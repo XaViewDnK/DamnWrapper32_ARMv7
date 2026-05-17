@@ -1,0 +1,76 @@
+// Single-module Android project that wraps the existing legacy
+// (AIDE-style) layout so it can also be built with Gradle / AGP
+// in CI. The original directory structure is preserved: sources
+// stay in `src/java`, native code in `src/jni`, and the manifest
+// at the repository root.
+
+plugins {
+    id 'com.android.application' version '7.4.2'
+}
+
+android {
+    namespace 'com.damnwrapper32armv7.xaview'
+    compileSdk 33
+    ndkVersion '25.2.9519653'
+
+    defaultConfig {
+        applicationId 'com.damnwrapper32armv7.xaview'
+        minSdk 21
+        targetSdk 28
+        versionCode 4
+        versionName '1.0.3'
+
+        ndk {
+            abiFilters 'armeabi-v7a'
+        }
+
+        // The native code takes the address of overloaded libc functions
+        // (e.g. `(void*)open`), which clashes with modern NDK fortify
+        // overloads that carry the `pass_object_size` attribute. Disable
+        // fortify so those headers do not introduce overloads.
+        externalNativeBuild {
+            ndkBuild {
+                cFlags '-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=0'
+                cppFlags '-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=0'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        ndkBuild {
+            path file('src/jni/Android.mk')
+        }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ['src/java']
+            res.srcDirs = ['res']
+            assets.srcDirs = ['assets']
+            jniLibs.srcDirs = []
+            aidl.srcDirs = []
+            renderscript.srcDirs = []
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
