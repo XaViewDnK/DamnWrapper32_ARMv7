@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build debug APK
+    name: Build release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -44,18 +44,18 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Build release APK
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Rename APK
         run: |
           mkdir -p artifacts
-          cp build/outputs/apk/debug/*.apk "artifacts/DamnWrapper32-ARMv7-debug-${GITHUB_SHA::7}.apk"
+          cp build/outputs/apk/release/*.apk "artifacts/DamnWrapper32-ARMv7-release-${GITHUB_SHA::7}.apk"
 
-      - name: Upload debug APK as workflow artifact
+      - name: Upload release APK as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DamnWrapper32-ARMv7-debug
+          name: DamnWrapper32-ARMv7-release
           path: artifacts/*.apk
           if-no-files-found: error
 
