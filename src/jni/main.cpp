@@ -1059,7 +1059,21 @@ void CrashHandler(int sig, siginfo_t *info, void *context) {
         if (uc_sys) {
             uint32_t syscall_num = uc_sys->uc_mcontext.arm_ip; // R12 = iOS syscall number
             uint32_t r0 = uc_sys->uc_mcontext.arm_r0;
-            // Логируем для отладки (не через LogToJava — unsafe в signal handler)
+            uint32_t pc_log = uc_sys->uc_mcontext.arm_pc;
+            // Логируем в файл: номер syscall, PC, R0
+            if (g_crashLogPath[0] != '\0') {
+                int log_fd = open(g_crashLogPath, O_RDWR | O_CREAT | O_APPEND, 0666);
+                if (log_fd >= 0) {
+                    SafeWriteStr(log_fd, "SIGSYS: syscall=0x");
+                    SafeWriteHex(log_fd, syscall_num);
+                    SafeWriteStr(log_fd, " PC=0x");
+                    SafeWriteHex(log_fd, pc_log);
+                    SafeWriteStr(log_fd, " R0=0x");
+                    SafeWriteHex(log_fd, r0);
+                    SafeWriteStr(log_fd, "\n");
+                    close(log_fd);
+                }
+            }
             // Известные iOS syscalls:
             // 4   = write
             // 6   = close
