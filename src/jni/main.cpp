@@ -11130,7 +11130,7 @@ void LoadMachO(const std::string& bundlePath) {
         } else if (lc.cmd == 2) { lseek(fd, cmd_offset, SEEK_SET); read(fd, &symtab, sizeof(symtab));
         } else if (lc.cmd == 11) { lseek(fd, cmd_offset, SEEK_SET); read(fd, &dysymtab, sizeof(dysymtab));
         } else if (lc.cmd == 0x22 || lc.cmd == 0x80000022) { dyld_info_command dyld; lseek(fd, cmd_offset, SEEK_SET); read(fd, &dyld, sizeof(dyld)); dyld_bind_off = dyld.bind_off; dyld_bind_size = dyld.bind_size; dyld_lazy_bind_off = dyld.lazy_bind_off; dyld_lazy_bind_size = dyld.lazy_bind_size; dyld_rebase_off = dyld.rebase_off; dyld_rebase_size = dyld.rebase_size;
-        } else if (lc.cmd == 5) { thread_command th; lseek(fd, cmd_offset, SEEK_SET); read(fd, &th, sizeof(th)); if (th.flavor == 1) { struct { uint32_t r[13]; uint32_t sp; uint32_t lr; uint32_t pc; uint32_t cpsr; } state; read(fd, &state, sizeof(state)); g_entryPoint = state.pc + g_appSlide; }
+        } else if (lc.cmd == 5) { thread_command th; lseek(fd, cmd_offset, SEEK_SET); read(fd, &th, sizeof(th)); if (th.flavor == 1) { struct { uint32_t r[13]; uint32_t sp; uint32_t lr; uint32_t pc; uint32_t cpsr; } state; read(fd, &state, sizeof(state)); g_entryPoint = state.pc + g_appSlide; char ep_buf[128]; snprintf(ep_buf, sizeof(ep_buf), "LC_THREAD: state.pc=0x%X, slide=0x%X, g_entryPoint=0x%X", state.pc, g_appSlide, g_entryPoint); LogToJava(ep_buf); }
         } else if (lc.cmd == 0xC || lc.cmd == 0x18 || lc.cmd == 0x80000018) {
         }
         cmd_offset += lc.cmdsize;
@@ -11229,10 +11229,19 @@ void LoadMachO(const std::string& bundlePath) {
                             section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect));
                             std::string sectname = machoFixedName(sect.sectname);
                             
-                            bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
+                            bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub" || sectname == "__picsymbolstub4");
                             bool isString = (sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype");
+                            // ФИКС: __la_symbol_ptr (type==7) и __nl_symbol_ptr (type==6) НЕ нужно трогать
+                            // эвристическим ребейзом — их слоты будут полностью перезаписаны биндингом
+                            // через dysymtab/ProcessBindOpcodes. Эвристический ребейз + ProcessRebaseOpcodes
+                            // вместе дают двойной сдвиг (slot += slide ДВАЖДЫ), что приводит к невалидным
+                            // адресам типа 0x20B84F40 = stub_helper_pre_slide + 2*slide -> SIGSEGV.
+                            uint8_t sect_type = sect.flags & 0xff;
+                            bool isDysymSlot = (sect_type == 6 || sect_type == 7);
                             
-                                if (isCode && sect.size > 0) {
+                                if (isDysymSlot) {
+                                    // Пропускаем — будет заполнено биндингом
+                                } else if (isCode && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Кастомный парсер сканирует секцию: " + sectname + " (размер: " + std::to_string(sect.size) + ")");
                                 uint32_t current_addr = sect.addr;
                                 const uint8_t* code = (const uint8_t*)(sect.addr + g_appSlide);
@@ -11323,7 +11332,7 @@ void LoadMachO(const std::string& bundlePath) {
                                 }
                                 LogToJava("CUSTOM-PARSER: Успешно разобрано " + std::to_string(parsed_count) + " инструкций.");
                                 LogToJava("CUSTOM-PARSER: Изменено абсолютных указателей в пулах: " + std::to_string(modified_literals));
-                            } else if (!isString && sect.size > 0) {
+                            } else if (!isString && !isDysymSlot && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Эвристический ребейз секции данных: " + sectname);
                                 uint32_t* ptr = (uint32_t*)(sect.addr + g_appSlide);
                                 uint32_t count = sect.size / 4;
@@ -11490,7 +11499,7 @@ void LoadMachO(const std::string& bundlePath) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
                 uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
+                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) { // INDIRECT_SYMBOL_LOCAL / _ABS: слот содержит пре-slide адрес из файла, нужно ребейзить uint32_t val = ptr_table[i]; if (val >= min_vmaddr && val < max_vmaddr) ptr_table[i] = val + g_appSlide; continue; } std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
             }
         }
     }
