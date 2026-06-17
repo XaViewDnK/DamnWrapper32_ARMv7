@@ -11376,7 +11376,16 @@ void LoadMachO(const std::string& bundlePath) {
                                                                      target_section.find("__mod_init_func") != std::string::npos);
 
                                             if (is_code_target) {
-                                                if ((val & 1) == 0) { safe_to_rebase = false; reason = "Code: Even"; }
+                                                // Убрали фильтр "Code: Even": ARM32 функции имеют чётные адреса (бит 0 = 0),
+                                                // Thumb-функции — нечётные (бит 0 = 1). Оба варианта валидны в ARMv7 бинарях.
+                                                // Вместо фильтра по чётности проверяем что shifted_val попадает в mapped секцию.
+                                                if ((val & 1) == 0) {
+                                                    // ARM32 pointer — проверяем что адрес (без учёта Thumb-бита) реально в секции
+                                                    bool in_mapped = false;
+                                                    for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { in_mapped = true; break; } }
+                                                    if (!in_mapped) { safe_to_rebase = false; reason = "Code: Even (Unmapped)"; }
+                                                    // иначе — это ARM32 функция, ребейзим
+                                                }
                                                 else if (((val >> 16) & 0xFFFF) == (val & 0xFFFF)) { safe_to_rebase = false; reason = "Code: Symmetric"; }
                                             } else if (is_raw_string_target) {
                                                 // FIX: Trust sv_mapped only. isValidString is unreliable for ObjC string
