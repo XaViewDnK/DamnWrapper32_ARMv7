@@ -62,6 +62,7 @@ extern bool g_logRender, g_logSound, g_logFs, g_logNet, g_logTodo, g_logRenderDe
 int g_spamFiltersMask = 0;
 int g_gpuOffloadMask = 0;
 void _LogToJava(const std::string& msg);
+void InternalWriteLog(const std::string& msg); // forward declaration для макроса LogToJava
 #define LogToJava(msg) do { \
     const std::string& _m = (msg); \
     if (!g_disableLogging) { _LogToJava(_m); } \
