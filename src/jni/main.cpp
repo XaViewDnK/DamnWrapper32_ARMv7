@@ -133,6 +133,10 @@ std::vector<uint32_t> g_initFuncs;
 
 struct MachOSectionInfo { std::string name; uint32_t start; uint32_t end; };
 std::vector<MachOSectionInfo> g_machoSections;
+// Адреса и размеры секций __nl_symbol_ptr / __la_symbol_ptr (post-slide).
+// Нужны для post-init патча слотов данных (см. фикс _AVAudioSessionCategory* ниже).
+struct DysymSlotRange { uint32_t addr; uint32_t size; };
+std::vector<DysymSlotRange> g_dysymSections;
 
 struct HLEClass { uint32_t magic; const char* className; };
 std::map<std::string, HLEClass*> g_hleClasses;
@@ -515,6 +519,20 @@ void* CreateNSString(const std::string& str) {
     return inst;
 }
 
+// FIX: Проверяет, попадает ли адрес в одну из маппированных секций бинаря ИЛИ в heap.
+// Используется в GetNSString перед разыменованием c_str_ptr, чтобы не словить SIGSEGV
+// когда гость передаёт кривой "NSString" (например, &переменная вместо *переменная).
+static bool IsMappedReadable(uint32_t addr) {
+    if (addr < 0x1000) return false;
+    // Heap аллокатора (scudo/malloc) — обычно выше 0x80000000 на Android ARMv7
+    // Это быстрый путь для наших CreateNSString() объектов.
+    if (addr >= 0x80000000u) return true;
+    for (const auto& sInfo : g_machoSections) {
+        if (addr >= sInfo.start && addr < sInfo.end) return true;
+    }
+    return false;
+}
+
 std::string GetNSString(void* nsstr) {
     if (!nsstr || (uintptr_t)nsstr < 0x1000) return "";
     uint32_t* ptr = (uint32_t*)nsstr;
@@ -526,19 +544,42 @@ std::string GetNSString(void* nsstr) {
     // Это предотвратит парсинг байтов указателя 'isa' как сырой C-строки!
     if (isa > 0x1000 && (isa % 4 == 0)) {
         uint32_t c_str_ptr = ptr[2];
-        if (c_str_ptr > 0x1000 && isValidString((const char*)c_str_ptr)) {
+        // FIX: Проверяем маппинг c_str_ptr ПЕРЕД разыменованием.
+        // Без этой проверки, если гость передаёт &variable вместо *variable
+        // (одинарный deref вместо двойного для nl_symbol_ptr), ptr[2] попадает
+        // в случайную BSS-память и isValidString падает с SIGSEGV (fault addr R5).
+        if (IsMappedReadable(c_str_ptr) && isValidString((const char*)c_str_ptr)) {
             result = std::string((const char*)c_str_ptr);
         } else {
             uint32_t c_str_ptr3 = ptr[3];
-            if (c_str_ptr3 > 0x1000 && isValidString((const char*)c_str_ptr3)) {
+            if (IsMappedReadable(c_str_ptr3) && isValidString((const char*)c_str_ptr3)) {
                 result = std::string((const char*)c_str_ptr3);
+            }
+        }
+        // FIX: Если объект не похож на валидный NSString (ptr[2]/ptr[3] кривые),
+        // но сам указатель nsstr является указателем на void* (т.е. гость передал
+        // &hle_SomeNSString_ptr вместо hle_SomeNSString_ptr), пробуем разыменовать.
+        if (result == "Unknown") {
+            uint32_t deref = ptr[0]; // ptr[0] в этом случае = само значение NSString*
+            // Если ptr[0] — это адрес heap-объекта (наш CreateNSString), рекурсируем.
+            // Защита от бесконечной рекурсии: deref != (uint32_t)(uintptr_t)nsstr
+            if (IsMappedReadable(deref) && deref != (uint32_t)(uintptr_t)nsstr) {
+                uint32_t* inner = (uint32_t*)deref;
+                uint32_t inner_isa = inner[0];
+                if (inner_isa > 0x1000 && (inner_isa % 4 == 0)) {
+                    uint32_t inner_cstr = inner[2];
+                    if (IsMappedReadable(inner_cstr) && isValidString((const char*)inner_cstr)) {
+                        LogToJava("STR-FIX: [GetNSString] Обнаружен двойной указатель (nl_symbol_ptr одинарный deref), раскрываем: " + std::to_string(deref));
+                        result = std::string((const char*)inner_cstr);
+                    }
+                }
             }
         }
     }
 
     // ФОЛБЕК: Только если это не похоже на строку внутри объекта (например, игра 
     // криво передала сырой C-String туда, где ожидался NSString), читаем напрямую.
-    if (result == "Unknown" && isValidString((const char*)nsstr)) {
+    if (result == "Unknown" && IsMappedReadable((uint32_t)(uintptr_t)nsstr) && isValidString((const char*)nsstr)) {
         result = std::string((const char*)nsstr);
     }
     
@@ -10794,6 +10835,32 @@ void LoadMachO(const std::string& bundlePath) {
            hle_kEAGLDrawablePropertyRetainedBacking_ptr = CreateNSString("kEAGLDrawablePropertyRetainedBacking");
         hle_AVAudioSessionCategoryPlayback_ptr = CreateNSString("AVAudioSessionCategoryPlayback");
         hle_AVAudioSessionCategoryAmbient_ptr = CreateNSString("AVAudioSessionCategoryAmbient");
+        // FIX: Патчим слоты __nl_symbol_ptr напрямую значениями NSString* (а не адресами переменных).
+        // Проблема: в таблице символов мы регистрировали (void*)&hle_..._ptr — адрес переменной.
+        // Гостевой код (CDAudioManager) при загрузке _AVAudioSessionCategoryAmbient делает
+        // ОДНО разыменование (ldr r0, [slot]) и сразу использует r0 как NSString*.
+        // Это даёт r0 = &hle_..._ptr (адрес C++ переменной), а не сам NSString*.
+        // GetNSString затем читает ptr[2] из области BSS → невалидный адрес → SIGSEGV.
+        // Решение: после инициализации HLE обходим все nl_symbol_ptr слоты и заменяем
+        // &hle_ptr → само значение hle_ptr, чтобы одинарный deref давал NSString* напрямую.
+        {
+            void* target_playback_addr = &hle_AVAudioSessionCategoryPlayback_ptr;
+            void* target_ambient_addr  = &hle_AVAudioSessionCategoryAmbient_ptr;
+            for (const auto& sect : g_dysymSections) {
+                uint32_t* slot = (uint32_t*)sect.addr;
+                uint32_t  count = sect.size / 4;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t val = slot[i];
+                    if (val == (uint32_t)(uintptr_t)target_playback_addr) {
+                        slot[i] = (uint32_t)(uintptr_t)hle_AVAudioSessionCategoryPlayback_ptr;
+                        LogToJava("STR-FIX: Пропатчен nl_symbol_ptr слот _AVAudioSessionCategoryPlayback → прямой NSString*");
+                    } else if (val == (uint32_t)(uintptr_t)target_ambient_addr) {
+                        slot[i] = (uint32_t)(uintptr_t)hle_AVAudioSessionCategoryAmbient_ptr;
+                        LogToJava("STR-FIX: Пропатчен nl_symbol_ptr слот _AVAudioSessionCategoryAmbient → прямой NSString*");
+                    }
+                }
+            }
+        }
         hle_NSUserDefaultsDidChangeNotification_ptr = CreateNSString("NSUserDefaultsDidChangeNotification");
         hle_GKPlayerAuthenticationDidChangeNotificationName_ptr = CreateNSString("GKPlayerAuthenticationDidChangeNotificationName");
         hle_kCFAllocatorDefault = (void*)1;
@@ -10953,7 +11020,7 @@ void LoadMachO(const std::string& bundlePath) {
                     section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect)); 
                     sect.addr += g_appSlide; // Сдвигаем адрес секции
                     uint8_t type = sect.flags & 0xff; 
-                    if (type == 6 || type == 7) dysym_sections.push_back(sect); 
+                    if (type == 6 || type == 7) { dysym_sections.push_back(sect); g_dysymSections.push_back({sect.addr, sect.size}); }
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     
