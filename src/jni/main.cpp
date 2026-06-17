@@ -11499,7 +11499,17 @@ void LoadMachO(const std::string& bundlePath) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
                 uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) { // INDIRECT_SYMBOL_LOCAL / _ABS: слот содержит пре-slide адрес из файла, нужно ребейзить uint32_t val = ptr_table[i]; if (val >= min_vmaddr && val < max_vmaddr) ptr_table[i] = val + g_appSlide; continue; } std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
+                for (uint32_t i = 0; i < num_pointers; i++) {
+                    uint32_t sym_idx = indirectSyms[sect.reserved1 + i];
+                    if (sym_idx == 0x80000000 || sym_idx == 0x40000000) {
+                        /* INDIRECT_SYMBOL_LOCAL/_ABS: пре-slide адрес из файла, ребейзим */
+                        uint32_t val = ptr_table[i];
+                        if (val >= min_vmaddr && val < max_vmaddr) ptr_table[i] = val + g_appSlide;
+                        continue;
+                    }
+                    std::string symName = &strTable[symTable[sym_idx].n_un.n_strx];
+                    ptr_table[i] = (uint32_t)ResolveSymbol(symName);
+                }
             }
         }
     }
