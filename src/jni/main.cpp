@@ -111,7 +111,7 @@ extern "C" {
             "mov r0, r1\n"                 // Возвращаем val
             "cmp r0, #0\n"
             "it eq\n"
-            "mov r0, #1\n"                 // FIX: moveq невалиден в Thumb2, используем it eq + mov
+            "moveq r0, #1\n"
             "bx lr\n"
         );
     }
