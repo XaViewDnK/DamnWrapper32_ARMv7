@@ -62,7 +62,18 @@ extern bool g_logRender, g_logSound, g_logFs, g_logNet, g_logTodo, g_logRenderDe
 int g_spamFiltersMask = 0;
 int g_gpuOffloadMask = 0;
 void _LogToJava(const std::string& msg);
-#define LogToJava(msg) do { if (!g_disableLogging) _LogToJava(msg); } while(0)
+#define LogToJava(msg) do { \
+    const std::string& _m = (msg); \
+    if (!g_disableLogging) { _LogToJava(_m); } \
+    else if (_m.find("FATAL") != std::string::npos || \
+             (_m.find("CRITICAL") != std::string::npos && _m.find("[SIZE-CRITICAL]") == std::string::npos) || \
+             _m.find("ERROR") != std::string::npos || \
+             _m.find("ОШИБКА") != std::string::npos || \
+             _m.find("ASSERT") != std::string::npos || \
+             _m.find("КРИТИЧЕСКАЯ") != std::string::npos) { \
+        InternalWriteLog(_m); \
+    } \
+} while(0)
 void _LogToBlackBox(const std::string& msg);
 #define LogToBlackBox(msg) do { if (!g_disableLogging) _LogToBlackBox(msg); } while(0)
 void _SyncLog(const std::string& msg);
@@ -99,7 +110,7 @@ extern "C" {
             "mov r0, r1\n"                 // Возвращаем val
             "cmp r0, #0\n"
             "it eq\n"
-            "moveq r0, #1\n"
+            "mov r0, #1\n"                 // FIX: moveq невалиден в Thumb2, используем it eq + mov
             "bx lr\n"
         );
     }
@@ -1724,7 +1735,7 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             void* debugTextPtr = (void*)0xDEB001; // Фейковый указатель (ключ) для кэша мапы
             char resStr[64];
             if (g_isFakeViewport) {
-                snprintf(resStr, sizeof(resStr), "Fake 480x320 (Real 0x0)");
+                snprintf(resStr, sizeof(resStr), "Fake 480x320 (Real %dx%d)", g_gameViewportW, g_gameViewportH);
             } else {
                 snprintf(resStr, sizeof(resStr), "VP: %dx%d", g_gameViewportW, g_gameViewportH);
             }
@@ -11601,7 +11612,17 @@ void LoadMachO(const std::string& bundlePath) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
                 uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
+                for (uint32_t i = 0; i < num_pointers; i++) {
+                    uint32_t idxInIndirect = sect.reserved1 + i;
+                    // FIX: Баг #5 — bounds check чтобы не словить SIGSEGV при кривом reserved1
+                    if (idxInIndirect >= indirectSyms.size()) continue;
+                    uint32_t sym_idx = indirectSyms[idxInIndirect];
+                    if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue;
+                    // FIX: bounds check sym_idx перед доступом к symTable
+                    if (sym_idx >= symTable.size()) continue;
+                    std::string symName = &strTable[symTable[sym_idx].n_un.n_strx];
+                    ptr_table[i] = (uint32_t)ResolveSymbol(symName);
+                }
             }
         }
     }
