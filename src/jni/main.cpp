@@ -62,19 +62,7 @@ extern bool g_logRender, g_logSound, g_logFs, g_logNet, g_logTodo, g_logRenderDe
 int g_spamFiltersMask = 0;
 int g_gpuOffloadMask = 0;
 void _LogToJava(const std::string& msg);
-void InternalWriteLog(const std::string& msg); // forward declaration для макроса LogToJava
-#define LogToJava(msg) do { \
-    const std::string& _m = (msg); \
-    if (!g_disableLogging) { _LogToJava(_m); } \
-    else if (_m.find("FATAL") != std::string::npos || \
-             (_m.find("CRITICAL") != std::string::npos && _m.find("[SIZE-CRITICAL]") == std::string::npos) || \
-             _m.find("ERROR") != std::string::npos || \
-             _m.find("ОШИБКА") != std::string::npos || \
-             _m.find("ASSERT") != std::string::npos || \
-             _m.find("КРИТИЧЕСКАЯ") != std::string::npos) { \
-        InternalWriteLog(_m); \
-    } \
-} while(0)
+#define LogToJava(msg) do { if (!g_disableLogging) _LogToJava(msg); } while(0)
 void _LogToBlackBox(const std::string& msg);
 #define LogToBlackBox(msg) do { if (!g_disableLogging) _LogToBlackBox(msg); } while(0)
 void _SyncLog(const std::string& msg);
@@ -1736,7 +1724,7 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             void* debugTextPtr = (void*)0xDEB001; // Фейковый указатель (ключ) для кэша мапы
             char resStr[64];
             if (g_isFakeViewport) {
-                snprintf(resStr, sizeof(resStr), "Fake 480x320 (Real %dx%d)", g_gameViewportW, g_gameViewportH);
+                snprintf(resStr, sizeof(resStr), "Fake 480x320 (Real 0x0)");
             } else {
                 snprintf(resStr, sizeof(resStr), "VP: %dx%d", g_gameViewportW, g_gameViewportH);
             }
@@ -10848,65 +10836,6 @@ inline size_t GetThumbInstructionSize(uint16_t hw) {
     return 2;
 }
 
-// ============================================================================
-// MOVW / MOVT (Thumb-2, 32-бит) — декодирование и кодирование.
-//
-// Компилятор часто материализует абсолютные 32-битные константы (адреса
-// vtable, указатели на статические объекты и т.п.) парой инструкций:
-//   MOVW Rd, #imm16_lo    ; младшие 16 бит
-//   MOVT Rd, #imm16_hi    ; старшие 16 бит
-// без участия литерал-пула, поэтому старый парсер (который ловит только
-// LDR Rx,[PC,#imm]) такие указатели в принципе не видел и не ребейзил —
-// именно это похоже на причину текущего крэша (R5 = 0x007869F1, точное
-// значение не найдено ни в одном data-проходе, значит оно "вшито" в код).
-//
-// Кодирование (ARM ARM A6.7.91 MOV (T3) / A6.7.92 MOVT):
-//   hw1: 1111 0i00 0100 imm4   (MOVW)
-//        1111 0i10 1100 imm4   (MOVT)
-//   hw2: 0 imm3 dddd imm8
-// ============================================================================
-
-// Проверяет, что 32-битная Thumb-2 инструкция (hw1,hw2) — это MOVW или MOVT.
-// is_movt = true, если это MOVT (старшие 16 бит), false если MOVW (младшие 16 бит).
-inline bool IsThumb2MovWT(uint16_t hw1, uint16_t hw2, bool* is_movt = nullptr) {
-    // Общий опкод: биты [15:11] = 11110, дальше op-код в битах [9:4]
-    if ((hw1 & 0xF800) != 0xF000) return false;
-    uint16_t op_bits = (hw1 >> 4) & 0x3F; // биты [9:4]
-    bool movw = (op_bits == 0x24); // 100100 -> MOVW
-    bool movt = (op_bits == 0x2C); // 101100 -> MOVT
-    if (!movw && !movt) return false;
-    // Старший бит второй halfword у MOV(imm)/MOVT всегда 0
-    if (hw2 & 0x8000) return false;
-    if (is_movt) *is_movt = movt;
-    return true;
-}
-
-// Извлекает регистр-приёмник Rd (биты [11:8] второй половины слова).
-inline uint32_t Thumb2MovWT_GetRd(uint16_t hw2) {
-    return (hw2 >> 8) & 0xF;
-}
-
-// Извлекает 16-битный непосредственный операнд imm16, разбросанный по полям
-// i (hw1 бит10), imm4 (hw1 биты[3:0]), imm3 (hw2 биты[14:12]), imm8 (hw2 биты[7:0]).
-inline uint32_t Thumb2MovWT_GetImm16(uint16_t hw1, uint16_t hw2) {
-    uint32_t imm4 = hw1 & 0x000F;
-    uint32_t i    = (hw1 >> 10) & 0x1;
-    uint32_t imm3 = (hw2 >> 12) & 0x7;
-    uint32_t imm8 = hw2 & 0x00FF;
-    return (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
-}
-
-// Кодирует imm16 обратно в существующую пару halfword, сохраняя опкод/регистр.
-inline void Thumb2MovWT_SetImm16(uint16_t* hw1, uint16_t* hw2, uint32_t imm16) {
-    uint32_t imm4 = (imm16 >> 12) & 0xF;
-    uint32_t i    = (imm16 >> 11) & 0x1;
-    uint32_t imm3 = (imm16 >> 8) & 0x7;
-    uint32_t imm8 = imm16 & 0xFF;
-
-    *hw1 = (uint16_t)((*hw1 & ~0x040F) | (i << 10) | imm4);
-    *hw2 = (uint16_t)((*hw2 & ~0x70FF) | (imm3 << 12) | imm8);
-}
-
 void LoadMachO(const std::string& bundlePath) {
     HLEClass* cls_NSString = new HLEClass{0xDEADBEEF, "NSString"};    g_hleClasses["NSString"] = cls_NSString; g_hleClasses["__CFConstantStringClassReference"] = cls_NSString; g_hleStubs["___CFConstantStringClassReference"] = cls_NSString;    g_hleClasses["CADisplayLink"] = new HLEClass{0xDEADBEEF, "CADisplayLink"}; g_hleClasses["UIButton"] = new HLEClass{0xDEADBEEF, "UIButton"}; g_hleClasses["UISwitch"] = new HLEClass{0xDEADBEEF, "UISwitch"}; g_hleClasses["UILabel"] = new HLEClass{0xDEADBEEF, "UILabel"}; g_hleClasses["UIColor"] = new HLEClass{0xDEADBEEF, "UIColor"};     g_hleClasses["UIView"] = new HLEClass{0xDEADBEEF, "UIView"}; g_hleClasses["UITextView"] = new HLEClass{0xDEADBEEF, "UITextView"}; g_hleClasses["UITextField"] = new HLEClass{0xDEADBEEF, "UITextField"}; g_hleClasses["UIWindow"] = new HLEClass{0xDEADBEEF, "UIWindow"}; g_hleClasses["UIScreen"] = new HLEClass{0xDEADBEEF, "UIScreen"}; g_hleClasses["UINib"] = new HLEClass{0xDEADBEEF, "UINib"}; g_hleClasses["NSBundle"] = new HLEClass{0xDEADBEEF, "NSBundle"}; g_hleClasses["NSURL"] = new HLEClass{0xDEADBEEF, "NSURL"}; g_hleClasses["NSThread"] = new HLEClass{0xDEADBEEF, "NSThread"};     g_hleClasses["NSURLConnection"] = new HLEClass{0xDEADBEEF, "NSURLConnection"}; g_hleClasses["NSAutoreleasePool"] = new HLEClass{0xDEADBEEF, "NSAutoreleasePool"}; g_hleClasses["GKLocalPlayer"] = new HLEClass{0xDEADBEEF, "GKLocalPlayer"}; g_hleClasses["UIViewController"] = new HLEClass{0xDEADBEEF, "UIViewController"}; g_hleClasses["UIImageView"] = new HLEClass{0xDEADBEEF, "UIImageView"}; g_hleClasses["UIImage"] = new HLEClass{0xDEADBEEF, "UIImage"};
     g_hleClasses["GKAchievement"] = new HLEClass{0xDEADBEEF, "GKAchievement"};
@@ -11311,7 +11240,6 @@ void LoadMachO(const std::string& bundlePath) {
                                 
                                 int parsed_count = 0;
                                 int modified_literals = 0;
-                                int modified_movwt = 0;
                                 
                                 const uint16_t* ptr = (const uint16_t*)code;
                                 size_t remaining_bytes = code_size;
@@ -11321,56 +11249,6 @@ void LoadMachO(const std::string& bundlePath) {
                                     size_t insn_size = GetThumbInstructionSize(hw1);
                                     
                                     if (insn_size == 4 && remaining_bytes < 4) break;
-                                    
-                                    // --- MOVW/MOVT: материализация абсолютного адреса прямо в регистр,
-                                    // минуя литерал-пул. Старый цикл это вообще не видел.
-                                    // Паттерн: MOVW Rd,#lo  затем (сразу следующая инструкция) MOVT Rd,#hi.
-                                    if (insn_size == 4) {
-                                        uint16_t hw2 = *(ptr + 1);
-                                        bool is_movt_self = false;
-                                        if (IsThumb2MovWT(hw1, hw2, &is_movt_self) && !is_movt_self) {
-                                            // Нашли MOVW — смотрим, есть ли сразу за ним MOVT на тот же Rd
-                                            uint32_t rd = Thumb2MovWT_GetRd(hw2);
-                                            size_t next_remaining = remaining_bytes - insn_size;
-                                            if (next_remaining >= 4) {
-                                                const uint16_t* next_ptr = ptr + (insn_size / 2);
-                                                uint16_t nhw1 = *next_ptr;
-                                                size_t next_insn_size = GetThumbInstructionSize(nhw1);
-                                                if (next_insn_size == 4 && next_remaining >= 4) {
-                                                    uint16_t nhw2 = *(next_ptr + 1);
-                                                    bool is_movt_next = false;
-                                                    if (IsThumb2MovWT(nhw1, nhw2, &is_movt_next) && is_movt_next &&
-                                                        Thumb2MovWT_GetRd(nhw2) == rd) {
-                                                        uint32_t lo = Thumb2MovWT_GetImm16(hw1, hw2);
-                                                        uint32_t hi = Thumb2MovWT_GetImm16(nhw1, nhw2);
-                                                        uint32_t val = (hi << 16) | lo;
-                                                        
-                                                        // Ребейзим только если это похоже на исходный (до слайда) валидный адрес образа
-                                                        if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
-                                                            uint32_t new_val = val + g_appSlide;
-                                                            uint16_t out_hw1 = hw1, out_hw2 = hw2;
-                                                            uint16_t out_nhw1 = nhw1, out_nhw2 = nhw2;
-                                                            Thumb2MovWT_SetImm16(&out_hw1, &out_hw2, new_val & 0xFFFF);
-                                                            Thumb2MovWT_SetImm16(&out_nhw1, &out_nhw2, (new_val >> 16) & 0xFFFF);
-                                                            
-                                                            uint16_t* w_ptr = (uint16_t*)ptr;
-                                                            uint16_t* w_next_ptr = (uint16_t*)next_ptr;
-                                                            w_ptr[0] = out_hw1; w_ptr[1] = out_hw2;
-                                                            w_next_ptr[0] = out_nhw1; w_next_ptr[1] = out_nhw2;
-                                                            modified_movwt++;
-                                                        }
-                                                        
-                                                        // Пропускаем сразу обе инструкции пары (MOVW и MOVT)
-                                                        ptr += (insn_size + next_insn_size) / 2;
-                                                        current_addr += insn_size + next_insn_size;
-                                                        remaining_bytes -= insn_size + next_insn_size;
-                                                        parsed_count += 2;
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
                                     
                                     uint32_t literal_addr = 0;
                                     bool is_ldr_pc = false;
@@ -11445,7 +11323,6 @@ void LoadMachO(const std::string& bundlePath) {
                                 }
                                 LogToJava("CUSTOM-PARSER: Успешно разобрано " + std::to_string(parsed_count) + " инструкций.");
                                 LogToJava("CUSTOM-PARSER: Изменено абсолютных указателей в пулах: " + std::to_string(modified_literals));
-                                LogToJava("CUSTOM-PARSER: Изменено абсолютных указателей в парах MOVW/MOVT: " + std::to_string(modified_movwt));
                             } else if (!isString && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Эвристический ребейз секции данных: " + sectname);
                                 uint32_t* ptr = (uint32_t*)(sect.addr + g_appSlide);
@@ -11613,17 +11490,7 @@ void LoadMachO(const std::string& bundlePath) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
                 uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) {
-                    uint32_t idxInIndirect = sect.reserved1 + i;
-                    // FIX: Баг #5 — bounds check чтобы не словить SIGSEGV при кривом reserved1
-                    if (idxInIndirect >= indirectSyms.size()) continue;
-                    uint32_t sym_idx = indirectSyms[idxInIndirect];
-                    if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue;
-                    // FIX: bounds check sym_idx перед доступом к symTable
-                    if (sym_idx >= symTable.size()) continue;
-                    std::string symName = &strTable[symTable[sym_idx].n_un.n_strx];
-                    ptr_table[i] = (uint32_t)ResolveSymbol(symName);
-                }
+                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
             }
         }
     }
