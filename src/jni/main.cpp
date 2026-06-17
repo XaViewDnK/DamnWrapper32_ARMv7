@@ -11230,11 +11230,15 @@ void LoadMachO(const std::string& bundlePath) {
                                                 if ((val & 1) == 0) { safe_to_rebase = false; reason = "Code: Even"; }
                                                 else if (((val >> 16) & 0xFFFF) == (val & 0xFFFF)) { safe_to_rebase = false; reason = "Code: Symmetric"; }
                                             } else if (is_raw_string_target) {
-                                                // FIX: Verify shifted_val is within a mapped section before dereferencing
+                                                // FIX: Trust sv_mapped only. isValidString is unreliable for ObjC string
+                                                // sections: __objc_classname__TEXT can have zero-padding before the first
+                                                // real string, so isValidString returns false for a perfectly valid name_ptr
+                                                // offset. That leaves the pointer un-rebased, and the classlist scanner
+                                                // later reads a pre-slide address -> SIGSEGV. If shifted_val falls inside
+                                                // a known mapped section it is a legitimate ObjC string pointer; rebase it.
                                                 bool sv_mapped = false;
                                                 for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
                                                 if (!sv_mapped) { safe_to_rebase = false; reason = "String: Unmapped Ptr"; }
-                                                else if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "String: Invalid"; }
                                             } else if (is_struct_target) {
                                                 if ((val & 3) != 0) { safe_to_rebase = false; reason = "Struct: Unaligned"; }
                                                 else if (target_section.find("__cfstring") != std::string::npos) {
@@ -11326,11 +11330,22 @@ void LoadMachO(const std::string& bundlePath) {
         for (uint32_t i = 0; i < num_classes; i++) {
             uint32_t cls_addr = ptr_table[i];
             if (cls_addr > 0x1000) {
+                // FIX: verify cls_addr is in a mapped section (guards against un-rebased classlist entry)
+                bool cls_mapped = false;
+                for (const auto& si : g_machoSections) { if (cls_addr >= si.start && cls_addr < si.end) { cls_mapped = true; break; } }
+                if (!cls_mapped) continue;
                 uint32_t* cls = (uint32_t*)cls_addr;
                 uint32_t data_ptr = cls[4] & ~3;
                 if (data_ptr > 0x1000) {
+                    // FIX: verify data_ptr is mapped before reading class_ro_t fields
+                    bool dp_mapped = false;
+                    for (const auto& si : g_machoSections) { if (data_ptr >= si.start && (data_ptr + 20) <= si.end) { dp_mapped = true; break; } }
+                    if (!dp_mapped) continue;
                     uint32_t name_ptr = ((uint32_t*)data_ptr)[4];
-                    if (isValidString((const char*)name_ptr)) {
+                    // FIX: verify name_ptr is in a mapped section before passing to isValidString
+                    bool np_mapped = false;
+                    for (const auto& si : g_machoSections) { if (name_ptr >= si.start && name_ptr < si.end) { np_mapped = true; break; } }
+                    if (np_mapped && isValidString((const char*)name_ptr)) {
                         std::string cName = (const char*)name_ptr;
                         g_appSymbols["_OBJC_CLASS_$_" + cName] = cls_addr;
                         if (g_logHiddenClasses) {
