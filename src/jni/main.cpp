@@ -10635,25 +10635,26 @@ void ProcessRebaseOpcodes(int fd, uint32_t arch_offset, uint32_t rebase_off, uin
             case 0x40: offset += imm * 4; break;
             case 0x50: {
                 for (int i = 0; i < imm; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                    // FIX: guard against out-of-segment offset before write
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                     offset += 4;
                 } break;
             }
             case 0x60: {
                 uint64_t count = read_uleb128(&p);
                 for (uint64_t i = 0; i < count; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                     offset += 4;
                 } break;
             }
             case 0x70: {
-                if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                 offset += 4 + read_uleb128(&p); break;
             }
             case 0x80: {
                 uint64_t count = read_uleb128(&p); uint64_t skip = read_uleb128(&p);
                 for (uint64_t i = 0; i < count; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                     offset += 4 + skip;
                 } break;
             }
@@ -10675,13 +10676,14 @@ void ProcessBindOpcodes(int fd, uint32_t arch_offset, uint32_t bind_off, uint32_
             case 0x70: segment_idx = imm; offset = read_uleb128(&p); break;
             case 0x80: offset += read_uleb128(&p); break;
             case 0x90: case 0xA0: case 0xB0: {
-                if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); }
+                // FIX: guard offset before write
+                if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); } }
                 if (opcode == 0x90) offset += 4; else if (opcode == 0xA0) offset += 4 + read_uleb128(&p); else offset += 4 + (imm * 4); break;
             }
             case 0xC0: {
                 uint64_t count = read_uleb128(&p); uint64_t skip = read_uleb128(&p);
                 for (uint64_t i = 0; i < count; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); }
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); } }
                     offset += 4 + skip;
                 } break;
             }
@@ -11228,18 +11230,38 @@ void LoadMachO(const std::string& bundlePath) {
                                                 if ((val & 1) == 0) { safe_to_rebase = false; reason = "Code: Even"; }
                                                 else if (((val >> 16) & 0xFFFF) == (val & 0xFFFF)) { safe_to_rebase = false; reason = "Code: Symmetric"; }
                                             } else if (is_raw_string_target) {
-                                                if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "String: Invalid"; }
+                                                // FIX: Verify shifted_val is within a mapped section before dereferencing
+                                                bool sv_mapped = false;
+                                                for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
+                                                if (!sv_mapped) { safe_to_rebase = false; reason = "String: Unmapped Ptr"; }
+                                                else if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "String: Invalid"; }
                                             } else if (is_struct_target) {
                                                 if ((val & 3) != 0) { safe_to_rebase = false; reason = "Struct: Unaligned"; }
                                                 else if (target_section.find("__cfstring") != std::string::npos) {
-                                                    uint32_t* cfstr = (uint32_t*)shifted_val;
-                                                    uint32_t str_ptr = cfstr[2];
-                                                    if (str_ptr < min_vmaddr || str_ptr >= max_vmaddr) { safe_to_rebase = false; reason = "CFString: Invalid Ptr"; }
-                                                    else if (!isValidString((const char*)(str_ptr + g_appSlide))) { safe_to_rebase = false; reason = "CFString: Invalid Str"; }
+                                                    // FIX: Verify shifted_val is mapped before reading cfstr fields
+                                                    bool sv_mapped = false;
+                                                    for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && (shifted_val + 16) <= sInfo.end) { sv_mapped = true; break; } }
+                                                    if (!sv_mapped) { safe_to_rebase = false; reason = "CFString: Unmapped Ptr"; }
+                                                    else {
+                                                        uint32_t* cfstr = (uint32_t*)shifted_val;
+                                                        uint32_t str_ptr = cfstr[2];
+                                                        if (str_ptr < min_vmaddr || str_ptr >= max_vmaddr) { safe_to_rebase = false; reason = "CFString: Invalid Ptr"; }
+                                                        else {
+                                                            uint32_t shifted_str_ptr = str_ptr + g_appSlide;
+                                                            bool sp_mapped = false;
+                                                            for (const auto& sInfo : g_machoSections) { if (shifted_str_ptr >= sInfo.start && shifted_str_ptr < sInfo.end) { sp_mapped = true; break; } }
+                                                            if (!sp_mapped) { safe_to_rebase = false; reason = "CFString: Unmapped Str"; }
+                                                            else if (!isValidString((const char*)shifted_str_ptr)) { safe_to_rebase = false; reason = "CFString: Invalid Str"; }
+                                                        }
+                                                    }
                                                 }
                                             } else {
                                                 if ((val & 3) != 0) {
-                                                    if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
+                                                    // FIX: Verify shifted_val is mapped before dereferencing
+                                                    bool sv_mapped = false;
+                                                    for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
+                                                    if (!sv_mapped) { safe_to_rebase = false; reason = "Data: Unmapped Ptr"; }
+                                                    else if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
                                                 }
                                             }
                                         } else {
