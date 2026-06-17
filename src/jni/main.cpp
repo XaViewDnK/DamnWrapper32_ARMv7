@@ -146,6 +146,7 @@ bool g_frameHasDraw = false;
 bool g_onScreenDebugOverlay = false;
 bool g_showPerfOverlay = false;
 int g_esModeOption = 2;
+void* g_lastEAGLViewInstance = nullptr; // FIX: последний созданный EAGLView (для outlet glView)
 
 // Variables for FPS calculation
 uint64_t g_fpsLastTimeMs = 0;
@@ -6269,6 +6270,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             else if (cName.find("Label") != std::string::npos) g_views[instance].type = "UILabel";
             else if (cName.find("View") != std::string::npos) g_views[instance].type = "UIView";
             
+            // FIX: Запоминаем последний аллоцированный EAGLView-подобный объект
+            // чтобы awakeFromNib ViewController'а мог подобрать его как glView outlet
+            if (cName.find("EAGLView") != std::string::npos || cName.find("EaglView") != std::string::npos) {
+                g_lastEAGLViewInstance = instance;
+                LogToJava("HLE-FIX: [alloc] Запомнили EAGLView кандидат: " + cName);
+            }
+            
             return (uint64_t)(uintptr_t)instance;
         }
         
@@ -6331,6 +6339,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         g_views[view].bgColor = g_uiColors[view]; g_views[view].hasBg = true;
                     }
                     g_viewControllersViews[self] = view;
+                    // FIX: Регистрируем EAGLView как outlet glView у ViewController'а,
+                    // чтобы awakeFromNib не упал на assert(self.glView != nil)
+                    if (!g_dictionaries[self][(void*)0xA001]) {
+                        g_dictionaries[self][(void*)0xA001] = view;
+                        LogToJava("HLE-FIX: [loadView] зарегистрирован glView outlet -> EAGLView для " + cName);
+                    }
                 }
                 LogToJava("HLE: Calling viewDidLoad for " + cName);
                 void* vdl_imp = FindMethodIMP(isa, "viewDidLoad");
@@ -6368,6 +6382,151 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
         if (strcmp(op, "class") == 0) return (uint64_t)isa;
 
+        // FIX: Перехват сеттера setGlView: — нативный loadView вызывает его
+        // когда создаёт EAGLView. Сохраняем outlet чтобы геттер glView не вернул nil.
+        if (strcmp(op, "setGlView:") == 0 || strcmp(op, "setEaglView:") == 0) {
+            g_dictionaries[self][(void*)0xA001] = a1;
+            LogToJava("HLE-FIX: [" + std::string(op) + "] сохранён EAGLView outlet для " + cName);
+            void* imp_sv = FindMethodIMP(isa, op);
+            if (imp_sv) {
+                LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
+#if defined(__arm__)
+                asm volatile (
+                    "vldr s0, [%0]\n"
+                    "vldr s1, [%0, #4]\n"
+                    "vldr s2, [%0, #8]\n"
+                    "vldr s3, [%0, #12]\n"
+                    : : "r"(saved_s) : "s0", "s1", "s2", "s3"
+                );
+#endif
+                typedef uint64_t (*MethodType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
+                return ((MethodType)imp_sv)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+            }
+            return 0;
+        }
+
+        // FIX: Перехват геттера glView (и любых ivar-outlet'ов вида get*View)
+        // для нативных ViewController'ов. Если нативный код читает ivar через
+        // этот геттер, ivar не заполнен (нет NIB-парсера), и assert падает.
+        // Решение: возвращаем закэшированный EAGLView из g_dictionaries.
+        if (strcmp(op, "glView") == 0) {
+            void* stored = g_dictionaries[self][(void*)0xA001]; // ключ для glView outlet
+            if (stored) {
+                LogToJava("HLE-FIX: [glView] возвращаем кэшированный EAGLView");
+                return (uint64_t)(uintptr_t)stored;
+            }
+            // Пробуем найти EAGLView среди уже созданных view контроллера
+            if (g_viewControllersViews.count(self)) {
+                void* v = g_viewControllersViews[self];
+                g_dictionaries[self][(void*)0xA001] = v;
+                LogToJava("HLE-FIX: [glView] возвращаем view из g_viewControllersViews");
+                return (uint64_t)(uintptr_t)v;
+            }
+            // Создаем EAGLView на лету
+            uint32_t eaglViewClsAddr = 0;
+            for (auto const& pair : g_appSymbols) {
+                if (pair.first == "_OBJC_CLASS_$_EAGLView") {
+                    eaglViewClsAddr = pair.second; break;
+                }
+            }
+            if (eaglViewClsAddr) {
+                void* eaglView = (void*)Stub_objc_msgSend(
+                    (void*)eaglViewClsAddr, "alloc",
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                uint32_t dummyCoder_data[8] = {0};
+                dummyCoder_data[0] = g_hleClasses.count("NSCoder") ? (uint32_t)g_hleClasses["NSCoder"] : 0xDEADBEEF;
+                eaglView = (void*)Stub_objc_msgSend(
+                    eaglView, "initWithCoder:", (void*)dummyCoder_data,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                g_views[eaglView].frame = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
+                g_dictionaries[self][(void*)0xA001] = eaglView;
+                g_mainView = eaglView;
+                LogToJava("HLE-FIX: [glView] EAGLView создан на лету для " + cName);
+                return (uint64_t)(uintptr_t)eaglView;
+            }
+            LogToJava("HLE-FIX: [glView] EAGLView класс не найден, возвращаем 0");
+            return 0;
+        }
+
+        // FIX: Перехват awakeFromNib для нативных ViewController'ов.
+        // До вызова нативного awakeFromNib гарантируем что ivar _glView заполнен —
+        // иначе NSAssert(self.glView != nil) роняет приложение.
+        if (strcmp(op, "awakeFromNib") == 0) {
+            // Шаг 1: Ищем EAGLView, который уже мог быть создан в ходе loadView
+            void* eaglViewPtr = g_dictionaries[self][(void*)0xA001];
+            
+            // Шаг 1б: Если не нашли в кэше — берём g_lastEAGLViewInstance
+            // (нативный loadView мог создать EAGLView через alloc до нашего awakeFromNib)
+            if (!eaglViewPtr && g_lastEAGLViewInstance) {
+                eaglViewPtr = g_lastEAGLViewInstance;
+                g_dictionaries[self][(void*)0xA001] = eaglViewPtr;
+                LogToJava("HLE-FIX: [awakeFromNib] Взяли g_lastEAGLViewInstance как glView для " + cName);
+            }
+            
+            // Шаг 2: Если не нашли — создаём через наш HLE glView getter
+            if (!eaglViewPtr) {
+                void* glViewImp = FindMethodIMP(isa, "glView");
+                if (glViewImp) {
+                    LogToJava("HLE-FIX: [awakeFromNib] Pre-populating glView outlet для " + cName);
+                    eaglViewPtr = (void*)Stub_objc_msgSend(self, "glView",
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                }
+            }
+            
+            // Шаг 3: Пишем найденный EAGLView напрямую в ivar _glView объекта
+            // (на случай если нативный awakeFromNib читает ivar напрямую, а не через getter)
+            if (eaglViewPtr) {
+                // Ищем ivar _glView в списке ivars класса через Mach-O метаданные
+                uint32_t cls_ptr = isa;
+                while (cls_ptr > 0x1000) {
+                    uint32_t* cls_data = (uint32_t*)cls_ptr;
+                    if (cls_data[0] == 0xDEADBEEF) break; // дошли до HLE-класса
+                    uint32_t ro_ptr = cls_data[4] & ~3;
+                    if (!ro_ptr || ro_ptr < 0x1000) break;
+                    uint32_t* ro = (uint32_t*)ro_ptr;
+                    uint32_t ivar_list_ptr = ro[6]; // ro->ivars
+                    if (ivar_list_ptr && ivar_list_ptr > 0x1000) {
+                        uint32_t* ilist = (uint32_t*)ivar_list_ptr;
+                        uint32_t ivar_count = ilist[1];
+                        uint32_t ivar_entry_size = ilist[0] & 0xFFFF; // entsize_and_flags
+                        if (ivar_entry_size == 0) ivar_entry_size = 12;
+                        if (ivar_count < 500) {
+                            uint8_t* entry = (uint8_t*)(ilist + 2);
+                            for (uint32_t i = 0; i < ivar_count; i++) {
+                                uint32_t* ivar_e = (uint32_t*)entry;
+                                uint32_t name_ptr = ivar_e[1];
+                                if (name_ptr > 0x1000 && isValidString((const char*)name_ptr)) {
+                                    const char* iname = (const char*)name_ptr;
+                                    if (strcmp(iname, "_glView") == 0 || strcmp(iname, "glView") == 0 ||
+                                        strcmp(iname, "_eaglView") == 0 || strcmp(iname, "eaglView") == 0 ||
+                                        strcmp(iname, "_m_glView") == 0 || strcmp(iname, "m_glView") == 0) {
+                                        // ivar_e[0] = offset_ptr
+                                        uint32_t offset_ptr = ivar_e[0];
+                                        if (offset_ptr > 0x1000) {
+                                            int32_t ivar_offset = *(int32_t*)offset_ptr;
+                                            if (ivar_offset > 0 && ivar_offset < 10000) {
+                                                uint32_t* obj_ivar = (uint32_t*)((uint8_t*)self + ivar_offset);
+                                                *obj_ivar = (uint32_t)(uintptr_t)eaglViewPtr;
+                                                LogToJava("HLE-FIX: Записан ivar [" + std::string(iname) +
+                                                    "] offset=" + std::to_string(ivar_offset) +
+                                                    " -> EAGLView для " + cName);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                                entry += ivar_entry_size;
+                            }
+                        }
+                    }
+                    uint32_t super_cls = cls_data[1];
+                    if (!super_cls || super_cls == cls_ptr) break;
+                    cls_ptr = super_cls;
+                }
+            }
+            // Дальше форвардим в нативный код как обычно
+        }
+
         void* imp = FindMethodIMP(isa, op);
         if (imp) {
             LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
@@ -6381,7 +6540,19 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             );
 #endif
             typedef uint64_t (*MethodType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
-            return ((MethodType)imp)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+            uint64_t native_ret = ((MethodType)imp)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+            // FIX: После нативного init* для EAGLView — обновляем g_lastEAGLViewInstance
+            // (init может вернуть другой адрес, например при initWithCoder:)
+            if (strncmp(op, "init", 4) == 0 && native_ret > 0x1000) {
+                void* ret_obj = (void*)(uintptr_t)native_ret;
+                std::string retCls = GetObjCClassName(ret_obj);
+                if (retCls.find("EAGLView") != std::string::npos || retCls.find("EaglView") != std::string::npos) {
+                    g_lastEAGLViewInstance = ret_obj;
+                    g_views[ret_obj].frame = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
+                    LogToJava("HLE-FIX: [native init] Обновлён g_lastEAGLViewInstance -> " + retCls);
+                }
+            }
+            return native_ret;
         }
         
         if (strncmp(op, "init", 4) == 0 || strcmp(op, "alloc") == 0) return (uint64_t)(uintptr_t)self; 
