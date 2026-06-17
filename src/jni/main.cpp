@@ -1049,6 +1049,71 @@ static _Unwind_Reason_Code UnwindCallback(struct _Unwind_Context* context, void*
 }
 
 void CrashHandler(int sig, siginfo_t *info, void *context) {
+    // ФИК SIGSYS: Перехват iOS syscall'ов через svc инструкцию.
+    // На iOS ARM syscall номер передаётся в R12 (ip), затем идёт svc 0x80.
+    // Android не знает эти syscall'ы и кидает SIGSYS.
+    // Мы перехватываем, эмулируем что нужно (большинство — заглушки/0), и возвращаем управление.
+#if defined(__arm__)
+    if (sig == SIGSYS) {
+        ucontext_t *uc_sys = (ucontext_t *)context;
+        if (uc_sys) {
+            uint32_t syscall_num = uc_sys->uc_mcontext.arm_ip; // R12 = iOS syscall number
+            uint32_t r0 = uc_sys->uc_mcontext.arm_r0;
+            // Логируем для отладки (не через LogToJava — unsafe в signal handler)
+            // Известные iOS syscalls:
+            // 4   = write
+            // 6   = close
+            // 20  = getpid
+            // 33  = access
+            // 90  = mmap (критичный — возвращаем MAP_FAILED чтобы код упал в обычный fallback)
+            // 194 = mmap2
+            // 199 = lseek
+            // 336 = pthread_sigmask / bsdthread_create — просто 0
+            // Большинство остальных: возвращаем 0 (успех) и продолжаем
+            uint32_t ret = 0;
+            bool handled = true;
+            switch (syscall_num & 0xFFFF) {
+                case 20:  // getpid
+                    ret = (uint32_t)getpid(); break;
+                case 4:   // write — пусть libc обработает через нормальный путь
+                    ret = (uint32_t)write((int)r0,
+                        (const void*)uc_sys->uc_mcontext.arm_r1,
+                        (size_t)uc_sys->uc_mcontext.arm_r2);
+                    break;
+                case 6:   // close
+                    ret = 0; break;
+                case 33:  // access
+                    ret = 0; break;
+                case 90:  // mmap — возвращаем MAP_FAILED (0xFFFFFFFF), пусть игра использует malloc
+                case 194: // mmap2
+                    ret = (uint32_t)MAP_FAILED; break;
+                case 199: // lseek
+                    ret = 0; break;
+                case 240: // bsdthread_create — заглушка
+                case 241: // bsdthread_terminate
+                case 336: // pthread_sigmask
+                    ret = 0; break;
+                default:
+                    // Неизвестный syscall — возвращаем 0 и продолжаем
+                    ret = 0; break;
+            }
+            if (handled) {
+                uc_sys->uc_mcontext.arm_r0 = ret;
+                // Пропускаем svc инструкцию (2 байта в Thumb, 4 байта в ARM)
+                uint32_t pc_sys = uc_sys->uc_mcontext.arm_pc;
+                uint32_t cpsr_sys = uc_sys->uc_mcontext.arm_cpsr;
+                if (cpsr_sys & (1 << 5)) { // Thumb mode
+                    uc_sys->uc_mcontext.arm_pc = pc_sys + 2;
+                } else {
+                    uc_sys->uc_mcontext.arm_pc = pc_sys + 4;
+                }
+                __sync_fetch_and_add(&g_crash_counter, -1); // сбрасываем счётчик краша
+                return; // возвращаем управление в игру
+            }
+        }
+    }
+#endif
+
     // ЗАЩИТА ОТ ДВОЙНОГО КРАША:
     if (__sync_fetch_and_add(&g_crash_counter, 1) > 0) {
         struct sigaction sa; sa.sa_handler = SIG_DFL; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
