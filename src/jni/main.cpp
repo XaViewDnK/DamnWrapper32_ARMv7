@@ -10742,6 +10742,18 @@ void* ResolveSymbol(const std::string& name) {
 // --- Структуры Mach-O ---
 struct fat_header { uint32_t magic; uint32_t nfat_arch; }; struct fat_arch { uint32_t cputype; uint32_t cpusubtype; uint32_t offset; uint32_t size; uint32_t align; }; struct mach_header { uint32_t magic; uint32_t cputype; uint32_t cpusubtype; uint32_t filetype; uint32_t ncmds; uint32_t sizeofcmds; uint32_t flags; }; struct load_command { uint32_t cmd; uint32_t cmdsize; }; struct segment_command { uint32_t cmd; uint32_t cmdsize; char segname[16]; uint32_t vmaddr; uint32_t vmsize; uint32_t fileoff; uint32_t filesize; uint32_t maxprot; uint32_t initprot; uint32_t nsects; uint32_t flags; }; struct section { char sectname[16]; char segname[16]; uint32_t addr; uint32_t size; uint32_t offset; uint32_t align; uint32_t reloff; uint32_t nreloc; uint32_t flags; uint32_t reserved1; uint32_t reserved2; }; struct symtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t symoff; uint32_t nsyms; uint32_t stroff; uint32_t strsize; }; struct dysymtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t ilocalsym; uint32_t nlocalsym; uint32_t iextdefsym; uint32_t nextdefsym; uint32_t iundefsym; uint32_t nundefsym; uint32_t tocoff; uint32_t ntoc; uint32_t modtaboff; uint32_t nmodtab; uint32_t extrefsymoff; uint32_t nextrefsyms; uint32_t indirectsymoff; uint32_t nindirectsyms; uint32_t extreloff; uint32_t nextrel; uint32_t locreloff; uint32_t nlocrel; }; struct thread_command { uint32_t cmd; uint32_t cmdsize; uint32_t flavor; uint32_t count; }; struct nlist { union { uint32_t n_strx; } n_un; uint8_t n_type; uint8_t n_sect; int16_t n_desc; uint32_t n_value; }; struct dyld_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t rebase_off; uint32_t rebase_size; uint32_t bind_off; uint32_t bind_size; uint32_t weak_bind_off; uint32_t weak_bind_size; uint32_t lazy_bind_off; uint32_t lazy_bind_size; uint32_t export_off; uint32_t export_size; };
 struct encryption_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t cryptoff; uint32_t cryptsize; uint32_t cryptid; };
+// ФИКС: sectname/segname в Mach-O — это char[16] БЕЗ гарантированного нуль-терминатора,
+// если имя занимает все 16 байт (напр. "__objc_classname" - ровно 16 символов).
+// std::string(sect.sectname) в этом случае читает за пределы массива и захватывает
+// байты соседнего поля segname[16], давая "__objc_classname__TEXT" вместо "__objc_classname".
+// Из-за этого строгие сравнения (sectname == "__objc_classname") молча проваливались,
+// и секция со строками классов уходила в эвристический числовой ребейз вместо пропуска.
+static inline std::string machoFixedName(const char* buf16) {
+    size_t len = 0;
+    while (len < 16 && buf16[len] != '\0') len++;
+    return std::string(buf16, len);
+}
+
 uint64_t read_uleb128(const uint8_t** p) { uint64_t result = 0; int bit = 0; do { result |= ((**p & 0x7f) << bit); bit += 7; } while (*(*p)++ & 0x80); return result; } int64_t read_sleb128(const uint8_t** p) { int64_t result = 0; int bit = 0; uint8_t byte; do { byte = *(*p)++; result |= ((byte & 0x7f) << bit); bit += 7; } while (byte & 0x80); if (byte & 0x40) result |= (-1ULL) << bit; return result; }
 
 void ProcessRebaseOpcodes(int fd, uint32_t arch_offset, uint32_t rebase_off, uint32_t rebase_size, const std::vector<segment_command>& segments, uint32_t slide) {
@@ -11107,7 +11119,7 @@ void LoadMachO(const std::string& bundlePath) {
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     
                     MachOSectionInfo sinfo;
-                    sinfo.name = std::string(sect.segname) + "," + std::string(sect.sectname);
+                    sinfo.name = machoFixedName(sect.segname) + "," + machoFixedName(sect.sectname);
                     sinfo.start = sect.addr;
                     sinfo.end = sect.addr + sect.size;
                     g_machoSections.push_back(sinfo);
@@ -11215,7 +11227,7 @@ void LoadMachO(const std::string& bundlePath) {
                         uint32_t sect_offset = scan_cmd_offset + sizeof(segment_command);
                         for(uint32_t s = 0; s < seg.nsects; s++) {
                             section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect));
-                            std::string sectname = sect.sectname;
+                            std::string sectname = machoFixedName(sect.sectname);
                             
                             bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
                             bool isString = (sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype");
@@ -11317,9 +11329,14 @@ void LoadMachO(const std::string& bundlePath) {
                                 uint32_t count = sect.size / 4;
                                 int data_rebased_count = 0;
                                 
-                                bool is_const_or_data = (sectname == "__const" || sectname == "__data");
+                                // ФИКС: раньше диагностика писалась только для __const/__data, но через этот же
+                                // эвристический цикл проходит ещё ~15 секций (__objc_const, __objc_data,
+                                // __cfstring, __nl_symbol_ptr, __mod_init_func и т.д.) без какого-либо лога.
+                                // Битый указатель из крэша (0x007869F1) не найден ни в __data, ни в __const —
+                                // значит, он там. Дампим теперь диагностику для всех секций этого прохода.
+                                bool dump_diag = true;
                                 FILE* f_diag = nullptr;
-                                if (is_const_or_data) {
+                                if (dump_diag) {
                                     std::string diag_path = g_workDir + "rebase_diag_" + sectname + ".txt";
                                     f_diag = fopen(diag_path.c_str(), "w");
                                     if (f_diag) fprintf(f_diag, "DIAGNOSTICS FOR %s\n", sectname.c_str());
@@ -11328,7 +11345,11 @@ void LoadMachO(const std::string& bundlePath) {
                                 for (uint32_t j = 0; j < count; j++) {
                                     uint32_t val = ptr[j];
                                     
-                                    if (val == 18362952 || val == 18321096 || val == 7339996) {
+                                    // ФИКС: добавлены значения из крэш-лога (Signal 11, R5 = 0x007869F1).
+                                    // Это похоже на недоребейзенный указатель: 0x007869F1 + slide(0x10000000)
+                                    // = 0x107869F1 — валидный адрес в рабочем диапазоне. Проверяем оба варианта
+                                    // (с Thumb-битом и без), чтобы понять, в какой секции он застрял.
+                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440) {
                                         char alert_buf[256];
                                         snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT: Целевая переменная %u (0x%X) найдена по адресу 0x%X (секция %s)", val, val, sect.addr + j*4, sectname.c_str());
                                         LogToJava(alert_buf);
