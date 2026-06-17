@@ -1070,46 +1070,49 @@ void CrashHandler(int sig, siginfo_t *info, void *context) {
             // 199 = lseek
             // 336 = pthread_sigmask / bsdthread_create — просто 0
             // Большинство остальных: возвращаем 0 (успех) и продолжаем
-            uint32_t ret = 0;
-            bool handled = true;
+            // ВАЖНО: При SIGSYS ядро уже остановилось ДО выполнения syscall,
+            // PC указывает на svc инструкцию. Нам нужно пропустить её и эмулировать.
+            // R0 трогаем ТОЛЬКО для syscall'ов которые реально возвращают значение —
+            // иначе затираем this-указатель или другие важные значения.
+            uint32_t ret = r0; // сохраняем R0 по умолчанию
+            bool write_r0 = false;
             switch (syscall_num & 0xFFFF) {
                 case 20:  // getpid
-                    ret = (uint32_t)getpid(); break;
-                case 4:   // write — пусть libc обработает через нормальный путь
+                    ret = (uint32_t)getpid(); write_r0 = true; break;
+                case 4:   // write
                     ret = (uint32_t)write((int)r0,
                         (const void*)uc_sys->uc_mcontext.arm_r1,
                         (size_t)uc_sys->uc_mcontext.arm_r2);
+                    write_r0 = true; break;
+                case 3:   // read
+                    ret = 0; write_r0 = true; break;
+                case 6:   // close — void, R0 не трогаем
                     break;
-                case 6:   // close
-                    ret = 0; break;
                 case 33:  // access
-                    ret = 0; break;
-                case 90:  // mmap — возвращаем MAP_FAILED (0xFFFFFFFF), пусть игра использует malloc
+                    ret = 0; write_r0 = true; break;
+                case 90:  // mmap
                 case 194: // mmap2
-                    ret = (uint32_t)MAP_FAILED; break;
+                    ret = (uint32_t)MAP_FAILED; write_r0 = true; break;
                 case 199: // lseek
-                    ret = 0; break;
-                case 240: // bsdthread_create — заглушка
+                    ret = 0; write_r0 = true; break;
+                case 240: // bsdthread_create
                 case 241: // bsdthread_terminate
                 case 336: // pthread_sigmask
-                    ret = 0; break;
+                    break; // void — R0 не трогаем
                 default:
-                    // Неизвестный syscall — возвращаем 0 и продолжаем
-                    ret = 0; break;
+                    break; // неизвестный — R0 не трогаем, просто пропускаем svc
             }
-            if (handled) {
-                uc_sys->uc_mcontext.arm_r0 = ret;
-                // Пропускаем svc инструкцию (2 байта в Thumb, 4 байта в ARM)
-                uint32_t pc_sys = uc_sys->uc_mcontext.arm_pc;
-                uint32_t cpsr_sys = uc_sys->uc_mcontext.arm_cpsr;
-                if (cpsr_sys & (1 << 5)) { // Thumb mode
-                    uc_sys->uc_mcontext.arm_pc = pc_sys + 2;
-                } else {
-                    uc_sys->uc_mcontext.arm_pc = pc_sys + 4;
-                }
-                __sync_fetch_and_add(&g_crash_counter, -1); // сбрасываем счётчик краша
-                return; // возвращаем управление в игру
+            if (write_r0) uc_sys->uc_mcontext.arm_r0 = ret;
+            // Пропускаем svc: Thumb = 2 байта, ARM32 = 4 байта
+            uint32_t pc_sys = uc_sys->uc_mcontext.arm_pc;
+            uint32_t cpsr_sys = uc_sys->uc_mcontext.arm_cpsr;
+            if (cpsr_sys & (1 << 5)) {
+                uc_sys->uc_mcontext.arm_pc = pc_sys + 2;
+            } else {
+                uc_sys->uc_mcontext.arm_pc = pc_sys + 4;
             }
+            __sync_fetch_and_add(&g_crash_counter, -1);
+            return;
         }
     }
 #endif
