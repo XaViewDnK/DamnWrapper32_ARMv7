@@ -11516,102 +11516,84 @@ void LoadMachO(const std::string& bundlePath) {
                                 // Проход 1: сканируем __text, находим все инструкции вида
                                 //   ADD Rx, PC, Rm  и  LDR Rx, [PC, Rm]
                                 //   Для каждой ищем назад (до 128 слов) MOVW Rm / MOVT Rm.
-                                //   Найденные индексы помечаем в no_patch_set.
-                                // Проход 2: патчим все MOVW/MOVT пары, не вошедшие в no_patch_set,
+                                //   Найденные индексы помечаем в no_patch (vector<bool> по индексу).
+                                // Проход 2: патчим все MOVW/MOVT пары, не вошедшие в no_patch,
                                 //   если их адрес попадает в vmaddr-диапазон бинаря.
+                                //
+                                // Лямбды не используются (совместимость с NDK r17c / Clang 6).
                                 {
-                                    auto decode_imm16_arm = [](uint32_t w) -> uint32_t {
-                                        return ((w >> 4) & 0xF000) | (w & 0xFFF);
-                                    };
-                                    auto encode_imm16_arm = [](uint32_t w, uint32_t val16) -> uint32_t {
-                                        return (w & 0xFFF0F000) | ((val16 & 0xF000) << 4) | (val16 & 0xFFF);
-                                    };
                                     const uint32_t* arm_ptr = (const uint32_t*)code;
                                     size_t arm_count = code_size / 4;
-                                    // Максимум инструкций для обратного поиска MOVW/MOVT
                                     const size_t BACK_WINDOW = 128;
 
-                                    // Проход 1: строим множество индексов MOVW, которые являются
-                                    // PC-относительными смещениями (не абсолютными указателями).
-                                    std::set<size_t> no_patch_set;
+                                    // Проход 1: помечаем MOVW-индексы, которые являются PC-смещениями
+                                    std::vector<bool> no_patch(arm_count, false);
                                     for (size_t ai = 0; ai < arm_count; ai++) {
                                         uint32_t w = arm_ptr[ai];
                                         uint32_t Rn = (w >> 16) & 0xF;
-                                        if (Rn != 15) continue; // интересуют только инструкции с Rn=PC
+                                        if (Rn != 15) continue; // только инструкции с Rn=PC
 
-                                        uint32_t Rm_used = 0;
-                                        bool is_pc_relative_use = false;
-
-                                        uint8_t op_hi = (w >> 24) & 0xF;
-                                        // ADD/SUB/... Rx, PC, Rm  (data processing, register, Rn=PC)
+                                        uint32_t Rm_used = w & 0xF;
+                                        bool is_pc_rel = false;
+                                        uint32_t op_hi = (w >> 24) & 0xF;
+                                        // ADD/SUB/... Rx, PC, Rm  — data processing, регистровая форма
                                         // bits[27:26]=00, [25]=0 -> op_hi in {0x0,0x1}
-                                        if ((op_hi == 0x0 || op_hi == 0x1) && (w & 0x0E000000) == 0) {
-                                            Rm_used = w & 0xF;
-                                            // Только если Rm != PC (не ADD PC,PC,PC)
-                                            if (Rm_used != 15) is_pc_relative_use = true;
+                                        if ((op_hi == 0x0 || op_hi == 0x1) && (w & 0x0E000000) == 0 && Rm_used != 15) {
+                                            is_pc_rel = true;
                                         }
-                                        // LDR/STR Rx, [PC, Rm]  (load/store register, Rn=PC)
+                                        // LDR/STR Rx, [PC, Rm] — load/store регистровая форма
                                         // bits[27:26]=01, [25]=1 -> op_hi in {0x6,0x7}
-                                        else if (op_hi == 0x6 || op_hi == 0x7) {
-                                            Rm_used = w & 0xF;
-                                            if (Rm_used != 15) is_pc_relative_use = true;
+                                        else if ((op_hi == 0x6 || op_hi == 0x7) && Rm_used != 15) {
+                                            is_pc_rel = true;
                                         }
+                                        if (!is_pc_rel) continue;
 
-                                        if (!is_pc_relative_use) continue;
-
-                                        // Ищем назад до BACK_WINDOW слов: MOVT Rm_used, затем MOVW Rm_used
+                                        // Ищем назад MOVT Rm_used, затем MOVW Rm_used
                                         size_t back_start = (ai >= BACK_WINDOW) ? ai - BACK_WINDOW : 0;
-                                        // Сначала ищем MOVT (он должен быть прямо перед использованием)
                                         for (size_t bi = ai; bi > back_start; bi--) {
                                             uint32_t bw = arm_ptr[bi - 1];
                                             uint32_t bRd = (bw >> 12) & 0xF;
-                                            // MOVT?
                                             if (((bw >> 20) & 0xFF) == 0x34 && bRd == Rm_used) {
-                                                // Нашли MOVT. Ищем MOVW ещё на шаг назад.
+                                                // Нашли MOVT — ищем MOVW на шаг раньше
                                                 if (bi >= 2) {
                                                     uint32_t bw2 = arm_ptr[bi - 2];
-                                                    uint32_t bRd2 = (bw2 >> 12) & 0xF;
-                                                    if (((bw2 >> 20) & 0xFF) == 0x30 && bRd2 == Rm_used) {
-                                                        // MOVW+MOVT пара найдена: пометить как PC-смещение
-                                                        no_patch_set.insert(bi - 2); // индекс MOVW
+                                                    if (((bw2 >> 20) & 0xFF) == 0x30 && ((bw2 >> 12) & 0xF) == Rm_used) {
+                                                        no_patch[bi - 2] = true; // индекс MOVW
                                                     }
                                                 }
-                                                break; // нашли MOVT — дальше не ищем
+                                                break;
                                             }
-                                            // Если встретили другую инструкцию, записывающую Rm_used (Rd==Rm_used),
-                                            // значит определение уже перекрыто — прекращаем поиск.
-                                            uint32_t bRd_write = (bw >> 12) & 0xF;
-                                            uint8_t bop = (bw >> 24) & 0xF;
-                                            bool writes_rd = (bRd_write == Rm_used) &&
-                                                             (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)); // data proc
-                                            if (writes_rd && ((bw >> 20) & 0xFF) != 0x34) break;
+                                            // Прерываем если встретили другую запись в Rm_used
+                                            uint32_t bop = (bw >> 24) & 0xF;
+                                            bool writes_rm = (bRd == Rm_used) && (((bw >> 20) & 0xFF) != 0x34) &&
+                                                             (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF));
+                                            if (writes_rm) break;
                                         }
                                     }
 
-                                    // Проход 2: патчим все MOVW/MOVT пары вне no_patch_set
+                                    // Проход 2: патчим незапрещённые MOVW/MOVT пары
                                     int arm_movt_patched = 0;
                                     for (size_t ai = 0; ai + 1 < arm_count; ai++) {
                                         uint32_t w0 = arm_ptr[ai];
                                         uint32_t w1 = arm_ptr[ai + 1];
-                                        // Ищем MOVW (0x30) + MOVT (0x34) с одним Rd
                                         if (((w0 >> 20) & 0xFF) != 0x30) continue;
                                         if (((w1 >> 20) & 0xFF) != 0x34) continue;
-                                        uint32_t rd = (w0 >> 12) & 0xF;
-                                        if (rd != ((w1 >> 12) & 0xF)) continue;
-                                        // Пропускаем PC-относительные смещения
-                                        if (no_patch_set.count(ai)) { ai++; continue; }
-                                        // Проверяем диапазон адреса
-                                        uint32_t lo16 = decode_imm16_arm(w0);
-                                        uint32_t hi16 = decode_imm16_arm(w1);
+                                        if (((w0 >> 12) & 0xF) != ((w1 >> 12) & 0xF)) continue;
+                                        if (no_patch[ai]) { ai++; continue; }
+                                        // Декодируем imm16: (bits[19:16] << 12) | bits[11:0]
+                                        uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
+                                        uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
                                         uint32_t full_addr = (hi16 << 16) | lo16;
                                         if (full_addr < min_vmaddr || full_addr >= max_vmaddr || full_addr <= 0x1000) continue;
-                                        // Патчим
+                                        // Кодируем patched значение обратно
                                         uint32_t patched = full_addr + g_appSlide;
-                                        uint32_t* patch_ptr = const_cast<uint32_t*>(&arm_ptr[ai]);
-                                        patch_ptr[0] = encode_imm16_arm(w0, patched & 0xFFFF);
-                                        patch_ptr[1] = encode_imm16_arm(w1, (patched >> 16) & 0xFFFF);
+                                        uint32_t new_lo = patched & 0xFFFF;
+                                        uint32_t new_hi = (patched >> 16) & 0xFFFF;
+                                        uint32_t* pp = const_cast<uint32_t*>(&arm_ptr[ai]);
+                                        pp[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
+                                        pp[1] = (w1 & 0xFFF0F000) | ((new_hi & 0xF000) << 4) | (new_hi & 0xFFF);
                                         arm_movt_patched++;
-                                        ai++; // пропускаем MOVT
+                                        ai++;
                                     }
                                     if (arm_movt_patched > 0)
                                         LogToJava("CUSTOM-PARSER: Пропатчено ARM MOVW/MOVT пар: " + std::to_string(arm_movt_patched));
