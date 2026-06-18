@@ -11849,6 +11849,41 @@ void LoadMachO(const std::string& bundlePath) {
                 }
             }
         }
+
+        // ФИКС КРАША: Asphalt6 и другие старые бинари (iOS 3.x, без полного LC_DYLD_INFO
+        // или с dyld_lazy_bind_size == 0) могут оставлять часть __la_symbol_ptr слотов
+        // нетронутыми — в них лежит pre-slide адрес __stub_helper (например, 0x003B85A4).
+        // Когда mod_init_func вызывает функцию через такой слот, PC прыгает на pre-slide
+        // адрес → SIGSEGV (Signal 11, Fault addr == PC, нет маппинга по этому адресу).
+        //
+        // Решение: после всего биндинга обходим все dysym-слоты и любой слот, который
+        // всё ещё указывает в pre-slide диапазон бинаря (т.е. не был заполнен HLE/bind),
+        // принудительно сдвигаем на +slide. Это корректно: такой слот содержит адрес
+        // __stub_helper в файловом пространстве, и +slide даёт правильный runtime-адрес.
+        // Попадание в __stub_helper с корректным адресом безвредно — он просто вызовет
+        // dyld_stub_binder, который у нас заглушён и вернёт 0.
+        {
+            int la_fixed = 0;
+            for (const auto& sect : dysym_sections) {
+                uint8_t sect_type = sect.flags & 0xff;
+                if (sect_type != 7 /* S_LAZY_SYMBOL_POINTERS */) continue; // только __la_symbol_ptr
+                uint32_t* ptr_table = (uint32_t*)sect.addr;
+                uint32_t num_pointers = sect.size / 4;
+                for (uint32_t i = 0; i < num_pointers; i++) {
+                    uint32_t val = ptr_table[i];
+                    // Слот в pre-slide диапазоне бинаря — ещё не заполнен биндингом
+                    if (val >= min_vmaddr && val < max_vmaddr) {
+                        ptr_table[i] = val + g_appSlide;
+                        la_fixed++;
+                    }
+                }
+            }
+            if (la_fixed > 0) {
+                LogToJava("REBASE-FIX: Принудительно ребейзено " + std::to_string(la_fixed) +
+                          " необработанных __la_symbol_ptr слотов (pre-slide stub_helper адреса → +slide). "
+                          "Это предотвращает SIGSEGV при вызове через незаполненный lazy-слот.");
+            }
+        }
     }
     cmd_offset = arch_offset + sizeof(mach_header);
     for (uint32_t i = 0; i < mh.ncmds; i++) {
