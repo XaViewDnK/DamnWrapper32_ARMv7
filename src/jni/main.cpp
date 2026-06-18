@@ -11850,38 +11850,62 @@ void LoadMachO(const std::string& bundlePath) {
             }
         }
 
-        // ФИКС КРАША: Asphalt6 и другие старые бинари (iOS 3.x, без полного LC_DYLD_INFO
-        // или с dyld_lazy_bind_size == 0) могут оставлять часть __la_symbol_ptr слотов
-        // нетронутыми — в них лежит pre-slide адрес __stub_helper (например, 0x003B85A4).
-        // Когда mod_init_func вызывает функцию через такой слот, PC прыгает на pre-slide
-        // адрес → SIGSEGV (Signal 11, Fault addr == PC, нет маппинга по этому адресу).
+        // ФИКС КРАША: Asphalt6 и другие старые бинари (iOS 3.x) могут оставлять часть
+        // __la_symbol_ptr / __nl_symbol_ptr слотов нетронутыми после биндинга.
+        // В них лежит pre-slide адрес __stub_helper (например, 0x003B85A4).
+        // Когда mod_init_func или любой другой код вызывает функцию через такой слот,
+        // PC прыгает на pre-slide адрес → SIGSEGV (Signal 11).
         //
-        // Решение: после всего биндинга обходим все dysym-слоты и любой слот, который
-        // всё ещё указывает в pre-slide диапазон бинаря (т.е. не был заполнен HLE/bind),
-        // принудительно сдвигаем на +slide. Это корректно: такой слот содержит адрес
-        // __stub_helper в файловом пространстве, и +slide даёт правильный runtime-адрес.
-        // Попадание в __stub_helper с корректным адресом безвредно — он просто вызовет
-        // dyld_stub_binder, который у нас заглушён и вернёт 0.
+        // Решение: обходим ВСЕ dysym-слоты (type 6 = nl_symbol_ptr, type 7 = la_symbol_ptr,
+        // а также type 8 = symbol_stubs на случай нестандартного флага).
+        // Любой слот, значение которого попадает в pre-slide диапазон бинаря
+        // [min_vmaddr, max_vmaddr), принудительно сдвигается на +slide.
+        // Слоты, уже заполненные HLE (адреса >> max_vmaddr), не затрагиваются.
         {
             int la_fixed = 0;
+            // Эвристический диапазон pre-slide адресов: расширяем чуть вниз до 0
+            // на случай если min_vmaddr = 0 (PIE с vmaddr=0)
+            uint32_t pre_slide_lo = (min_vmaddr > 0x1000) ? min_vmaddr : 0;
+            uint32_t pre_slide_hi = max_vmaddr;
             for (const auto& sect : dysym_sections) {
                 uint8_t sect_type = sect.flags & 0xff;
-                if (sect_type != 7 /* S_LAZY_SYMBOL_POINTERS */) continue; // только __la_symbol_ptr
+                // Обрабатываем: S_NON_LAZY_SYMBOL_POINTERS(6), S_LAZY_SYMBOL_POINTERS(7), S_SYMBOL_STUBS(8)
+                // и любой другой тип — всё равно проверка по значению безопасна.
+                (void)sect_type; // Убираем фильтр по типу — проверяем по значению
                 uint32_t* ptr_table = (uint32_t*)sect.addr;
                 uint32_t num_pointers = sect.size / 4;
                 for (uint32_t i = 0; i < num_pointers; i++) {
                     uint32_t val = ptr_table[i];
-                    // Слот в pre-slide диапазоне бинаря — ещё не заполнен биндингом
-                    if (val >= min_vmaddr && val < max_vmaddr) {
+                    // Слот содержит pre-slide адрес — ещё не заполнен биндингом
+                    if (val > pre_slide_lo && val < pre_slide_hi) {
+                        uint32_t slotAddr = sect.addr + i * 4; // post-slide адрес слота
+                        // Детальный лог для диагностики (особенно известный crash-адрес)
+                        if (val == 0x003B85A4 || la_fixed < 5) {
+                            char dbgBuf[256];
+                            snprintf(dbgBuf, sizeof(dbgBuf),
+                                "DYSYM-SLOT-FIX: slot[%u] @ 0x%08X: pre-slide val 0x%08X → 0x%08X",
+                                i, slotAddr, val, val + g_appSlide);
+                            LogToJava(std::string(dbgBuf));
+                        }
                         ptr_table[i] = val + g_appSlide;
                         la_fixed++;
                     }
                 }
             }
             if (la_fixed > 0) {
-                LogToJava("REBASE-FIX: Принудительно ребейзено " + std::to_string(la_fixed) +
-                          " необработанных __la_symbol_ptr слотов (pre-slide stub_helper адреса → +slide). "
-                          "Это предотвращает SIGSEGV при вызове через незаполненный lazy-слот.");
+                LogToJava("DYSYM-SLOT-FIX: Принудительно ребейзено " + std::to_string(la_fixed) +
+                          " необработанных dysym слотов (+slide). pre_slide range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_lo) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_hi) +
+                          ")");
+            } else {
+                LogToJava("DYSYM-SLOT-FIX: Все dysym слоты уже заполнены биндингом (0 необработанных). "
+                          "pre_slide range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_lo) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_hi) +
+                          ")");
             }
         }
     }
