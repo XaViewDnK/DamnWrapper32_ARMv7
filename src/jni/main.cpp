@@ -11503,6 +11503,60 @@ void LoadMachO(const std::string& bundlePath) {
                                 }
                                 LogToJava("CUSTOM-PARSER: Успешно разобрано " + std::to_string(parsed_count) + " инструкций.");
                                 LogToJava("CUSTOM-PARSER: Изменено абсолютных указателей в пулах: " + std::to_string(modified_literals));
+
+                                // ARM MOVW/MOVT PATCH:
+                                // Некоторые функции в __text компилируются в ARM-режиме (а не Thumb).
+                                // ARM MOVW/MOVT пары кодируют абсолютные 32-битные адреса прямо в инструкциях,
+                                // а Thumb-парсер выше их не видит (неправильная интерпретация байт).
+                                // Паттерн:
+                                //   MOVW Rd, #lo16  -> (word >> 20) & 0xFF == 0x30, условие = 0xE
+                                //   MOVT Rd, #hi16  -> (word >> 20) & 0xFF == 0x34, тот же Rd
+                                // Если собранный адрес попадает в vmaddr диапазон бинаря — добавляем slide.
+                                {
+                                    int arm_movt_patched = 0;
+                                    // Сканируем по 4 байта (ARM инструкции выровнены по 4)
+                                    const uint32_t* arm_ptr = (const uint32_t*)code;
+                                    size_t arm_count = code_size / 4;
+                                    for (size_t ai = 0; ai + 1 < arm_count; ai++) {
+                                        uint32_t w0 = arm_ptr[ai];
+                                        uint32_t w1 = arm_ptr[ai + 1];
+                                        // ARM MOVW: bits[31:28]=0xE (always), bits[27:20]=0x30
+                                        // ARM MOVT: bits[31:28]=0xE (always), bits[27:20]=0x34
+                                        bool is_movw = ((w0 >> 20) & 0xFF) == 0x30;
+                                        bool is_movt = ((w1 >> 20) & 0xFF) == 0x34;
+                                        if (!is_movw || !is_movt) continue;
+                                        // Rd должен совпадать
+                                        uint32_t rd0 = (w0 >> 12) & 0xF;
+                                        uint32_t rd1 = (w1 >> 12) & 0xF;
+                                        if (rd0 != rd1) continue;
+                                        // Декодируем 16-битные значения из MOVW/MOVT
+                                        auto decode_imm16 = [](uint32_t w) -> uint32_t {
+                                            return ((w >> 4) & 0xF000) | (w & 0xFFF);
+                                        };
+                                        uint32_t lo16 = decode_imm16(w0);
+                                        uint32_t hi16 = decode_imm16(w1);
+                                        uint32_t full_addr = (hi16 << 16) | lo16;
+                                        // Проверяем: адрес в диапазоне vmaddr бинаря (до slide)
+                                        if (full_addr < min_vmaddr || full_addr >= max_vmaddr || full_addr <= 0x1000) continue;
+                                        // Патчим: добавляем slide в оба слова
+                                        uint32_t patched = full_addr + g_appSlide;
+                                        uint32_t new_lo = patched & 0xFFFF;
+                                        uint32_t new_hi = (patched >> 16) & 0xFFFF;
+                                        auto encode_imm16 = [](uint32_t w, uint32_t val16) -> uint32_t {
+                                            return (w & 0xFFF0F000) | ((val16 & 0xF000) << 4) | (val16 & 0xFFF);
+                                        };
+                                        uint32_t new_w0 = encode_imm16(w0, new_lo);
+                                        uint32_t new_w1 = encode_imm16(w1, new_hi);
+                                        // Записываем обратно (память уже r/w после mmap)
+                                        uint32_t* patch_ptr = const_cast<uint32_t*>(&arm_ptr[ai]);
+                                        patch_ptr[0] = new_w0;
+                                        patch_ptr[1] = new_w1;
+                                        arm_movt_patched++;
+                                        ai++; // Пропускаем MOVT (уже обработан)
+                                    }
+                                    if (arm_movt_patched > 0)
+                                        LogToJava("CUSTOM-PARSER: Пропатчено ARM MOVW/MOVT пар: " + std::to_string(arm_movt_patched));
+                                }
                             } else if (!isString && !isDysymSlot && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Эвристический ребейз секции данных: " + sectname);
                                 uint32_t* ptr = (uint32_t*)(sect.addr + g_appSlide);
