@@ -11722,7 +11722,12 @@ void LoadMachO(const std::string& bundlePath) {
                                             bool is_raw_string_target = (target_section.find("__cstring") != std::string::npos || 
                                                                          target_section.find("__objc_methname") != std::string::npos || 
                                                                          target_section.find("__objc_classname") != std::string::npos || 
-                                                                         target_section.find("__objc_methtype") != std::string::npos);
+                                                                         target_section.find("__objc_methtype") != std::string::npos ||
+                                                                         // FIX: __ustring содержит UTF-16 данные CFString литералов.
+                                                                         // isValidString() не работает для UTF-16 (возвращает false на '\0' в старшем байте),
+                                                                         // поэтому указатели на __ustring раньше падали в ветку else и игнорировались.
+                                                                         // Трактуем __ustring как сырую строку и ребейзим если shifted_val mapped.
+                                                                         target_section.find("__ustring") != std::string::npos);
                                                                          
                                             bool is_struct_target = (target_section.find("__cfstring") != std::string::npos || 
                                                                      target_section.find("__objc_const") != std::string::npos || 
@@ -11774,13 +11779,22 @@ void LoadMachO(const std::string& bundlePath) {
                                                     else {
                                                         uint32_t* cfstr = (uint32_t*)shifted_val;
                                                         uint32_t str_ptr = cfstr[2];
-                                                        if (str_ptr < min_vmaddr || str_ptr >= max_vmaddr) { safe_to_rebase = false; reason = "CFString: Invalid Ptr"; }
+                                                        // FIX: __cfstring может быть уже ребейзнут к этому моменту
+                                                        // (он обрабатывается раньше второго прохода __const).
+                                                        // Тогда str_ptr уже содержит post-slide адрес (>= max_vmaddr).
+                                                        // Нормализуем: если str_ptr выглядит как post-slide — вычитаем slide.
+                                                        uint32_t norm_str_ptr = str_ptr;
+                                                        if (str_ptr >= max_vmaddr && str_ptr >= g_appSlide) {
+                                                            norm_str_ptr = str_ptr - g_appSlide;
+                                                        }
+                                                        if (norm_str_ptr < min_vmaddr || norm_str_ptr >= max_vmaddr || norm_str_ptr <= 0x1000) { safe_to_rebase = false; reason = "CFString: Invalid Ptr"; }
                                                         else {
-                                                            uint32_t shifted_str_ptr = str_ptr + g_appSlide;
+                                                            uint32_t shifted_str_ptr = norm_str_ptr + g_appSlide;
                                                             bool sp_mapped = false;
                                                             for (const auto& sInfo : g_machoSections) { if (shifted_str_ptr >= sInfo.start && shifted_str_ptr < sInfo.end) { sp_mapped = true; break; } }
                                                             if (!sp_mapped) { safe_to_rebase = false; reason = "CFString: Unmapped Str"; }
-                                                            else if (!isValidString((const char*)shifted_str_ptr)) { safe_to_rebase = false; reason = "CFString: Invalid Str"; }
+                                                            // Не проверяем isValidString для str_ptr — это может быть UTF-16
+                                                            // (__ustring) или другой бинарный формат. Маппинга достаточно.
                                                         }
                                                     }
                                                 }
