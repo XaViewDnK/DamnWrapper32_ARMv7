@@ -11597,6 +11597,77 @@ void LoadMachO(const std::string& bundlePath) {
                                     }
                                     if (arm_movt_patched > 0)
                                         LogToJava("CUSTOM-PARSER: Пропатчено ARM MOVW/MOVT пар: " + std::to_string(arm_movt_patched));
+
+                                    // ARM32 LDR Rx, [PC, #imm12] literal pool patch
+                                    // -----------------------------------------------
+                                    // Thumb-парсер выше обрабатывает только Thumb LDR Rx,[PC,#imm].
+                                    // MOVW/MOVT патчер обрабатывает только inline-пары.
+                                    // ARM32-функции в FAT-бинаре используют LDR Rx,[PC,#imm12]:
+                                    //   E59Fxyyy = LDR Rx,[PC,#+yyy]   (U=1)
+                                    //   E51Fxyyy = LDR Rx,[PC,#-yyy]   (U=0)
+                                    // Literal pool по этому адресу содержит pre-slide указатель,
+                                    // который нужно сдвинуть на g_appSlide.
+                                    // Именно такой пропуск привёл к крэшу (PC=0x10330c88, R5=0x007869f1).
+                                    {
+                                        // Адрес начала секции __text до сдвига
+                                        uint32_t text_vmaddr = sect.addr; // pre-slide
+                                        const uint32_t* arm32_ptr = (const uint32_t*)code;
+                                        int arm_ldrpc_patched = 0;
+
+                                        for (size_t ai = 0; ai < arm_count; ai++) {
+                                            uint32_t w = arm32_ptr[ai];
+                                            // Проверяем ARM32 unconditional/conditional LDR Rx,[PC,#imm12]:
+                                            // bits[27:20]: 0101 U001  (LDR, Rn=PC)
+                                            //   U=1: 0x059F → mask 0x0FFF0000 == 0x059F0000
+                                            //   U=0: 0x051F → mask 0x0FFF0000 == 0x051F0000
+                                            uint32_t field = w & 0x0FFF0000;
+                                            bool is_ldr_pc_pos = (field == 0x059F0000);
+                                            bool is_ldr_pc_neg = (field == 0x051F0000);
+                                            if (!is_ldr_pc_pos && !is_ldr_pc_neg) continue;
+
+                                            uint32_t imm12 = w & 0x00000FFF;
+                                            // PC при исполнении = адрес инструкции + 8
+                                            uint32_t instr_vmaddr = text_vmaddr + (uint32_t)(ai * 4);
+                                            uint32_t pc_val = instr_vmaddr + 8;
+                                            uint32_t lit_vmaddr = is_ldr_pc_pos ? (pc_val + imm12) : (pc_val - imm12);
+
+                                            // Literal pool должен быть в пределах файла
+                                            if (lit_vmaddr < min_vmaddr || lit_vmaddr >= max_vmaddr) continue;
+                                            uint32_t lit_host = lit_vmaddr + g_appSlide;
+
+                                            // Проверяем что адрес смапирован
+                                            bool lit_mapped = false;
+                                            for (const auto& sInfo : g_machoSections) {
+                                                if (lit_host >= sInfo.start && (lit_host + 4) <= sInfo.end) {
+                                                    lit_mapped = true; break;
+                                                }
+                                            }
+                                            if (!lit_mapped) continue;
+
+                                            uint32_t val;
+                                            memcpy(&val, (void*)lit_host, 4);
+
+                                            // Значение должно быть pre-slide указателем в диапазоне бинаря
+                                            if (val < min_vmaddr || val >= max_vmaddr || val <= 0x1000) continue;
+
+                                            // Дополнительная проверка: shifted_val должен попадать в mapped секцию
+                                            uint32_t shifted_val = val + g_appSlide;
+                                            bool sv_mapped = false;
+                                            for (const auto& sInfo : g_machoSections) {
+                                                if (shifted_val >= sInfo.start && shifted_val < sInfo.end) {
+                                                    sv_mapped = true; break;
+                                                }
+                                            }
+                                            if (!sv_mapped) continue;
+
+                                            // Патчим literal pool (сохраняя Thumb-бит если есть)
+                                            uint32_t patched_val = val + g_appSlide;
+                                            memcpy((void*)lit_host, &patched_val, 4);
+                                            arm_ldrpc_patched++;
+                                        }
+                                        if (arm_ldrpc_patched > 0)
+                                            LogToJava("CUSTOM-PARSER: Пропатчено ARM32 LDR-PC literal pools: " + std::to_string(arm_ldrpc_patched));
+                                    }
                                 }
                             } else if (!isString && !isDysymSlot && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Эвристический ребейз секции данных: " + sectname);
