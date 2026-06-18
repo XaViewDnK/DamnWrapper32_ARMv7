@@ -11509,48 +11509,71 @@ void LoadMachO(const std::string& bundlePath) {
                                 // ARM MOVW/MOVT пары кодируют абсолютные 32-битные адреса прямо в инструкциях,
                                 // а Thumb-парсер выше их не видит (неправильная интерпретация байт).
                                 // Паттерн:
-                                //   MOVW Rd, #lo16  -> (word >> 20) & 0xFF == 0x30, условие = 0xE
-                                //   MOVT Rd, #hi16  -> (word >> 20) & 0xFF == 0x34, тот же Rd
-                                // Если собранный адрес попадает в vmaddr диапазон бинаря — добавляем slide.
+                                //   MOVW Rd, #lo16  -> bits[27:20]=0x30 (cond=E, always)
+                                //   MOVT Rd, #hi16  -> bits[27:20]=0x34 (cond=E, always), тот же Rd
+                                // ВАЖНО: lookahead — если Rd затем используется как смещение к PC
+                                // (LDR/STR/ADD с Rn=PC=15 и Rm=Rd) — это табличный offset, НЕ абсолютный
+                                // указатель, и патчить его НЕ нужно (иначе двойной сдвиг).
                                 {
                                     int arm_movt_patched = 0;
+                                    auto decode_imm16_arm = [](uint32_t w) -> uint32_t {
+                                        // ARM MOVW/MOVT: imm16 = (bits[19:16] << 12) | bits[11:0]
+                                        return ((w >> 4) & 0xF000) | (w & 0xFFF);
+                                    };
+                                    auto encode_imm16_arm = [](uint32_t w, uint32_t val16) -> uint32_t {
+                                        return (w & 0xFFF0F000) | ((val16 & 0xF000) << 4) | (val16 & 0xFFF);
+                                    };
                                     // Сканируем по 4 байта (ARM инструкции выровнены по 4)
                                     const uint32_t* arm_ptr = (const uint32_t*)code;
                                     size_t arm_count = code_size / 4;
                                     for (size_t ai = 0; ai + 1 < arm_count; ai++) {
                                         uint32_t w0 = arm_ptr[ai];
                                         uint32_t w1 = arm_ptr[ai + 1];
-                                        // ARM MOVW: bits[31:28]=0xE (always), bits[27:20]=0x30
-                                        // ARM MOVT: bits[31:28]=0xE (always), bits[27:20]=0x34
-                                        bool is_movw = ((w0 >> 20) & 0xFF) == 0x30;
-                                        bool is_movt = ((w1 >> 20) & 0xFF) == 0x34;
-                                        if (!is_movw || !is_movt) continue;
+                                        // ARM MOVW: cond=0xE, bits[27:20]=0x30
+                                        // ARM MOVT: cond=0xE, bits[27:20]=0x34
+                                        if (((w0 >> 20) & 0xFF) != 0x30) continue;
+                                        if (((w1 >> 20) & 0xFF) != 0x34) continue;
                                         // Rd должен совпадать
-                                        uint32_t rd0 = (w0 >> 12) & 0xF;
-                                        uint32_t rd1 = (w1 >> 12) & 0xF;
-                                        if (rd0 != rd1) continue;
-                                        // Декодируем 16-битные значения из MOVW/MOVT
-                                        auto decode_imm16 = [](uint32_t w) -> uint32_t {
-                                            return ((w >> 4) & 0xF000) | (w & 0xFFF);
-                                        };
-                                        uint32_t lo16 = decode_imm16(w0);
-                                        uint32_t hi16 = decode_imm16(w1);
+                                        uint32_t rd = (w0 >> 12) & 0xF;
+                                        if (rd != ((w1 >> 12) & 0xF)) continue;
+                                        // Декодируем полный 32-битный адрес
+                                        uint32_t lo16 = decode_imm16_arm(w0);
+                                        uint32_t hi16 = decode_imm16_arm(w1);
                                         uint32_t full_addr = (hi16 << 16) | lo16;
-                                        // Проверяем: адрес в диапазоне vmaddr бинаря (до slide)
+                                        // Проверяем: адрес в vmaddr диапазоне бинаря (до slide)
                                         if (full_addr < min_vmaddr || full_addr >= max_vmaddr || full_addr <= 0x1000) continue;
-                                        // Патчим: добавляем slide в оба слова
+                                        // LOOKAHEAD: проверяем, не используется ли Rd как смещение к PC.
+                                        // Если да — это табличный offset (switch/jump table), не трогаем.
+                                        // Паттерны:
+                                        //   LDR/STR Rx,[PC,Rd±shift]: (w & 0xFF0F0FF0)==0xE70F0000 && (w&0xF)==rd
+                                        //   ADD/SUB Rx,PC,Rd:         (w & 0xFF0FFFF0)==0xE08F0000 && (w&0xF)==rd  (ADD)
+                                        //   ADD/SUB Rx,PC,Rd:         (w & 0xFF0FFFF0)==0xE04F0000 && (w&0xF)==rd  (SUB)
+                                        bool is_table_offset = false;
+                                        size_t lookahead_limit = std::min(ai + 2 + 8, arm_count);
+                                        for (size_t li = ai + 2; li < lookahead_limit; li++) {
+                                            uint32_t lw = arm_ptr[li];
+                                            uint32_t lRm = lw & 0xF;
+                                            uint32_t lRn = (lw >> 16) & 0xF;
+                                            if (lRm != rd) continue;
+                                            // LDR/STR с Rn=PC: cond=E, L/S, Rn=15
+                                            // General: byte3=0xE?, byte2 has Rn=15 -> (lw>>16)&0xF == 15
+                                            if (lRn == 15) {
+                                                // Проверяем что это load/store/add с register offset (не immediate)
+                                                // bits[25]=1 (register operand) и это data processing или load/store
+                                                uint8_t op = (lw >> 24) & 0xF;
+                                                if (op == 0x7 || op == 0x6 || // LDR/STR register
+                                                    op == 0x0 || op == 0x1) {  // Data proc (ADD/SUB/etc)
+                                                    is_table_offset = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (is_table_offset) continue;
+                                        // Патчим: добавляем slide
                                         uint32_t patched = full_addr + g_appSlide;
-                                        uint32_t new_lo = patched & 0xFFFF;
-                                        uint32_t new_hi = (patched >> 16) & 0xFFFF;
-                                        auto encode_imm16 = [](uint32_t w, uint32_t val16) -> uint32_t {
-                                            return (w & 0xFFF0F000) | ((val16 & 0xF000) << 4) | (val16 & 0xFFF);
-                                        };
-                                        uint32_t new_w0 = encode_imm16(w0, new_lo);
-                                        uint32_t new_w1 = encode_imm16(w1, new_hi);
-                                        // Записываем обратно (память уже r/w после mmap)
                                         uint32_t* patch_ptr = const_cast<uint32_t*>(&arm_ptr[ai]);
-                                        patch_ptr[0] = new_w0;
-                                        patch_ptr[1] = new_w1;
+                                        patch_ptr[0] = encode_imm16_arm(w0, patched & 0xFFFF);
+                                        patch_ptr[1] = encode_imm16_arm(w1, (patched >> 16) & 0xFFFF);
                                         arm_movt_patched++;
                                         ai++; // Пропускаем MOVT (уже обработан)
                                     }
