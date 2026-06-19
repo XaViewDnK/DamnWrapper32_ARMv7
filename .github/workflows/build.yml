@@ -2,7 +2,7 @@ name: DamnWrapper32 CI
 
 on:
   push:
-    branches: [ "patch-1", "master" ]
+    branches: [ "main", "patch-1" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
