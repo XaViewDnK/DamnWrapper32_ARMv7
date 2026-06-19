@@ -11572,28 +11572,64 @@ void LoadMachO(const std::string& bundlePath) {
                                     }
 
                                     // Проход 2: патчим незапрещённые MOVW/MOVT пары
+                                    // FIX: Раньше сканнер искал только СМЕЖНЫЕ пары [MOVW][MOVT].
+                                    // В реальном ARM32 коде компилятор может вставить 1-N инструкций
+                                    // между MOVW и MOVT (сохранение регистров, вычисления и т.п.).
+                                    // Например: MOVW R0, #lo; MOV R1, #x; MOVT R0, #hi
+                                    // В таком случае смежный поиск пропускает пару → R0 остаётся
+                                    // с pre-slide адресом → SIGSEGV при разыменовании.
+                                    // Новая логика: для каждого MOVW ищем MOVT вперёд в окне
+                                    // FWND_MOVT инструкций с тем же Rd, прерываясь если встречаем
+                                    // другую запись в тот же Rd (что означало бы другую цепочку).
+                                    const size_t FWND_MOVT = 8;
+                                    // Набор индексов MOVT которые уже запатчены (чтобы не патчить дважды)
+                                    std::vector<bool> movt_patched_set(arm_count, false);
                                     int arm_movt_patched = 0;
-                                    for (size_t ai = 0; ai + 1 < arm_count; ai++) {
+                                    for (size_t ai = 0; ai < arm_count; ai++) {
                                         uint32_t w0 = arm_ptr[ai];
-                                        uint32_t w1 = arm_ptr[ai + 1];
+                                        // Ищем MOVW: bits[27:20] == 0x30
                                         if (((w0 >> 20) & 0xFF) != 0x30) continue;
-                                        if (((w1 >> 20) & 0xFF) != 0x34) continue;
-                                        if (((w0 >> 12) & 0xF) != ((w1 >> 12) & 0xF)) continue;
-                                        if (no_patch[ai]) { ai++; continue; }
-                                        // Декодируем imm16: (bits[19:16] << 12) | bits[11:0]
-                                        uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
-                                        uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
-                                        uint32_t full_addr = (hi16 << 16) | lo16;
-                                        if (full_addr < min_vmaddr || full_addr >= max_vmaddr || full_addr <= 0x1000) continue;
-                                        // Кодируем patched значение обратно
-                                        uint32_t patched = full_addr + g_appSlide;
-                                        uint32_t new_lo = patched & 0xFFFF;
-                                        uint32_t new_hi = (patched >> 16) & 0xFFFF;
-                                        uint32_t* pp = const_cast<uint32_t*>(&arm_ptr[ai]);
-                                        pp[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
-                                        pp[1] = (w1 & 0xFFF0F000) | ((new_hi & 0xF000) << 4) | (new_hi & 0xFFF);
-                                        arm_movt_patched++;
-                                        ai++;
+                                        if (no_patch[ai]) continue;
+                                        uint32_t Rd = (w0 >> 12) & 0xF;
+                                        // Ищем парный MOVT в окне вперёд
+                                        size_t fwd_end = ai + 1 + FWND_MOVT;
+                                        if (fwd_end > arm_count) fwd_end = arm_count;
+                                        for (size_t fi = ai + 1; fi < fwd_end; fi++) {
+                                            uint32_t w1 = arm_ptr[fi];
+                                            uint32_t fRd = (w1 >> 12) & 0xF;
+                                            // Если встречаем другую инструкцию записывающую тот же Rd — прерываем.
+                                            // Используем широкий критерий: data-proc (bits[27:26]=00) или LDR (01),
+                                            // записывающий в Rd. Это не MOVT и не MOVW.
+                                            bool is_movt = (((w1 >> 20) & 0xFF) == 0x34) && (fRd == Rd);
+                                            bool is_movw = (((w1 >> 20) & 0xFF) == 0x30) && (fRd == Rd);
+                                            if (is_movt) {
+                                                if (movt_patched_set[fi]) break; // уже запатчен другой парой
+                                                // Декодируем imm16: (bits[19:16] << 12) | bits[11:0]
+                                                uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
+                                                uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
+                                                uint32_t full_addr = (hi16 << 16) | lo16;
+                                                if (full_addr < min_vmaddr || full_addr >= max_vmaddr || full_addr <= 0x1000) break;
+                                                // Кодируем patched значение обратно
+                                                uint32_t patched = full_addr + g_appSlide;
+                                                uint32_t new_lo = patched & 0xFFFF;
+                                                uint32_t new_hi = (patched >> 16) & 0xFFFF;
+                                                uint32_t* pp = const_cast<uint32_t*>(&arm_ptr[ai]);
+                                                pp[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
+                                                uint32_t* pp1 = const_cast<uint32_t*>(&arm_ptr[fi]);
+                                                pp1[0] = (w1 & 0xFFF0F000) | ((new_hi & 0xF000) << 4) | (new_hi & 0xFFF);
+                                                movt_patched_set[fi] = true;
+                                                arm_movt_patched++;
+                                                break;
+                                            }
+                                            // Другой MOVW в тот же Rd — эта цепочка оборвалась, начинается новая
+                                            if (is_movw) break;
+                                            // Любая иная инструкция записывающая в Rd — прерываем поиск MOVT.
+                                            // Критерий: Rd совпадает + это data-proc или load, не MOVW/MOVT.
+                                            uint32_t bop = (w1 >> 24) & 0xF;
+                                            bool writes_rd = (fRd == Rd) && (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
+                                                             (((w1 >> 20) & 0xFF) != 0x30) && (((w1 >> 20) & 0xFF) != 0x34);
+                                            if (writes_rd) break;
+                                        }
                                     }
                                     if (arm_movt_patched > 0)
                                         LogToJava("CUSTOM-PARSER: Пропатчено ARM MOVW/MOVT пар: " + std::to_string(arm_movt_patched));
