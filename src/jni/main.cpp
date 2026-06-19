@@ -11272,6 +11272,9 @@ void LoadMachO(const std::string& bundlePath) {
     // --------------------------------------------------------
 
     uint32_t cmd_offset = arch_offset + sizeof(mach_header); symtab_command symtab = {0}; dysymtab_command dysymtab = {0}; uint32_t dyld_bind_off = 0, dyld_bind_size = 0; uint32_t dyld_lazy_bind_off = 0, dyld_lazy_bind_size = 0; uint32_t dyld_rebase_off = 0, dyld_rebase_size = 0; std::vector<segment_command> loaded_segments; std::vector<section> dysym_sections; std::vector<section> classlist_sections; std::vector<section> init_func_sections;
+    // Диапазон __stub_helper секции (post-slide). Используется для обнаружения незарезолвленных
+    // ленивых слотов после dysymtab-обработки (slot value в диапазоне stub_helper → нет dyld resolver).
+    uint32_t stub_helper_start = 0, stub_helper_end = 0;
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         lseek(fd, cmd_offset, SEEK_SET); load_command lc; read(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { 
@@ -11288,6 +11291,7 @@ void LoadMachO(const std::string& bundlePath) {
                     if (type == 6 || type == 7) { dysym_sections.push_back(sect); g_dysymSections.push_back({sect.addr, sect.size}); }
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
+                    if (strncmp(sect.sectname, "__stub_helper", 16) == 0) { stub_helper_start = sect.addr; stub_helper_end = sect.addr + sect.size; }
                     
                     MachOSectionInfo sinfo;
                     sinfo.name = machoFixedName(sect.segname) + "," + machoFixedName(sect.sectname);
@@ -11487,7 +11491,10 @@ void LoadMachO(const std::string& bundlePath) {
                                                 uint32_t val = 0;
                                                 memcpy(&val, (void*)shifted_literal, 4);
                                                 
-                                                if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                                // Thumb function pointers имеют bit 0 = 1. Маскируем для проверки диапазона,
+                                                // но сохраняем бит при записи (только +slide, не очищая bit 0).
+                                                uint32_t val_masked = val & ~1u;
+                                                if (val_masked >= min_vmaddr && val_masked < max_vmaddr && val_masked > 0x1000) {
                                                     val += g_appSlide;
                                                     memcpy((void*)shifted_literal, &val, 4);
                                                     modified_literals++;
@@ -11686,10 +11693,11 @@ void LoadMachO(const std::string& bundlePath) {
                                             memcpy(&val, (void*)lit_host, 4);
 
                                             // Значение должно быть pre-slide указателем в диапазоне бинаря
-                                            if (val < min_vmaddr || val >= max_vmaddr || val <= 0x1000) continue;
+                                            // Thumb function pointers имеют bit 0 = 1 — маскируем для проверки
+                                            if ((val & ~1u) < min_vmaddr || (val & ~1u) >= max_vmaddr || (val & ~1u) <= 0x1000) continue;
 
                                             // Дополнительная проверка: shifted_val должен попадать в mapped секцию
-                                            uint32_t shifted_val = val + g_appSlide;
+                                            uint32_t shifted_val = (val & ~1u) + g_appSlide;
                                             bool sv_mapped = false;
                                             for (const auto& sInfo : g_machoSections) {
                                                 if (shifted_val >= sInfo.start && shifted_val < sInfo.end) {
@@ -11739,13 +11747,16 @@ void LoadMachO(const std::string& bundlePath) {
                                         LogToJava(alert_buf);
                                     }
                                     
-                                    if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                    if ((val & ~1u) >= min_vmaddr && (val & ~1u) < max_vmaddr && (val & ~1u) > 0x1000) {
                                         bool safe_to_rebase = true;
                                         std::string target_section = "Unknown";
                                         std::string reason = "OK";
+                                        // Для Thumb function pointers (bit 0 = 1) маскируем бит для поиска секции,
+                                        // но shifted_val (для записи) сохраняет бит чтобы не потерять Thumb-режим.
                                         uint32_t shifted_val = val + g_appSlide;
+                                        uint32_t shifted_val_masked = shifted_val & ~1u;
                                         for (const auto& sInfo : g_machoSections) {
-                                            if (shifted_val >= sInfo.start && shifted_val < sInfo.end) {
+                                            if (shifted_val_masked >= sInfo.start && shifted_val_masked < sInfo.end) {
                                                 target_section = sInfo.name;
                                                 break;
                                             }
@@ -11957,6 +11968,60 @@ void LoadMachO(const std::string& bundlePath) {
                           [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_hi) +
                           ")");
             }
+        }
+
+        // ФИКС STUB_HELPER: Для старых бинарей (iOS 3.x, без LC_DYLD_INFO) dysymtab-loop
+        // ребейзит INDIRECT_SYMBOL_LOCAL слоты с pre-slide адреса __stub_helper на
+        // post-slide адрес __stub_helper. Но __stub_helper без dyld resolver бесполезен —
+        // при вызове через такой слот CPU прыгает на __stub_helper entry, который пытается
+        // позвать dyld (его нет) → PC = pre/post-slide stub_helper адрес → SIGSEGV.
+        //
+        // Решение: после всей обработки финально сканируем dysym-слоты.
+        // Любой слот значение которого попадает в __stub_helper секцию (post-slide диапазон)
+        // — заменяем на CreateDynamicStub. Аналогично ловим pre-slide stub_helper адреса
+        // на случай если dysymtab-loop их не тронул.
+        if (stub_helper_start != 0 || stub_helper_end != 0) {
+            int sh_fixed = 0;
+            // pre-slide диапазон stub_helper
+            uint32_t sh_pre_start = (stub_helper_start > g_appSlide) ? stub_helper_start - g_appSlide : 0;
+            uint32_t sh_pre_end   = (stub_helper_end   > g_appSlide) ? stub_helper_end   - g_appSlide : 0;
+            for (const auto& sect : dysym_sections) {
+                uint32_t* slot = (uint32_t*)sect.addr;
+                uint32_t  count = sect.size / 4;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t val = slot[i];
+                    bool is_stub_helper_post  = (stub_helper_start != 0 && val >= stub_helper_start && val < stub_helper_end);
+                    bool is_stub_helper_pre   = (sh_pre_start != 0 && val >= sh_pre_start && val < sh_pre_end);
+                    if (is_stub_helper_post || is_stub_helper_pre) {
+                        char name_buf[64]; snprintf(name_buf, sizeof(name_buf), "__unresolved_lazy_0x%08X", val);
+                        void* dstub = CreateDynamicStub(std::string(name_buf));
+                        char dbg[256]; snprintf(dbg, sizeof(dbg),
+                            "STUB-HELPER-FIX: dysym slot[%u] @ 0x%08X: val 0x%08X → stub %p (was %s stub_helper)",
+                            i, (uint32_t)(sect.addr + i * 4), val, dstub, is_stub_helper_pre ? "pre-slide" : "post-slide");
+                        LogToJava(std::string(dbg));
+                        slot[i] = (uint32_t)(uintptr_t)dstub;
+                        sh_fixed++;
+                    }
+                }
+            }
+            if (sh_fixed > 0) {
+                LogToJava("STUB-HELPER-FIX: Заменено " + std::to_string(sh_fixed) +
+                          " незарезолвленных stub_helper слотов на DynamicStub."
+                          " stub_helper range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
+                          ")");
+            } else {
+                LogToJava("STUB-HELPER-FIX: Незарезолвленных stub_helper слотов не найдено."
+                          " stub_helper range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
+                          ")");
+            }
+        } else {
+            LogToJava("STUB-HELPER-FIX: __stub_helper секция не найдена, пропускаем.");
         }
     }
     cmd_offset = arch_offset + sizeof(mach_header);
