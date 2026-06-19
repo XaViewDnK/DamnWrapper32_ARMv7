@@ -11554,12 +11554,27 @@ void LoadMachO(const std::string& bundlePath) {
                                             uint32_t bw = arm_ptr[bi - 1];
                                             uint32_t bRd = (bw >> 12) & 0xF;
                                             if (((bw >> 20) & 0xFF) == 0x34 && bRd == Rm_used) {
-                                                // Нашли MOVT — ищем MOVW на шаг раньше
-                                                if (bi >= 2) {
-                                                    uint32_t bw2 = arm_ptr[bi - 2];
-                                                    if (((bw2 >> 20) & 0xFF) == 0x30 && ((bw2 >> 12) & 0xF) == Rm_used) {
-                                                        no_patch[bi - 2] = true; // индекс MOVW
+                                                // Нашли MOVT — ищем MOVW назад в окне BACK_WINDOW.
+                                                // FIX: Раньше проверялось только arm_ptr[bi-2] (ровно одна
+                                                // инструкция до MOVT). Если MOVW стоит дальше (gap ≥ 2),
+                                                // no_patch не выставлялся, и Pass 2 (с новым расширенным
+                                                // форвард-поиском) ошибочно патчил PC-relative MOVW/MOVT пары
+                                                // что давало адреса вида PC + (offset + slide) = double-сдвиг.
+                                                // Теперь ищем MOVW назад в том же окне что и BACK_WINDOW.
+                                                size_t movt_idx = bi - 1; // индекс найденного MOVT
+                                                size_t mw_back_start = (movt_idx >= BACK_WINDOW) ? movt_idx - BACK_WINDOW : 0;
+                                                for (size_t mi = movt_idx; mi > mw_back_start; mi--) {
+                                                    uint32_t mw = arm_ptr[mi - 1];
+                                                    uint32_t mRd = (mw >> 12) & 0xF;
+                                                    if (((mw >> 20) & 0xFF) == 0x30 && mRd == Rm_used) {
+                                                        no_patch[mi - 1] = true; // индекс MOVW
+                                                        break;
                                                     }
+                                                    // Прерываем если что-то пишет в Rm_used (новая цепочка)
+                                                    uint32_t mop = (mw >> 24) & 0xF;
+                                                    bool writes_rm2 = (mRd == Rm_used) && (((mw >> 20) & 0xFF) != 0x30) &&
+                                                                      (mop <= 0x3 || (mop >= 0x8 && mop <= 0xF));
+                                                    if (writes_rm2) break;
                                                 }
                                                 break;
                                             }
@@ -11574,42 +11589,32 @@ void LoadMachO(const std::string& bundlePath) {
                                     // Проход 2: патчим незапрещённые MOVW/MOVT пары
                                     // FIX: Раньше сканнер искал только СМЕЖНЫЕ пары [MOVW][MOVT].
                                     // В реальном ARM32 коде компилятор может вставить 1-N инструкций
-                                    // между MOVW и MOVT (сохранение регистров, вычисления и т.п.).
-                                    // Например: MOVW R0, #lo; MOV R1, #x; MOVT R0, #hi
-                                    // В таком случае смежный поиск пропускает пару → R0 остаётся
-                                    // с pre-slide адресом → SIGSEGV при разыменовании.
-                                    // Новая логика: для каждого MOVW ищем MOVT вперёд в окне
-                                    // FWND_MOVT инструкций с тем же Rd, прерываясь если встречаем
-                                    // другую запись в тот же Rd (что означало бы другую цепочку).
+                                    // между MOVW и MOVT. В таком случае смежный поиск пропускал пару
+                                    // → адрес оставался pre-slide → SIGSEGV.
+                                    // Новая логика: для каждого MOVW ищем MOVT вперёд в окне FWND_MOVT.
+                                    // ВАЖНО: Pass 1 (no_patch) тоже расширен до поиска MOVW в окне,
+                                    // иначе PC-relative пары будут ошибочно пропатчены.
                                     const size_t FWND_MOVT = 8;
-                                    // Набор индексов MOVT которые уже запатчены (чтобы не патчить дважды)
                                     std::vector<bool> movt_patched_set(arm_count, false);
                                     int arm_movt_patched = 0;
                                     for (size_t ai = 0; ai < arm_count; ai++) {
                                         uint32_t w0 = arm_ptr[ai];
-                                        // Ищем MOVW: bits[27:20] == 0x30
-                                        if (((w0 >> 20) & 0xFF) != 0x30) continue;
+                                        if (((w0 >> 20) & 0xFF) != 0x30) continue; // не MOVW
                                         if (no_patch[ai]) continue;
                                         uint32_t Rd = (w0 >> 12) & 0xF;
-                                        // Ищем парный MOVT в окне вперёд
                                         size_t fwd_end = ai + 1 + FWND_MOVT;
                                         if (fwd_end > arm_count) fwd_end = arm_count;
                                         for (size_t fi = ai + 1; fi < fwd_end; fi++) {
                                             uint32_t w1 = arm_ptr[fi];
                                             uint32_t fRd = (w1 >> 12) & 0xF;
-                                            // Если встречаем другую инструкцию записывающую тот же Rd — прерываем.
-                                            // Используем широкий критерий: data-proc (bits[27:26]=00) или LDR (01),
-                                            // записывающий в Rd. Это не MOVT и не MOVW.
                                             bool is_movt = (((w1 >> 20) & 0xFF) == 0x34) && (fRd == Rd);
                                             bool is_movw = (((w1 >> 20) & 0xFF) == 0x30) && (fRd == Rd);
                                             if (is_movt) {
-                                                if (movt_patched_set[fi]) break; // уже запатчен другой парой
-                                                // Декодируем imm16: (bits[19:16] << 12) | bits[11:0]
+                                                if (movt_patched_set[fi]) break;
                                                 uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
                                                 uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
                                                 uint32_t full_addr = (hi16 << 16) | lo16;
                                                 if (full_addr < min_vmaddr || full_addr >= max_vmaddr || full_addr <= 0x1000) break;
-                                                // Кодируем patched значение обратно
                                                 uint32_t patched = full_addr + g_appSlide;
                                                 uint32_t new_lo = patched & 0xFFFF;
                                                 uint32_t new_hi = (patched >> 16) & 0xFFFF;
@@ -11621,10 +11626,7 @@ void LoadMachO(const std::string& bundlePath) {
                                                 arm_movt_patched++;
                                                 break;
                                             }
-                                            // Другой MOVW в тот же Rd — эта цепочка оборвалась, начинается новая
-                                            if (is_movw) break;
-                                            // Любая иная инструкция записывающая в Rd — прерываем поиск MOVT.
-                                            // Критерий: Rd совпадает + это data-proc или load, не MOVW/MOVT.
+                                            if (is_movw) break; // новая цепочка — прерываем
                                             uint32_t bop = (w1 >> 24) & 0xF;
                                             bool writes_rd = (fRd == Rd) && (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
                                                              (((w1 >> 20) & 0xFF) != 0x30) && (((w1 >> 20) & 0xFF) != 0x34);
@@ -11760,9 +11762,8 @@ void LoadMachO(const std::string& bundlePath) {
                                                                          target_section.find("__objc_classname") != std::string::npos || 
                                                                          target_section.find("__objc_methtype") != std::string::npos ||
                                                                          // FIX: __ustring содержит UTF-16 данные CFString литералов.
-                                                                         // isValidString() не работает для UTF-16 (возвращает false на '\0' в старшем байте),
-                                                                         // поэтому указатели на __ustring раньше падали в ветку else и игнорировались.
-                                                                         // Трактуем __ustring как сырую строку и ребейзим если shifted_val mapped.
+                                                                         // isValidString() не работает для UTF-16, поэтому раньше
+                                                                         // указатели на __ustring падали в ветку else и игнорировались.
                                                                          target_section.find("__ustring") != std::string::npos);
                                                                          
                                             bool is_struct_target = (target_section.find("__cfstring") != std::string::npos || 
@@ -11829,8 +11830,7 @@ void LoadMachO(const std::string& bundlePath) {
                                                             bool sp_mapped = false;
                                                             for (const auto& sInfo : g_machoSections) { if (shifted_str_ptr >= sInfo.start && shifted_str_ptr < sInfo.end) { sp_mapped = true; break; } }
                                                             if (!sp_mapped) { safe_to_rebase = false; reason = "CFString: Unmapped Str"; }
-                                                            // Не проверяем isValidString для str_ptr — это может быть UTF-16
-                                                            // (__ustring) или другой бинарный формат. Маппинга достаточно.
+                                                            // Не проверяем isValidString — str_ptr может быть UTF-16 (__ustring)
                                                         }
                                                     }
                                                 }
