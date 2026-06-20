@@ -133,6 +133,10 @@ std::vector<uint32_t> g_initFuncs;
 
 struct MachOSectionInfo { std::string name; uint32_t start; uint32_t end; };
 std::vector<MachOSectionInfo> g_machoSections;
+// Адреса и размеры секций __nl_symbol_ptr / __la_symbol_ptr (post-slide).
+// Нужны для post-init патча слотов данных (см. фикс _AVAudioSessionCategory* ниже).
+struct DysymSlotRange { uint32_t addr; uint32_t size; };
+std::vector<DysymSlotRange> g_dysymSections;
 
 struct HLEClass { uint32_t magic; const char* className; };
 std::map<std::string, HLEClass*> g_hleClasses;
@@ -142,6 +146,7 @@ bool g_frameHasDraw = false;
 bool g_onScreenDebugOverlay = false;
 bool g_showPerfOverlay = false;
 int g_esModeOption = 2;
+void* g_lastEAGLViewInstance = nullptr; // FIX: последний созданный EAGLView (для outlet glView)
 
 // Variables for FPS calculation
 uint64_t g_fpsLastTimeMs = 0;
@@ -515,6 +520,20 @@ void* CreateNSString(const std::string& str) {
     return inst;
 }
 
+// FIX: Проверяет, попадает ли адрес в одну из маппированных секций бинаря ИЛИ в heap.
+// Используется в GetNSString перед разыменованием c_str_ptr, чтобы не словить SIGSEGV
+// когда гость передаёт кривой "NSString" (например, &переменная вместо *переменная).
+static bool IsMappedReadable(uint32_t addr) {
+    if (addr < 0x1000) return false;
+    // Heap аллокатора (scudo/malloc) — обычно выше 0x80000000 на Android ARMv7
+    // Это быстрый путь для наших CreateNSString() объектов.
+    if (addr >= 0x80000000u) return true;
+    for (const auto& sInfo : g_machoSections) {
+        if (addr >= sInfo.start && addr < sInfo.end) return true;
+    }
+    return false;
+}
+
 std::string GetNSString(void* nsstr) {
     if (!nsstr || (uintptr_t)nsstr < 0x1000) return "";
     uint32_t* ptr = (uint32_t*)nsstr;
@@ -526,19 +545,42 @@ std::string GetNSString(void* nsstr) {
     // Это предотвратит парсинг байтов указателя 'isa' как сырой C-строки!
     if (isa > 0x1000 && (isa % 4 == 0)) {
         uint32_t c_str_ptr = ptr[2];
-        if (c_str_ptr > 0x1000 && isValidString((const char*)c_str_ptr)) {
+        // FIX: Проверяем маппинг c_str_ptr ПЕРЕД разыменованием.
+        // Без этой проверки, если гость передаёт &variable вместо *variable
+        // (одинарный deref вместо двойного для nl_symbol_ptr), ptr[2] попадает
+        // в случайную BSS-память и isValidString падает с SIGSEGV (fault addr R5).
+        if (IsMappedReadable(c_str_ptr) && isValidString((const char*)c_str_ptr)) {
             result = std::string((const char*)c_str_ptr);
         } else {
             uint32_t c_str_ptr3 = ptr[3];
-            if (c_str_ptr3 > 0x1000 && isValidString((const char*)c_str_ptr3)) {
+            if (IsMappedReadable(c_str_ptr3) && isValidString((const char*)c_str_ptr3)) {
                 result = std::string((const char*)c_str_ptr3);
+            }
+        }
+        // FIX: Если объект не похож на валидный NSString (ptr[2]/ptr[3] кривые),
+        // но сам указатель nsstr является указателем на void* (т.е. гость передал
+        // &hle_SomeNSString_ptr вместо hle_SomeNSString_ptr), пробуем разыменовать.
+        if (result == "Unknown") {
+            uint32_t deref = ptr[0]; // ptr[0] в этом случае = само значение NSString*
+            // Если ptr[0] — это адрес heap-объекта (наш CreateNSString), рекурсируем.
+            // Защита от бесконечной рекурсии: deref != (uint32_t)(uintptr_t)nsstr
+            if (IsMappedReadable(deref) && deref != (uint32_t)(uintptr_t)nsstr) {
+                uint32_t* inner = (uint32_t*)deref;
+                uint32_t inner_isa = inner[0];
+                if (inner_isa > 0x1000 && (inner_isa % 4 == 0)) {
+                    uint32_t inner_cstr = inner[2];
+                    if (IsMappedReadable(inner_cstr) && isValidString((const char*)inner_cstr)) {
+                        LogToJava("STR-FIX: [GetNSString] Обнаружен двойной указатель (nl_symbol_ptr одинарный deref), раскрываем: " + std::to_string(deref));
+                        result = std::string((const char*)inner_cstr);
+                    }
+                }
             }
         }
     }
 
     // ФОЛБЕК: Только если это не похоже на строку внутри объекта (например, игра 
     // криво передала сырой C-String туда, где ожидался NSString), читаем напрямую.
-    if (result == "Unknown" && isValidString((const char*)nsstr)) {
+    if (result == "Unknown" && IsMappedReadable((uint32_t)(uintptr_t)nsstr) && isValidString((const char*)nsstr)) {
         result = std::string((const char*)nsstr);
     }
     
@@ -1008,6 +1050,88 @@ static _Unwind_Reason_Code UnwindCallback(struct _Unwind_Context* context, void*
 }
 
 void CrashHandler(int sig, siginfo_t *info, void *context) {
+    // ФИК SIGSYS: Перехват iOS syscall'ов через svc инструкцию.
+    // На iOS ARM syscall номер передаётся в R12 (ip), затем идёт svc 0x80.
+    // Android не знает эти syscall'ы и кидает SIGSYS.
+    // Мы перехватываем, эмулируем что нужно (большинство — заглушки/0), и возвращаем управление.
+#if defined(__arm__)
+    if (sig == SIGSYS) {
+        ucontext_t *uc_sys = (ucontext_t *)context;
+        if (uc_sys) {
+            uint32_t syscall_num = uc_sys->uc_mcontext.arm_ip; // R12 = iOS syscall number
+            uint32_t r0 = uc_sys->uc_mcontext.arm_r0;
+            uint32_t pc_log = uc_sys->uc_mcontext.arm_pc;
+            // Логируем в файл: номер syscall, PC, R0
+            if (g_crashLogPath[0] != '\0') {
+                int log_fd = open(g_crashLogPath, O_RDWR | O_CREAT | O_APPEND, 0666);
+                if (log_fd >= 0) {
+                    SafeWriteStr(log_fd, "SIGSYS: syscall=0x");
+                    SafeWriteHex(log_fd, syscall_num);
+                    SafeWriteStr(log_fd, " PC=0x");
+                    SafeWriteHex(log_fd, pc_log);
+                    SafeWriteStr(log_fd, " R0=0x");
+                    SafeWriteHex(log_fd, r0);
+                    SafeWriteStr(log_fd, "\n");
+                    close(log_fd);
+                }
+            }
+            // Известные iOS syscalls:
+            // 4   = write
+            // 6   = close
+            // 20  = getpid
+            // 33  = access
+            // 90  = mmap (критичный — возвращаем MAP_FAILED чтобы код упал в обычный fallback)
+            // 194 = mmap2
+            // 199 = lseek
+            // 336 = pthread_sigmask / bsdthread_create — просто 0
+            // Большинство остальных: возвращаем 0 (успех) и продолжаем
+            // ВАЖНО: При SIGSYS ядро уже остановилось ДО выполнения syscall,
+            // PC указывает на svc инструкцию. Нам нужно пропустить её и эмулировать.
+            // R0 трогаем ТОЛЬКО для syscall'ов которые реально возвращают значение —
+            // иначе затираем this-указатель или другие важные значения.
+            uint32_t ret = r0; // сохраняем R0 по умолчанию
+            bool write_r0 = false;
+            switch (syscall_num & 0xFFFF) {
+                case 20:  // getpid
+                    ret = (uint32_t)getpid(); write_r0 = true; break;
+                case 4:   // write
+                    ret = (uint32_t)write((int)r0,
+                        (const void*)uc_sys->uc_mcontext.arm_r1,
+                        (size_t)uc_sys->uc_mcontext.arm_r2);
+                    write_r0 = true; break;
+                case 3:   // read
+                    ret = 0; write_r0 = true; break;
+                case 6:   // close — void, R0 не трогаем
+                    break;
+                case 33:  // access
+                    ret = 0; write_r0 = true; break;
+                case 90:  // mmap
+                case 194: // mmap2
+                    ret = (uint32_t)MAP_FAILED; write_r0 = true; break;
+                case 199: // lseek
+                    ret = 0; write_r0 = true; break;
+                case 240: // bsdthread_create
+                case 241: // bsdthread_terminate
+                case 336: // pthread_sigmask
+                    break; // void — R0 не трогаем
+                default:
+                    break; // неизвестный — R0 не трогаем, просто пропускаем svc
+            }
+            if (write_r0) uc_sys->uc_mcontext.arm_r0 = ret;
+            // Пропускаем svc: Thumb = 2 байта, ARM32 = 4 байта
+            uint32_t pc_sys = uc_sys->uc_mcontext.arm_pc;
+            uint32_t cpsr_sys = uc_sys->uc_mcontext.arm_cpsr;
+            if (cpsr_sys & (1 << 5)) {
+                uc_sys->uc_mcontext.arm_pc = pc_sys + 2;
+            } else {
+                uc_sys->uc_mcontext.arm_pc = pc_sys + 4;
+            }
+            __sync_fetch_and_add(&g_crash_counter, -1);
+            return;
+        }
+    }
+#endif
+
     // ЗАЩИТА ОТ ДВОЙНОГО КРАША:
     if (__sync_fetch_and_add(&g_crash_counter, 1) > 0) {
         struct sigaction sa; sa.sa_handler = SIG_DFL; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
@@ -6146,6 +6270,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             else if (cName.find("Label") != std::string::npos) g_views[instance].type = "UILabel";
             else if (cName.find("View") != std::string::npos) g_views[instance].type = "UIView";
             
+            // FIX: Запоминаем последний аллоцированный EAGLView-подобный объект
+            // чтобы awakeFromNib ViewController'а мог подобрать его как glView outlet
+            if (cName.find("EAGLView") != std::string::npos || cName.find("EaglView") != std::string::npos) {
+                g_lastEAGLViewInstance = instance;
+                LogToJava("HLE-FIX: [alloc] Запомнили EAGLView кандидат: " + cName);
+            }
+            
             return (uint64_t)(uintptr_t)instance;
         }
         
@@ -6208,6 +6339,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         g_views[view].bgColor = g_uiColors[view]; g_views[view].hasBg = true;
                     }
                     g_viewControllersViews[self] = view;
+                    // FIX: Регистрируем EAGLView как outlet glView у ViewController'а,
+                    // чтобы awakeFromNib не упал на assert(self.glView != nil)
+                    if (!g_dictionaries[self][(void*)0xA001]) {
+                        g_dictionaries[self][(void*)0xA001] = view;
+                        LogToJava("HLE-FIX: [loadView] зарегистрирован glView outlet -> EAGLView для " + cName);
+                    }
                 }
                 LogToJava("HLE: Calling viewDidLoad for " + cName);
                 void* vdl_imp = FindMethodIMP(isa, "viewDidLoad");
@@ -6245,6 +6382,151 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
         if (strcmp(op, "class") == 0) return (uint64_t)isa;
 
+        // FIX: Перехват сеттера setGlView: — нативный loadView вызывает его
+        // когда создаёт EAGLView. Сохраняем outlet чтобы геттер glView не вернул nil.
+        if (strcmp(op, "setGlView:") == 0 || strcmp(op, "setEaglView:") == 0) {
+            g_dictionaries[self][(void*)0xA001] = a1;
+            LogToJava("HLE-FIX: [" + std::string(op) + "] сохранён EAGLView outlet для " + cName);
+            void* imp_sv = FindMethodIMP(isa, op);
+            if (imp_sv) {
+                LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
+#if defined(__arm__)
+                asm volatile (
+                    "vldr s0, [%0]\n"
+                    "vldr s1, [%0, #4]\n"
+                    "vldr s2, [%0, #8]\n"
+                    "vldr s3, [%0, #12]\n"
+                    : : "r"(saved_s) : "s0", "s1", "s2", "s3"
+                );
+#endif
+                typedef uint64_t (*MethodType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
+                return ((MethodType)imp_sv)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+            }
+            return 0;
+        }
+
+        // FIX: Перехват геттера glView (и любых ivar-outlet'ов вида get*View)
+        // для нативных ViewController'ов. Если нативный код читает ivar через
+        // этот геттер, ivar не заполнен (нет NIB-парсера), и assert падает.
+        // Решение: возвращаем закэшированный EAGLView из g_dictionaries.
+        if (strcmp(op, "glView") == 0) {
+            void* stored = g_dictionaries[self][(void*)0xA001]; // ключ для glView outlet
+            if (stored) {
+                LogToJava("HLE-FIX: [glView] возвращаем кэшированный EAGLView");
+                return (uint64_t)(uintptr_t)stored;
+            }
+            // Пробуем найти EAGLView среди уже созданных view контроллера
+            if (g_viewControllersViews.count(self)) {
+                void* v = g_viewControllersViews[self];
+                g_dictionaries[self][(void*)0xA001] = v;
+                LogToJava("HLE-FIX: [glView] возвращаем view из g_viewControllersViews");
+                return (uint64_t)(uintptr_t)v;
+            }
+            // Создаем EAGLView на лету
+            uint32_t eaglViewClsAddr = 0;
+            for (auto const& pair : g_appSymbols) {
+                if (pair.first == "_OBJC_CLASS_$_EAGLView") {
+                    eaglViewClsAddr = pair.second; break;
+                }
+            }
+            if (eaglViewClsAddr) {
+                void* eaglView = (void*)Stub_objc_msgSend(
+                    (void*)eaglViewClsAddr, "alloc",
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                uint32_t dummyCoder_data[8] = {0};
+                dummyCoder_data[0] = g_hleClasses.count("NSCoder") ? (uint32_t)g_hleClasses["NSCoder"] : 0xDEADBEEF;
+                eaglView = (void*)Stub_objc_msgSend(
+                    eaglView, "initWithCoder:", (void*)dummyCoder_data,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                g_views[eaglView].frame = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
+                g_dictionaries[self][(void*)0xA001] = eaglView;
+                g_mainView = eaglView;
+                LogToJava("HLE-FIX: [glView] EAGLView создан на лету для " + cName);
+                return (uint64_t)(uintptr_t)eaglView;
+            }
+            LogToJava("HLE-FIX: [glView] EAGLView класс не найден, возвращаем 0");
+            return 0;
+        }
+
+        // FIX: Перехват awakeFromNib для нативных ViewController'ов.
+        // До вызова нативного awakeFromNib гарантируем что ivar _glView заполнен —
+        // иначе NSAssert(self.glView != nil) роняет приложение.
+        if (strcmp(op, "awakeFromNib") == 0) {
+            // Шаг 1: Ищем EAGLView, который уже мог быть создан в ходе loadView
+            void* eaglViewPtr = g_dictionaries[self][(void*)0xA001];
+            
+            // Шаг 1б: Если не нашли в кэше — берём g_lastEAGLViewInstance
+            // (нативный loadView мог создать EAGLView через alloc до нашего awakeFromNib)
+            if (!eaglViewPtr && g_lastEAGLViewInstance) {
+                eaglViewPtr = g_lastEAGLViewInstance;
+                g_dictionaries[self][(void*)0xA001] = eaglViewPtr;
+                LogToJava("HLE-FIX: [awakeFromNib] Взяли g_lastEAGLViewInstance как glView для " + cName);
+            }
+            
+            // Шаг 2: Если не нашли — создаём через наш HLE glView getter
+            if (!eaglViewPtr) {
+                void* glViewImp = FindMethodIMP(isa, "glView");
+                if (glViewImp) {
+                    LogToJava("HLE-FIX: [awakeFromNib] Pre-populating glView outlet для " + cName);
+                    eaglViewPtr = (void*)Stub_objc_msgSend(self, "glView",
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                }
+            }
+            
+            // Шаг 3: Пишем найденный EAGLView напрямую в ivar _glView объекта
+            // (на случай если нативный awakeFromNib читает ivar напрямую, а не через getter)
+            if (eaglViewPtr) {
+                // Ищем ivar _glView в списке ivars класса через Mach-O метаданные
+                uint32_t cls_ptr = isa;
+                while (cls_ptr > 0x1000) {
+                    uint32_t* cls_data = (uint32_t*)cls_ptr;
+                    if (cls_data[0] == 0xDEADBEEF) break; // дошли до HLE-класса
+                    uint32_t ro_ptr = cls_data[4] & ~3;
+                    if (!ro_ptr || ro_ptr < 0x1000) break;
+                    uint32_t* ro = (uint32_t*)ro_ptr;
+                    uint32_t ivar_list_ptr = ro[6]; // ro->ivars
+                    if (ivar_list_ptr && ivar_list_ptr > 0x1000) {
+                        uint32_t* ilist = (uint32_t*)ivar_list_ptr;
+                        uint32_t ivar_count = ilist[1];
+                        uint32_t ivar_entry_size = ilist[0] & 0xFFFF; // entsize_and_flags
+                        if (ivar_entry_size == 0) ivar_entry_size = 12;
+                        if (ivar_count < 500) {
+                            uint8_t* entry = (uint8_t*)(ilist + 2);
+                            for (uint32_t i = 0; i < ivar_count; i++) {
+                                uint32_t* ivar_e = (uint32_t*)entry;
+                                uint32_t name_ptr = ivar_e[1];
+                                if (name_ptr > 0x1000 && isValidString((const char*)name_ptr)) {
+                                    const char* iname = (const char*)name_ptr;
+                                    if (strcmp(iname, "_glView") == 0 || strcmp(iname, "glView") == 0 ||
+                                        strcmp(iname, "_eaglView") == 0 || strcmp(iname, "eaglView") == 0 ||
+                                        strcmp(iname, "_m_glView") == 0 || strcmp(iname, "m_glView") == 0) {
+                                        // ivar_e[0] = offset_ptr
+                                        uint32_t offset_ptr = ivar_e[0];
+                                        if (offset_ptr > 0x1000) {
+                                            int32_t ivar_offset = *(int32_t*)offset_ptr;
+                                            if (ivar_offset > 0 && ivar_offset < 10000) {
+                                                uint32_t* obj_ivar = (uint32_t*)((uint8_t*)self + ivar_offset);
+                                                *obj_ivar = (uint32_t)(uintptr_t)eaglViewPtr;
+                                                LogToJava("HLE-FIX: Записан ivar [" + std::string(iname) +
+                                                    "] offset=" + std::to_string(ivar_offset) +
+                                                    " -> EAGLView для " + cName);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                                entry += ivar_entry_size;
+                            }
+                        }
+                    }
+                    uint32_t super_cls = cls_data[1];
+                    if (!super_cls || super_cls == cls_ptr) break;
+                    cls_ptr = super_cls;
+                }
+            }
+            // Дальше форвардим в нативный код как обычно
+        }
+
         void* imp = FindMethodIMP(isa, op);
         if (imp) {
             LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
@@ -6258,7 +6540,19 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             );
 #endif
             typedef uint64_t (*MethodType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
-            return ((MethodType)imp)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+            uint64_t native_ret = ((MethodType)imp)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+            // FIX: После нативного init* для EAGLView — обновляем g_lastEAGLViewInstance
+            // (init может вернуть другой адрес, например при initWithCoder:)
+            if (strncmp(op, "init", 4) == 0 && native_ret > 0x1000) {
+                void* ret_obj = (void*)(uintptr_t)native_ret;
+                std::string retCls = GetObjCClassName(ret_obj);
+                if (retCls.find("EAGLView") != std::string::npos || retCls.find("EaglView") != std::string::npos) {
+                    g_lastEAGLViewInstance = ret_obj;
+                    g_views[ret_obj].frame = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
+                    LogToJava("HLE-FIX: [native init] Обновлён g_lastEAGLViewInstance -> " + retCls);
+                }
+            }
+            return native_ret;
         }
         
         if (strncmp(op, "init", 4) == 0 || strcmp(op, "alloc") == 0) return (uint64_t)(uintptr_t)self; 
@@ -10361,7 +10655,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_D(strdup), STB_D(strcasecmp), STB_D(strncasecmp), STB_D(strcspn), {"_strpbrk", (void*)(char*(*)(char*, const char*))strpbrk},
     STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_D(sprintf), STB_D(snprintf), STB_D(vsprintf), STB_D(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
     STB_W(fopen), STB_W(fclose), STB_W(fread), STB_W(fwrite), STB_W(fseek), STB_W(ftell), STB_W(fgetpos), STB_W(fsetpos), STB_W(fputc), STB_W(fscanf), STB_W(fflush), STB_W(fputs), STB_W(fprintf), STB_W(fgetc), STB_W(fgets), STB_W(feof), STB_W(ferror), STB_W(fileno), {"___srget", (void*)wrap___srget},
-    {"_sqrt", (void*)(double(*)(double))sqrt}, STB_D(sqrtf), {"_pow", (void*)(double(*)(double, double))pow}, STB_D(powf), {"_exp", (void*)(double(*)(double))exp}, STB_D(expf), {"_log", (void*)(double(*)(double))log}, STB_D(logf), {"_log10", (void*)(double(*)(double))log10}, STB_D(log10f), {"_log2", (void*)(double(*)(double))log2}, STB_D(log2f),
+    {"_sqrt", (void*)(double(*)(double))sqrt}, STB_D(sqrtf), {"_pow", (void*)(double(*)(double, double))pow}, STB_D(powf), {"_exp", (void*)(double(*)(double))exp}, STB_D(expf), {"_log", (void*)(double(*)(double))log}, STB_D(logf), {"_log10", (void*)(double(*)(double))log10}, STB_D(log10f), {"_log2", (void*)(double(*)(double))log2}, STB_D(log2f), {"_exp2", (void*)(double(*)(double))exp2}, STB_D(exp2f),
     {"_ceil", (void*)(double(*)(double))ceil}, STB_D(ceilf), {"_floor", (void*)(double(*)(double))floor}, STB_D(floorf), {"_round", (void*)(double(*)(double))round}, STB_D(roundf), {"_fmod", (void*)(double(*)(double, double))fmod}, STB_D(fmodf), {"_fmin", (void*)(double(*)(double, double))fmin}, STB_D(fminf), {"_fmax", (void*)(double(*)(double, double))fmax}, STB_D(fmaxf),
     {"_sin", (void*)(double(*)(double))sin}, {"_cos", (void*)(double(*)(double))cos}, {"_tan", (void*)(double(*)(double))tan}, {"_asin", (void*)(double(*)(double))asin}, {"_acos", (void*)(double(*)(double))acos}, {"_atan", (void*)(double(*)(double))atan}, {"_atan2", (void*)(double(*)(double, double))atan2}, STB_D(atan2f), STB_D(atanf),
     {"_sinh", (void*)(double(*)(double))sinh}, {"_cosh", (void*)(double(*)(double))cosh}, {"_tanh", (void*)(double(*)(double))tanh}, {"_abs", (void*)(int(*)(int))abs}, {"_fabs", (void*)(double(*)(double))fabs}, STB_D(fabsf),
@@ -10619,6 +10913,18 @@ void* ResolveSymbol(const std::string& name) {
 // --- Структуры Mach-O ---
 struct fat_header { uint32_t magic; uint32_t nfat_arch; }; struct fat_arch { uint32_t cputype; uint32_t cpusubtype; uint32_t offset; uint32_t size; uint32_t align; }; struct mach_header { uint32_t magic; uint32_t cputype; uint32_t cpusubtype; uint32_t filetype; uint32_t ncmds; uint32_t sizeofcmds; uint32_t flags; }; struct load_command { uint32_t cmd; uint32_t cmdsize; }; struct segment_command { uint32_t cmd; uint32_t cmdsize; char segname[16]; uint32_t vmaddr; uint32_t vmsize; uint32_t fileoff; uint32_t filesize; uint32_t maxprot; uint32_t initprot; uint32_t nsects; uint32_t flags; }; struct section { char sectname[16]; char segname[16]; uint32_t addr; uint32_t size; uint32_t offset; uint32_t align; uint32_t reloff; uint32_t nreloc; uint32_t flags; uint32_t reserved1; uint32_t reserved2; }; struct symtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t symoff; uint32_t nsyms; uint32_t stroff; uint32_t strsize; }; struct dysymtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t ilocalsym; uint32_t nlocalsym; uint32_t iextdefsym; uint32_t nextdefsym; uint32_t iundefsym; uint32_t nundefsym; uint32_t tocoff; uint32_t ntoc; uint32_t modtaboff; uint32_t nmodtab; uint32_t extrefsymoff; uint32_t nextrefsyms; uint32_t indirectsymoff; uint32_t nindirectsyms; uint32_t extreloff; uint32_t nextrel; uint32_t locreloff; uint32_t nlocrel; }; struct thread_command { uint32_t cmd; uint32_t cmdsize; uint32_t flavor; uint32_t count; }; struct nlist { union { uint32_t n_strx; } n_un; uint8_t n_type; uint8_t n_sect; int16_t n_desc; uint32_t n_value; }; struct dyld_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t rebase_off; uint32_t rebase_size; uint32_t bind_off; uint32_t bind_size; uint32_t weak_bind_off; uint32_t weak_bind_size; uint32_t lazy_bind_off; uint32_t lazy_bind_size; uint32_t export_off; uint32_t export_size; };
 struct encryption_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t cryptoff; uint32_t cryptsize; uint32_t cryptid; };
+// ФИКС: sectname/segname в Mach-O — это char[16] БЕЗ гарантированного нуль-терминатора,
+// если имя занимает все 16 байт (напр. "__objc_classname" - ровно 16 символов).
+// std::string(sect.sectname) в этом случае читает за пределы массива и захватывает
+// байты соседнего поля segname[16], давая "__objc_classname__TEXT" вместо "__objc_classname".
+// Из-за этого строгие сравнения (sectname == "__objc_classname") молча проваливались,
+// и секция со строками классов уходила в эвристический числовой ребейз вместо пропуска.
+static inline std::string machoFixedName(const char* buf16) {
+    size_t len = 0;
+    while (len < 16 && buf16[len] != '\0') len++;
+    return std::string(buf16, len);
+}
+
 uint64_t read_uleb128(const uint8_t** p) { uint64_t result = 0; int bit = 0; do { result |= ((**p & 0x7f) << bit); bit += 7; } while (*(*p)++ & 0x80); return result; } int64_t read_sleb128(const uint8_t** p) { int64_t result = 0; int bit = 0; uint8_t byte; do { byte = *(*p)++; result |= ((byte & 0x7f) << bit); bit += 7; } while (byte & 0x80); if (byte & 0x40) result |= (-1ULL) << bit; return result; }
 
 void ProcessRebaseOpcodes(int fd, uint32_t arch_offset, uint32_t rebase_off, uint32_t rebase_size, const std::vector<segment_command>& segments, uint32_t slide) {
@@ -10635,25 +10941,26 @@ void ProcessRebaseOpcodes(int fd, uint32_t arch_offset, uint32_t rebase_off, uin
             case 0x40: offset += imm * 4; break;
             case 0x50: {
                 for (int i = 0; i < imm; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                    // FIX: guard against out-of-segment offset before write
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                     offset += 4;
                 } break;
             }
             case 0x60: {
                 uint64_t count = read_uleb128(&p);
                 for (uint64_t i = 0; i < count; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                     offset += 4;
                 } break;
             }
             case 0x70: {
-                if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                 offset += 4 + read_uleb128(&p); break;
             }
             case 0x80: {
                 uint64_t count = read_uleb128(&p); uint64_t skip = read_uleb128(&p);
                 for (uint64_t i = 0; i < count; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) += slide; }
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) += slide; } }
                     offset += 4 + skip;
                 } break;
             }
@@ -10675,13 +10982,14 @@ void ProcessBindOpcodes(int fd, uint32_t arch_offset, uint32_t bind_off, uint32_
             case 0x70: segment_idx = imm; offset = read_uleb128(&p); break;
             case 0x80: offset += read_uleb128(&p); break;
             case 0x90: case 0xA0: case 0xB0: {
-                if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); }
+                // FIX: guard offset before write
+                if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); } }
                 if (opcode == 0x90) offset += 4; else if (opcode == 0xA0) offset += 4 + read_uleb128(&p); else offset += 4 + (imm * 4); break;
             }
             case 0xC0: {
                 uint64_t count = read_uleb128(&p); uint64_t skip = read_uleb128(&p);
                 for (uint64_t i = 0; i < count; i++) {
-                    if (segment_idx < segments.size()) { uint32_t addr = segments[segment_idx].vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); }
+                    if (segment_idx < segments.size()) { const auto& seg = segments[segment_idx]; if (offset + 4 <= seg.vmsize) { uint32_t addr = seg.vmaddr + slide + offset; *((uint32_t*)addr) = (uint32_t)ResolveSymbol(symbol_name); } }
                     offset += 4 + skip;
                 } break;
             }
@@ -10792,6 +11100,32 @@ void LoadMachO(const std::string& bundlePath) {
            hle_kEAGLDrawablePropertyRetainedBacking_ptr = CreateNSString("kEAGLDrawablePropertyRetainedBacking");
         hle_AVAudioSessionCategoryPlayback_ptr = CreateNSString("AVAudioSessionCategoryPlayback");
         hle_AVAudioSessionCategoryAmbient_ptr = CreateNSString("AVAudioSessionCategoryAmbient");
+        // FIX: Патчим слоты __nl_symbol_ptr напрямую значениями NSString* (а не адресами переменных).
+        // Проблема: в таблице символов мы регистрировали (void*)&hle_..._ptr — адрес переменной.
+        // Гостевой код (CDAudioManager) при загрузке _AVAudioSessionCategoryAmbient делает
+        // ОДНО разыменование (ldr r0, [slot]) и сразу использует r0 как NSString*.
+        // Это даёт r0 = &hle_..._ptr (адрес C++ переменной), а не сам NSString*.
+        // GetNSString затем читает ptr[2] из области BSS → невалидный адрес → SIGSEGV.
+        // Решение: после инициализации HLE обходим все nl_symbol_ptr слоты и заменяем
+        // &hle_ptr → само значение hle_ptr, чтобы одинарный deref давал NSString* напрямую.
+        {
+            void* target_playback_addr = &hle_AVAudioSessionCategoryPlayback_ptr;
+            void* target_ambient_addr  = &hle_AVAudioSessionCategoryAmbient_ptr;
+            for (const auto& sect : g_dysymSections) {
+                uint32_t* slot = (uint32_t*)sect.addr;
+                uint32_t  count = sect.size / 4;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t val = slot[i];
+                    if (val == (uint32_t)(uintptr_t)target_playback_addr) {
+                        slot[i] = (uint32_t)(uintptr_t)hle_AVAudioSessionCategoryPlayback_ptr;
+                        LogToJava("STR-FIX: Пропатчен nl_symbol_ptr слот _AVAudioSessionCategoryPlayback → прямой NSString*");
+                    } else if (val == (uint32_t)(uintptr_t)target_ambient_addr) {
+                        slot[i] = (uint32_t)(uintptr_t)hle_AVAudioSessionCategoryAmbient_ptr;
+                        LogToJava("STR-FIX: Пропатчен nl_symbol_ptr слот _AVAudioSessionCategoryAmbient → прямой NSString*");
+                    }
+                }
+            }
+        }
         hle_NSUserDefaultsDidChangeNotification_ptr = CreateNSString("NSUserDefaultsDidChangeNotification");
         hle_GKPlayerAuthenticationDidChangeNotificationName_ptr = CreateNSString("GKPlayerAuthenticationDidChangeNotificationName");
         hle_kCFAllocatorDefault = (void*)1;
@@ -10938,6 +11272,9 @@ void LoadMachO(const std::string& bundlePath) {
     // --------------------------------------------------------
 
     uint32_t cmd_offset = arch_offset + sizeof(mach_header); symtab_command symtab = {0}; dysymtab_command dysymtab = {0}; uint32_t dyld_bind_off = 0, dyld_bind_size = 0; uint32_t dyld_lazy_bind_off = 0, dyld_lazy_bind_size = 0; uint32_t dyld_rebase_off = 0, dyld_rebase_size = 0; std::vector<segment_command> loaded_segments; std::vector<section> dysym_sections; std::vector<section> classlist_sections; std::vector<section> init_func_sections;
+    // Диапазон __stub_helper секции (post-slide). Используется для обнаружения незарезолвленных
+    // ленивых слотов после dysymtab-обработки (slot value в диапазоне stub_helper → нет dyld resolver).
+    uint32_t stub_helper_start = 0, stub_helper_end = 0;
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         lseek(fd, cmd_offset, SEEK_SET); load_command lc; read(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { 
@@ -10951,12 +11288,13 @@ void LoadMachO(const std::string& bundlePath) {
                     section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect)); 
                     sect.addr += g_appSlide; // Сдвигаем адрес секции
                     uint8_t type = sect.flags & 0xff; 
-                    if (type == 6 || type == 7) dysym_sections.push_back(sect); 
+                    if (type == 6 || type == 7) { dysym_sections.push_back(sect); g_dysymSections.push_back({sect.addr, sect.size}); }
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
+                    if (strncmp(sect.sectname, "__stub_helper", 16) == 0) { stub_helper_start = sect.addr; stub_helper_end = sect.addr + sect.size; }
                     
                     MachOSectionInfo sinfo;
-                    sinfo.name = std::string(sect.segname) + "," + std::string(sect.sectname);
+                    sinfo.name = machoFixedName(sect.segname) + "," + machoFixedName(sect.sectname);
                     sinfo.start = sect.addr;
                     sinfo.end = sect.addr + sect.size;
                     g_machoSections.push_back(sinfo);
@@ -10967,7 +11305,7 @@ void LoadMachO(const std::string& bundlePath) {
         } else if (lc.cmd == 2) { lseek(fd, cmd_offset, SEEK_SET); read(fd, &symtab, sizeof(symtab));
         } else if (lc.cmd == 11) { lseek(fd, cmd_offset, SEEK_SET); read(fd, &dysymtab, sizeof(dysymtab));
         } else if (lc.cmd == 0x22 || lc.cmd == 0x80000022) { dyld_info_command dyld; lseek(fd, cmd_offset, SEEK_SET); read(fd, &dyld, sizeof(dyld)); dyld_bind_off = dyld.bind_off; dyld_bind_size = dyld.bind_size; dyld_lazy_bind_off = dyld.lazy_bind_off; dyld_lazy_bind_size = dyld.lazy_bind_size; dyld_rebase_off = dyld.rebase_off; dyld_rebase_size = dyld.rebase_size;
-        } else if (lc.cmd == 5) { thread_command th; lseek(fd, cmd_offset, SEEK_SET); read(fd, &th, sizeof(th)); if (th.flavor == 1) { struct { uint32_t r[13]; uint32_t sp; uint32_t lr; uint32_t pc; uint32_t cpsr; } state; read(fd, &state, sizeof(state)); g_entryPoint = state.pc + g_appSlide; }
+        } else if (lc.cmd == 5) { thread_command th; lseek(fd, cmd_offset, SEEK_SET); read(fd, &th, sizeof(th)); if (th.flavor == 1) { struct { uint32_t r[13]; uint32_t sp; uint32_t lr; uint32_t pc; uint32_t cpsr; } state; read(fd, &state, sizeof(state)); g_entryPoint = state.pc + g_appSlide; char ep_buf[128]; snprintf(ep_buf, sizeof(ep_buf), "LC_THREAD: state.pc=0x%X, slide=0x%X, g_entryPoint=0x%X", state.pc, g_appSlide, g_entryPoint); LogToJava(ep_buf); }
         } else if (lc.cmd == 0xC || lc.cmd == 0x18 || lc.cmd == 0x80000018) {
         }
         cmd_offset += lc.cmdsize;
@@ -11064,12 +11402,21 @@ void LoadMachO(const std::string& bundlePath) {
                         uint32_t sect_offset = scan_cmd_offset + sizeof(segment_command);
                         for(uint32_t s = 0; s < seg.nsects; s++) {
                             section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect));
-                            std::string sectname = sect.sectname;
+                            std::string sectname = machoFixedName(sect.sectname);
                             
-                            bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
+                            bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub" || sectname == "__picsymbolstub4");
                             bool isString = (sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype");
+                            // ФИКС: __la_symbol_ptr (type==7) и __nl_symbol_ptr (type==6) НЕ нужно трогать
+                            // эвристическим ребейзом — их слоты будут полностью перезаписаны биндингом
+                            // через dysymtab/ProcessBindOpcodes. Эвристический ребейз + ProcessRebaseOpcodes
+                            // вместе дают двойной сдвиг (slot += slide ДВАЖДЫ), что приводит к невалидным
+                            // адресам типа 0x20B84F40 = stub_helper_pre_slide + 2*slide -> SIGSEGV.
+                            uint8_t sect_type = sect.flags & 0xff;
+                            bool isDysymSlot = (sect_type == 6 || sect_type == 7);
                             
-                                if (isCode && sect.size > 0) {
+                                if (isDysymSlot) {
+                                    // Пропускаем — будет заполнено биндингом
+                                } else if (isCode && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Кастомный парсер сканирует секцию: " + sectname + " (размер: " + std::to_string(sect.size) + ")");
                                 uint32_t current_addr = sect.addr;
                                 const uint8_t* code = (const uint8_t*)(sect.addr + g_appSlide);
@@ -11144,7 +11491,10 @@ void LoadMachO(const std::string& bundlePath) {
                                                 uint32_t val = 0;
                                                 memcpy(&val, (void*)shifted_literal, 4);
                                                 
-                                                if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                                // Thumb function pointers имеют bit 0 = 1. Маскируем для проверки диапазона,
+                                                // но сохраняем бит при записи (только +slide, не очищая bit 0).
+                                                uint32_t val_masked = val & ~1u;
+                                                if (val_masked >= min_vmaddr && val_masked < max_vmaddr && val_masked > 0x1000) {
                                                     val += g_appSlide;
                                                     memcpy((void*)shifted_literal, &val, 4);
                                                     modified_literals++;
@@ -11160,15 +11510,225 @@ void LoadMachO(const std::string& bundlePath) {
                                 }
                                 LogToJava("CUSTOM-PARSER: Успешно разобрано " + std::to_string(parsed_count) + " инструкций.");
                                 LogToJava("CUSTOM-PARSER: Изменено абсолютных указателей в пулах: " + std::to_string(modified_literals));
-                            } else if (!isString && sect.size > 0) {
+
+                                // ARM MOVW/MOVT PATCH — двухпроходная схема:
+                                //
+                                // Проблема: некоторые функции в __text скомпилированы в ARM-режиме.
+                                // ARM MOVW/MOVT пары кодируют абсолютные адреса inline, Thumb-парсер
+                                // их пропускает. Но тот же паттерн используется для PC-относительных
+                                // смещений (switch/GOT):  MOVW Rd,#off_lo; MOVT Rd,#off_hi; ... ADD Rx,PC,Rd
+                                // Если мы добавим slide к такому смещению — получим двойной сдвиг.
+                                //
+                                // Решение — двухпроходный обратный поиск:
+                                // Проход 1: сканируем __text, находим все инструкции вида
+                                //   ADD Rx, PC, Rm  и  LDR Rx, [PC, Rm]
+                                //   Для каждой ищем назад (до 128 слов) MOVW Rm / MOVT Rm.
+                                //   Найденные индексы помечаем в no_patch (vector<bool> по индексу).
+                                // Проход 2: патчим все MOVW/MOVT пары, не вошедшие в no_patch,
+                                //   если их адрес попадает в vmaddr-диапазон бинаря.
+                                //
+                                // Лямбды не используются (совместимость с NDK r17c / Clang 6).
+                                {
+                                    const uint32_t* arm_ptr = (const uint32_t*)code;
+                                    size_t arm_count = code_size / 4;
+                                    const size_t BACK_WINDOW = 128;
+
+                                    // Проход 1: помечаем MOVW-индексы, которые являются PC-смещениями
+                                    std::vector<bool> no_patch(arm_count, false);
+                                    for (size_t ai = 0; ai < arm_count; ai++) {
+                                        uint32_t w = arm_ptr[ai];
+                                        uint32_t Rn = (w >> 16) & 0xF;
+                                        if (Rn != 15) continue; // только инструкции с Rn=PC
+
+                                        uint32_t Rm_used = w & 0xF;
+                                        bool is_pc_rel = false;
+                                        uint32_t op_hi = (w >> 24) & 0xF;
+                                        // ADD/SUB/... Rx, PC, Rm  — data processing, регистровая форма
+                                        // bits[27:26]=00, [25]=0 -> op_hi in {0x0,0x1}
+                                        if ((op_hi == 0x0 || op_hi == 0x1) && (w & 0x0E000000) == 0 && Rm_used != 15) {
+                                            is_pc_rel = true;
+                                        }
+                                        // LDR/STR Rx, [PC, Rm] — load/store регистровая форма
+                                        // bits[27:26]=01, [25]=1 -> op_hi in {0x6,0x7}
+                                        else if ((op_hi == 0x6 || op_hi == 0x7) && Rm_used != 15) {
+                                            is_pc_rel = true;
+                                        }
+                                        if (!is_pc_rel) continue;
+
+                                        // Ищем назад MOVT Rm_used, затем MOVW Rm_used
+                                        size_t back_start = (ai >= BACK_WINDOW) ? ai - BACK_WINDOW : 0;
+                                        for (size_t bi = ai; bi > back_start; bi--) {
+                                            uint32_t bw = arm_ptr[bi - 1];
+                                            uint32_t bRd = (bw >> 12) & 0xF;
+                                            if (((bw >> 20) & 0xFF) == 0x34 && bRd == Rm_used) {
+                                                // Нашли MOVT — ищем MOVW назад в окне BACK_WINDOW.
+                                                // FIX: Раньше проверялось только arm_ptr[bi-2] (ровно одна
+                                                // инструкция до MOVT). Если MOVW стоит дальше (gap ≥ 2),
+                                                // no_patch не выставлялся, и Pass 2 (с новым расширенным
+                                                // форвард-поиском) ошибочно патчил PC-relative MOVW/MOVT пары
+                                                // что давало адреса вида PC + (offset + slide) = double-сдвиг.
+                                                // Теперь ищем MOVW назад в том же окне что и BACK_WINDOW.
+                                                size_t movt_idx = bi - 1; // индекс найденного MOVT
+                                                size_t mw_back_start = (movt_idx >= BACK_WINDOW) ? movt_idx - BACK_WINDOW : 0;
+                                                for (size_t mi = movt_idx; mi > mw_back_start; mi--) {
+                                                    uint32_t mw = arm_ptr[mi - 1];
+                                                    uint32_t mRd = (mw >> 12) & 0xF;
+                                                    if (((mw >> 20) & 0xFF) == 0x30 && mRd == Rm_used) {
+                                                        no_patch[mi - 1] = true; // индекс MOVW
+                                                        break;
+                                                    }
+                                                    // Прерываем если что-то пишет в Rm_used (новая цепочка)
+                                                    uint32_t mop = (mw >> 24) & 0xF;
+                                                    bool writes_rm2 = (mRd == Rm_used) && (((mw >> 20) & 0xFF) != 0x30) &&
+                                                                      (mop <= 0x3 || (mop >= 0x8 && mop <= 0xF));
+                                                    if (writes_rm2) break;
+                                                }
+                                                break;
+                                            }
+                                            // Прерываем если встретили другую запись в Rm_used
+                                            uint32_t bop = (bw >> 24) & 0xF;
+                                            bool writes_rm = (bRd == Rm_used) && (((bw >> 20) & 0xFF) != 0x34) &&
+                                                             (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF));
+                                            if (writes_rm) break;
+                                        }
+                                    }
+
+                                    // Проход 2: патчим незапрещённые MOVW/MOVT пары
+                                    // FIX: Раньше сканнер искал только СМЕЖНЫЕ пары [MOVW][MOVT].
+                                    // В реальном ARM32 коде компилятор может вставить 1-N инструкций
+                                    // между MOVW и MOVT. В таком случае смежный поиск пропускал пару
+                                    // → адрес оставался pre-slide → SIGSEGV.
+                                    // Новая логика: для каждого MOVW ищем MOVT вперёд в окне FWND_MOVT.
+                                    // ВАЖНО: Pass 1 (no_patch) тоже расширен до поиска MOVW в окне,
+                                    // иначе PC-relative пары будут ошибочно пропатчены.
+                                    const size_t FWND_MOVT = 8;
+                                    std::vector<bool> movt_patched_set(arm_count, false);
+                                    int arm_movt_patched = 0;
+                                    for (size_t ai = 0; ai < arm_count; ai++) {
+                                        uint32_t w0 = arm_ptr[ai];
+                                        if (((w0 >> 20) & 0xFF) != 0x30) continue; // не MOVW
+                                        if (no_patch[ai]) continue;
+                                        uint32_t Rd = (w0 >> 12) & 0xF;
+                                        size_t fwd_end = ai + 1 + FWND_MOVT;
+                                        if (fwd_end > arm_count) fwd_end = arm_count;
+                                        for (size_t fi = ai + 1; fi < fwd_end; fi++) {
+                                            uint32_t w1 = arm_ptr[fi];
+                                            uint32_t fRd = (w1 >> 12) & 0xF;
+                                            bool is_movt = (((w1 >> 20) & 0xFF) == 0x34) && (fRd == Rd);
+                                            bool is_movw = (((w1 >> 20) & 0xFF) == 0x30) && (fRd == Rd);
+                                            if (is_movt) {
+                                                if (movt_patched_set[fi]) break;
+                                                uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
+                                                uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
+                                                uint32_t full_addr = (hi16 << 16) | lo16;
+                                                if (full_addr < min_vmaddr || full_addr >= max_vmaddr || full_addr <= 0x1000) break;
+                                                uint32_t patched = full_addr + g_appSlide;
+                                                uint32_t new_lo = patched & 0xFFFF;
+                                                uint32_t new_hi = (patched >> 16) & 0xFFFF;
+                                                uint32_t* pp = const_cast<uint32_t*>(&arm_ptr[ai]);
+                                                pp[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
+                                                uint32_t* pp1 = const_cast<uint32_t*>(&arm_ptr[fi]);
+                                                pp1[0] = (w1 & 0xFFF0F000) | ((new_hi & 0xF000) << 4) | (new_hi & 0xFFF);
+                                                movt_patched_set[fi] = true;
+                                                arm_movt_patched++;
+                                                break;
+                                            }
+                                            if (is_movw) break; // новая цепочка — прерываем
+                                            uint32_t bop = (w1 >> 24) & 0xF;
+                                            bool writes_rd = (fRd == Rd) && (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
+                                                             (((w1 >> 20) & 0xFF) != 0x30) && (((w1 >> 20) & 0xFF) != 0x34);
+                                            if (writes_rd) break;
+                                        }
+                                    }
+                                    if (arm_movt_patched > 0)
+                                        LogToJava("CUSTOM-PARSER: Пропатчено ARM MOVW/MOVT пар: " + std::to_string(arm_movt_patched));
+
+                                    // ARM32 LDR Rx, [PC, #imm12] literal pool patch
+                                    // -----------------------------------------------
+                                    // Thumb-парсер выше обрабатывает только Thumb LDR Rx,[PC,#imm].
+                                    // MOVW/MOVT патчер обрабатывает только inline-пары.
+                                    // ARM32-функции в FAT-бинаре используют LDR Rx,[PC,#imm12]:
+                                    //   E59Fxyyy = LDR Rx,[PC,#+yyy]   (U=1)
+                                    //   E51Fxyyy = LDR Rx,[PC,#-yyy]   (U=0)
+                                    // Literal pool по этому адресу содержит pre-slide указатель,
+                                    // который нужно сдвинуть на g_appSlide.
+                                    // Именно такой пропуск привёл к крэшу (PC=0x10330c88, R5=0x007869f1).
+                                    {
+                                        // Адрес начала секции __text до сдвига
+                                        uint32_t text_vmaddr = sect.addr; // pre-slide
+                                        const uint32_t* arm32_ptr = (const uint32_t*)code;
+                                        int arm_ldrpc_patched = 0;
+
+                                        for (size_t ai = 0; ai < arm_count; ai++) {
+                                            uint32_t w = arm32_ptr[ai];
+                                            // Проверяем ARM32 unconditional/conditional LDR Rx,[PC,#imm12]:
+                                            // bits[27:20]: 0101 U001  (LDR, Rn=PC)
+                                            //   U=1: 0x059F → mask 0x0FFF0000 == 0x059F0000
+                                            //   U=0: 0x051F → mask 0x0FFF0000 == 0x051F0000
+                                            uint32_t field = w & 0x0FFF0000;
+                                            bool is_ldr_pc_pos = (field == 0x059F0000);
+                                            bool is_ldr_pc_neg = (field == 0x051F0000);
+                                            if (!is_ldr_pc_pos && !is_ldr_pc_neg) continue;
+
+                                            uint32_t imm12 = w & 0x00000FFF;
+                                            // PC при исполнении = адрес инструкции + 8
+                                            uint32_t instr_vmaddr = text_vmaddr + (uint32_t)(ai * 4);
+                                            uint32_t pc_val = instr_vmaddr + 8;
+                                            uint32_t lit_vmaddr = is_ldr_pc_pos ? (pc_val + imm12) : (pc_val - imm12);
+
+                                            // Literal pool должен быть в пределах файла
+                                            if (lit_vmaddr < min_vmaddr || lit_vmaddr >= max_vmaddr) continue;
+                                            uint32_t lit_host = lit_vmaddr + g_appSlide;
+
+                                            // Проверяем что адрес смапирован
+                                            bool lit_mapped = false;
+                                            for (const auto& sInfo : g_machoSections) {
+                                                if (lit_host >= sInfo.start && (lit_host + 4) <= sInfo.end) {
+                                                    lit_mapped = true; break;
+                                                }
+                                            }
+                                            if (!lit_mapped) continue;
+
+                                            uint32_t val;
+                                            memcpy(&val, (void*)lit_host, 4);
+
+                                            // Значение должно быть pre-slide указателем в диапазоне бинаря
+                                            // Thumb function pointers имеют bit 0 = 1 — маскируем для проверки
+                                            if ((val & ~1u) < min_vmaddr || (val & ~1u) >= max_vmaddr || (val & ~1u) <= 0x1000) continue;
+
+                                            // Дополнительная проверка: shifted_val должен попадать в mapped секцию
+                                            uint32_t shifted_val = (val & ~1u) + g_appSlide;
+                                            bool sv_mapped = false;
+                                            for (const auto& sInfo : g_machoSections) {
+                                                if (shifted_val >= sInfo.start && shifted_val < sInfo.end) {
+                                                    sv_mapped = true; break;
+                                                }
+                                            }
+                                            if (!sv_mapped) continue;
+
+                                            // Патчим literal pool (сохраняя Thumb-бит если есть)
+                                            uint32_t patched_val = val + g_appSlide;
+                                            memcpy((void*)lit_host, &patched_val, 4);
+                                            arm_ldrpc_patched++;
+                                        }
+                                        if (arm_ldrpc_patched > 0)
+                                            LogToJava("CUSTOM-PARSER: Пропатчено ARM32 LDR-PC literal pools: " + std::to_string(arm_ldrpc_patched));
+                                    }
+                                }
+                            } else if (!isString && !isDysymSlot && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Эвристический ребейз секции данных: " + sectname);
                                 uint32_t* ptr = (uint32_t*)(sect.addr + g_appSlide);
                                 uint32_t count = sect.size / 4;
                                 int data_rebased_count = 0;
                                 
-                                bool is_const_or_data = (sectname == "__const" || sectname == "__data");
+                                // ФИКС: раньше диагностика писалась только для __const/__data, но через этот же
+                                // эвристический цикл проходит ещё ~15 секций (__objc_const, __objc_data,
+                                // __cfstring, __nl_symbol_ptr, __mod_init_func и т.д.) без какого-либо лога.
+                                // Битый указатель из крэша (0x007869F1) не найден ни в __data, ни в __const —
+                                // значит, он там. Дампим теперь диагностику для всех секций этого прохода.
+                                bool dump_diag = true;
                                 FILE* f_diag = nullptr;
-                                if (is_const_or_data) {
+                                if (dump_diag) {
                                     std::string diag_path = g_workDir + "rebase_diag_" + sectname + ".txt";
                                     f_diag = fopen(diag_path.c_str(), "w");
                                     if (f_diag) fprintf(f_diag, "DIAGNOSTICS FOR %s\n", sectname.c_str());
@@ -11177,19 +11737,26 @@ void LoadMachO(const std::string& bundlePath) {
                                 for (uint32_t j = 0; j < count; j++) {
                                     uint32_t val = ptr[j];
                                     
-                                    if (val == 18362952 || val == 18321096 || val == 7339996) {
+                                    // ФИКС: добавлены значения из крэш-лога (Signal 11, R5 = 0x007869F1).
+                                    // Это похоже на недоребейзенный указатель: 0x007869F1 + slide(0x10000000)
+                                    // = 0x107869F1 — валидный адрес в рабочем диапазоне. Проверяем оба варианта
+                                    // (с Thumb-битом и без), чтобы понять, в какой секции он застрял.
+                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440) {
                                         char alert_buf[256];
                                         snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT: Целевая переменная %u (0x%X) найдена по адресу 0x%X (секция %s)", val, val, sect.addr + j*4, sectname.c_str());
                                         LogToJava(alert_buf);
                                     }
                                     
-                                    if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                    if ((val & ~1u) >= min_vmaddr && (val & ~1u) < max_vmaddr && (val & ~1u) > 0x1000) {
                                         bool safe_to_rebase = true;
                                         std::string target_section = "Unknown";
                                         std::string reason = "OK";
+                                        // Для Thumb function pointers (bit 0 = 1) маскируем бит для поиска секции,
+                                        // но shifted_val (для записи) сохраняет бит чтобы не потерять Thumb-режим.
                                         uint32_t shifted_val = val + g_appSlide;
+                                        uint32_t shifted_val_masked = shifted_val & ~1u;
                                         for (const auto& sInfo : g_machoSections) {
-                                            if (shifted_val >= sInfo.start && shifted_val < sInfo.end) {
+                                            if (shifted_val_masked >= sInfo.start && shifted_val_masked < sInfo.end) {
                                                 target_section = sInfo.name;
                                                 break;
                                             }
@@ -11204,7 +11771,11 @@ void LoadMachO(const std::string& bundlePath) {
                                             bool is_raw_string_target = (target_section.find("__cstring") != std::string::npos || 
                                                                          target_section.find("__objc_methname") != std::string::npos || 
                                                                          target_section.find("__objc_classname") != std::string::npos || 
-                                                                         target_section.find("__objc_methtype") != std::string::npos);
+                                                                         target_section.find("__objc_methtype") != std::string::npos ||
+                                                                         // FIX: __ustring содержит UTF-16 данные CFString литералов.
+                                                                         // isValidString() не работает для UTF-16, поэтому раньше
+                                                                         // указатели на __ustring падали в ветку else и игнорировались.
+                                                                         target_section.find("__ustring") != std::string::npos);
                                                                          
                                             bool is_struct_target = (target_section.find("__cfstring") != std::string::npos || 
                                                                      target_section.find("__objc_const") != std::string::npos || 
@@ -11225,21 +11796,62 @@ void LoadMachO(const std::string& bundlePath) {
                                                                      target_section.find("__mod_init_func") != std::string::npos);
 
                                             if (is_code_target) {
-                                                if ((val & 1) == 0) { safe_to_rebase = false; reason = "Code: Even"; }
+                                                // Убрали фильтр "Code: Even": ARM32 функции имеют чётные адреса (бит 0 = 0),
+                                                // Thumb-функции — нечётные (бит 0 = 1). Оба варианта валидны в ARMv7 бинарях.
+                                                // Вместо фильтра по чётности проверяем что shifted_val попадает в mapped секцию.
+                                                if ((val & 1) == 0) {
+                                                    // ARM32 pointer — проверяем что адрес (без учёта Thumb-бита) реально в секции
+                                                    bool in_mapped = false;
+                                                    for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { in_mapped = true; break; } }
+                                                    if (!in_mapped) { safe_to_rebase = false; reason = "Code: Even (Unmapped)"; }
+                                                    // иначе — это ARM32 функция, ребейзим
+                                                }
                                                 else if (((val >> 16) & 0xFFFF) == (val & 0xFFFF)) { safe_to_rebase = false; reason = "Code: Symmetric"; }
                                             } else if (is_raw_string_target) {
-                                                if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "String: Invalid"; }
+                                                // FIX: Trust sv_mapped only. isValidString is unreliable for ObjC string
+                                                // sections: __objc_classname__TEXT can have zero-padding before the first
+                                                // real string, so isValidString returns false for a perfectly valid name_ptr
+                                                // offset. That leaves the pointer un-rebased, and the classlist scanner
+                                                // later reads a pre-slide address -> SIGSEGV. If shifted_val falls inside
+                                                // a known mapped section it is a legitimate ObjC string pointer; rebase it.
+                                                bool sv_mapped = false;
+                                                for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
+                                                if (!sv_mapped) { safe_to_rebase = false; reason = "String: Unmapped Ptr"; }
                                             } else if (is_struct_target) {
                                                 if ((val & 3) != 0) { safe_to_rebase = false; reason = "Struct: Unaligned"; }
                                                 else if (target_section.find("__cfstring") != std::string::npos) {
-                                                    uint32_t* cfstr = (uint32_t*)shifted_val;
-                                                    uint32_t str_ptr = cfstr[2];
-                                                    if (str_ptr < min_vmaddr || str_ptr >= max_vmaddr) { safe_to_rebase = false; reason = "CFString: Invalid Ptr"; }
-                                                    else if (!isValidString((const char*)(str_ptr + g_appSlide))) { safe_to_rebase = false; reason = "CFString: Invalid Str"; }
+                                                    // FIX: Verify shifted_val is mapped before reading cfstr fields
+                                                    bool sv_mapped = false;
+                                                    for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && (shifted_val + 16) <= sInfo.end) { sv_mapped = true; break; } }
+                                                    if (!sv_mapped) { safe_to_rebase = false; reason = "CFString: Unmapped Ptr"; }
+                                                    else {
+                                                        uint32_t* cfstr = (uint32_t*)shifted_val;
+                                                        uint32_t str_ptr = cfstr[2];
+                                                        // FIX: __cfstring может быть уже ребейзнут к этому моменту
+                                                        // (он обрабатывается раньше второго прохода __const).
+                                                        // Тогда str_ptr уже содержит post-slide адрес (>= max_vmaddr).
+                                                        // Нормализуем: если str_ptr выглядит как post-slide — вычитаем slide.
+                                                        uint32_t norm_str_ptr = str_ptr;
+                                                        if (str_ptr >= max_vmaddr && str_ptr >= g_appSlide) {
+                                                            norm_str_ptr = str_ptr - g_appSlide;
+                                                        }
+                                                        if (norm_str_ptr < min_vmaddr || norm_str_ptr >= max_vmaddr || norm_str_ptr <= 0x1000) { safe_to_rebase = false; reason = "CFString: Invalid Ptr"; }
+                                                        else {
+                                                            uint32_t shifted_str_ptr = norm_str_ptr + g_appSlide;
+                                                            bool sp_mapped = false;
+                                                            for (const auto& sInfo : g_machoSections) { if (shifted_str_ptr >= sInfo.start && shifted_str_ptr < sInfo.end) { sp_mapped = true; break; } }
+                                                            if (!sp_mapped) { safe_to_rebase = false; reason = "CFString: Unmapped Str"; }
+                                                            // Не проверяем isValidString — str_ptr может быть UTF-16 (__ustring)
+                                                        }
+                                                    }
                                                 }
                                             } else {
                                                 if ((val & 3) != 0) {
-                                                    if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
+                                                    // FIX: Verify shifted_val is mapped before dereferencing
+                                                    bool sv_mapped = false;
+                                                    for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
+                                                    if (!sv_mapped) { safe_to_rebase = false; reason = "Data: Unmapped Ptr"; }
+                                                    else if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
                                                 }
                                             }
                                         } else {
@@ -11285,8 +11897,131 @@ void LoadMachO(const std::string& bundlePath) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
                 uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
+                for (uint32_t i = 0; i < num_pointers; i++) {
+                    uint32_t sym_idx = indirectSyms[sect.reserved1 + i];
+                    if (sym_idx == 0x80000000 || sym_idx == 0x40000000) {
+                        /* INDIRECT_SYMBOL_LOCAL/_ABS: пре-slide адрес из файла, ребейзим */
+                        uint32_t val = ptr_table[i];
+                        if (val >= min_vmaddr && val < max_vmaddr) ptr_table[i] = val + g_appSlide;
+                        continue;
+                    }
+                    std::string symName = &strTable[symTable[sym_idx].n_un.n_strx];
+                    ptr_table[i] = (uint32_t)ResolveSymbol(symName);
+                }
             }
+        }
+
+        // ФИКС КРАША: Asphalt6 и другие старые бинари (iOS 3.x) могут оставлять часть
+        // __la_symbol_ptr / __nl_symbol_ptr слотов нетронутыми после биндинга.
+        // В них лежит pre-slide адрес __stub_helper (например, 0x003B85A4).
+        // Когда mod_init_func или любой другой код вызывает функцию через такой слот,
+        // PC прыгает на pre-slide адрес → SIGSEGV (Signal 11).
+        //
+        // Решение: обходим ВСЕ dysym-слоты (type 6 = nl_symbol_ptr, type 7 = la_symbol_ptr,
+        // а также type 8 = symbol_stubs на случай нестандартного флага).
+        // Любой слот, значение которого попадает в pre-slide диапазон бинаря
+        // [min_vmaddr, max_vmaddr), принудительно сдвигается на +slide.
+        // Слоты, уже заполненные HLE (адреса >> max_vmaddr), не затрагиваются.
+        {
+            int la_fixed = 0;
+            // Эвристический диапазон pre-slide адресов: расширяем чуть вниз до 0
+            // на случай если min_vmaddr = 0 (PIE с vmaddr=0)
+            uint32_t pre_slide_lo = (min_vmaddr > 0x1000) ? min_vmaddr : 0;
+            uint32_t pre_slide_hi = max_vmaddr;
+            for (const auto& sect : dysym_sections) {
+                uint8_t sect_type = sect.flags & 0xff;
+                // Обрабатываем: S_NON_LAZY_SYMBOL_POINTERS(6), S_LAZY_SYMBOL_POINTERS(7), S_SYMBOL_STUBS(8)
+                // и любой другой тип — всё равно проверка по значению безопасна.
+                (void)sect_type; // Убираем фильтр по типу — проверяем по значению
+                uint32_t* ptr_table = (uint32_t*)sect.addr;
+                uint32_t num_pointers = sect.size / 4;
+                for (uint32_t i = 0; i < num_pointers; i++) {
+                    uint32_t val = ptr_table[i];
+                    // Слот содержит pre-slide адрес — ещё не заполнен биндингом
+                    if (val > pre_slide_lo && val < pre_slide_hi) {
+                        uint32_t slotAddr = sect.addr + i * 4; // post-slide адрес слота
+                        // Детальный лог для диагностики (особенно известный crash-адрес)
+                        if (val == 0x003B85A4 || la_fixed < 5) {
+                            char dbgBuf[256];
+                            snprintf(dbgBuf, sizeof(dbgBuf),
+                                "DYSYM-SLOT-FIX: slot[%u] @ 0x%08X: pre-slide val 0x%08X → 0x%08X",
+                                i, slotAddr, val, val + g_appSlide);
+                            LogToJava(std::string(dbgBuf));
+                        }
+                        ptr_table[i] = val + g_appSlide;
+                        la_fixed++;
+                    }
+                }
+            }
+            if (la_fixed > 0) {
+                LogToJava("DYSYM-SLOT-FIX: Принудительно ребейзено " + std::to_string(la_fixed) +
+                          " необработанных dysym слотов (+slide). pre_slide range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_lo) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_hi) +
+                          ")");
+            } else {
+                LogToJava("DYSYM-SLOT-FIX: Все dysym слоты уже заполнены биндингом (0 необработанных). "
+                          "pre_slide range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_lo) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(pre_slide_hi) +
+                          ")");
+            }
+        }
+
+        // ФИКС STUB_HELPER: Для старых бинарей (iOS 3.x, без LC_DYLD_INFO) dysymtab-loop
+        // ребейзит INDIRECT_SYMBOL_LOCAL слоты с pre-slide адреса __stub_helper на
+        // post-slide адрес __stub_helper. Но __stub_helper без dyld resolver бесполезен —
+        // при вызове через такой слот CPU прыгает на __stub_helper entry, который пытается
+        // позвать dyld (его нет) → PC = pre/post-slide stub_helper адрес → SIGSEGV.
+        //
+        // Решение: после всей обработки финально сканируем dysym-слоты.
+        // Любой слот значение которого попадает в __stub_helper секцию (post-slide диапазон)
+        // — заменяем на CreateDynamicStub. Аналогично ловим pre-slide stub_helper адреса
+        // на случай если dysymtab-loop их не тронул.
+        if (stub_helper_start != 0 || stub_helper_end != 0) {
+            int sh_fixed = 0;
+            // pre-slide диапазон stub_helper
+            uint32_t sh_pre_start = (stub_helper_start > g_appSlide) ? stub_helper_start - g_appSlide : 0;
+            uint32_t sh_pre_end   = (stub_helper_end   > g_appSlide) ? stub_helper_end   - g_appSlide : 0;
+            for (const auto& sect : dysym_sections) {
+                uint32_t* slot = (uint32_t*)sect.addr;
+                uint32_t  count = sect.size / 4;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t val = slot[i];
+                    bool is_stub_helper_post  = (stub_helper_start != 0 && val >= stub_helper_start && val < stub_helper_end);
+                    bool is_stub_helper_pre   = (sh_pre_start != 0 && val >= sh_pre_start && val < sh_pre_end);
+                    if (is_stub_helper_post || is_stub_helper_pre) {
+                        char name_buf[64]; snprintf(name_buf, sizeof(name_buf), "__unresolved_lazy_0x%08X", val);
+                        void* dstub = CreateDynamicStub(std::string(name_buf));
+                        char dbg[256]; snprintf(dbg, sizeof(dbg),
+                            "STUB-HELPER-FIX: dysym slot[%u] @ 0x%08X: val 0x%08X → stub %p (was %s stub_helper)",
+                            i, (uint32_t)(sect.addr + i * 4), val, dstub, is_stub_helper_pre ? "pre-slide" : "post-slide");
+                        LogToJava(std::string(dbg));
+                        slot[i] = (uint32_t)(uintptr_t)dstub;
+                        sh_fixed++;
+                    }
+                }
+            }
+            if (sh_fixed > 0) {
+                LogToJava("STUB-HELPER-FIX: Заменено " + std::to_string(sh_fixed) +
+                          " незарезолвленных stub_helper слотов на DynamicStub."
+                          " stub_helper range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
+                          ")");
+            } else {
+                LogToJava("STUB-HELPER-FIX: Незарезолвленных stub_helper слотов не найдено."
+                          " stub_helper range: [0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
+                          ", 0x" +
+                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
+                          ")");
+            }
+        } else {
+            LogToJava("STUB-HELPER-FIX: __stub_helper секция не найдена, пропускаем.");
         }
     }
     cmd_offset = arch_offset + sizeof(mach_header);
@@ -11304,11 +12039,22 @@ void LoadMachO(const std::string& bundlePath) {
         for (uint32_t i = 0; i < num_classes; i++) {
             uint32_t cls_addr = ptr_table[i];
             if (cls_addr > 0x1000) {
+                // FIX: verify cls_addr is in a mapped section (guards against un-rebased classlist entry)
+                bool cls_mapped = false;
+                for (const auto& si : g_machoSections) { if (cls_addr >= si.start && cls_addr < si.end) { cls_mapped = true; break; } }
+                if (!cls_mapped) continue;
                 uint32_t* cls = (uint32_t*)cls_addr;
                 uint32_t data_ptr = cls[4] & ~3;
                 if (data_ptr > 0x1000) {
+                    // FIX: verify data_ptr is mapped before reading class_ro_t fields
+                    bool dp_mapped = false;
+                    for (const auto& si : g_machoSections) { if (data_ptr >= si.start && (data_ptr + 20) <= si.end) { dp_mapped = true; break; } }
+                    if (!dp_mapped) continue;
                     uint32_t name_ptr = ((uint32_t*)data_ptr)[4];
-                    if (isValidString((const char*)name_ptr)) {
+                    // FIX: verify name_ptr is in a mapped section before passing to isValidString
+                    bool np_mapped = false;
+                    for (const auto& si : g_machoSections) { if (name_ptr >= si.start && name_ptr < si.end) { np_mapped = true; break; } }
+                    if (np_mapped && isValidString((const char*)name_ptr)) {
                         std::string cName = (const char*)name_ptr;
                         g_appSymbols["_OBJC_CLASS_$_" + cName] = cls_addr;
                         if (g_logHiddenClasses) {
