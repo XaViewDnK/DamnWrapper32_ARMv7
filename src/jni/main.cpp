@@ -11463,42 +11463,58 @@ void LoadMachO(const std::string& bundlePath) {
                                     }
                                     
                                     if (is_ldr_pc && literal_addr >= min_vmaddr && literal_addr < max_vmaddr) {
-                                        // Интеллектуальный Lookahead: Ищем ADD Rd, PC (паттерн позиционно-независимого кода)
-                                        bool is_pic_offset = false;
-                                        const uint16_t* scan_ptr = ptr + (insn_size / 2);
-                                        for (int i = 0; i < 12 && (const uint8_t*)scan_ptr < code + code_size; i++) {
-                                            uint16_t scan_hw = *scan_ptr;
-                                            if (target_rd < 8 && scan_hw == (0x4478 | target_rd)) {
-                                                is_pic_offset = true; break;
-                                            } else if (target_rd >= 8 && scan_hw == (0x44F8 | (target_rd & 7))) {
-                                                is_pic_offset = true; break;
+                                        // FIX: читаем значение из literal pool ДО PIC-lookahead.
+                                        // Если значение само по себе попадает в диапазон бинаря [min_vmaddr, max_vmaddr],
+                                        // это ЗАВЕДОМО абсолютный указатель, а не PIC-смещение.
+                                        // PIC-смещения (switch/GOT) — маленькие относительные числа, никогда не совпадающие
+                                        // с диапазоном адресов самого бинаря (~0x3000..0x800000).
+                                        // Старый код запускал lookahead первым и мог ложно пометить абсолютный pointer
+                                        // как PIC, если в следующих 12 инструкциях случайно встречался ADD Rd,PC
+                                        // (из другой функции или из пролога следующей). Это приводило к крэшу:
+                                        // PC=0x003B85A4 — пул не был пропатчен из-за ложного is_pic_offset=true.
+                                        bool is_valid_memory = false;
+                                        uint32_t shifted_literal = literal_addr + g_appSlide;
+                                        for (const auto& sInfo : g_machoSections) {
+                                            if (shifted_literal >= sInfo.start && shifted_literal < sInfo.end) {
+                                                is_valid_memory = true;
+                                                break;
                                             }
-                                            scan_ptr += GetThumbInstructionSize(scan_hw) / 2;
                                         }
 
-                                        // Если это НЕ относительное PIC смещение, значит это абсолютный указатель - делаем ребейз
-                                        if (!is_pic_offset) {
-                                            bool is_valid_memory = false;
-                                            uint32_t shifted_literal = literal_addr + g_appSlide;
-                                            for (const auto& sInfo : g_machoSections) {
-                                                if (shifted_literal >= sInfo.start && shifted_literal < sInfo.end) {
-                                                    is_valid_memory = true;
-                                                    break;
-                                                }
+                                        if (is_valid_memory) {
+                                            uint32_t val = 0;
+                                            memcpy(&val, (void*)shifted_literal, 4);
+                                            uint32_t val_masked = val & ~1u;
+
+                                            // REBASE-ALERT для отладки конкретных адресов
+                                            if (val == 3900836 || val == 3900837) { // 0x003B85A4 / 0x003B85A5
+                                                char alert_buf[256];
+                                                snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT (Thumb LDR-PC): val=0x%X найден в пуле по literal_addr=0x%X", val, literal_addr);
+                                                LogToJava(alert_buf);
                                             }
-                                            
-                                            if (is_valid_memory) {
-                                                uint32_t val = 0;
-                                                memcpy(&val, (void*)shifted_literal, 4);
-                                                
-                                                // Thumb function pointers имеют bit 0 = 1. Маскируем для проверки диапазона,
-                                                // но сохраняем бит при записи (только +slide, не очищая bit 0).
-                                                uint32_t val_masked = val & ~1u;
-                                                if (val_masked >= min_vmaddr && val_masked < max_vmaddr && val_masked > 0x1000) {
-                                                    val += g_appSlide;
-                                                    memcpy((void*)shifted_literal, &val, 4);
-                                                    modified_literals++;
+
+                                            if (val_masked >= min_vmaddr && val_masked < max_vmaddr && val_masked > 0x1000) {
+                                                // Значение в диапазоне бинаря — это абсолютный pointer.
+                                                // PIC lookahead не нужен: PIC-смещения никогда не попадают в этот диапазон.
+                                                val += g_appSlide;
+                                                memcpy((void*)shifted_literal, &val, 4);
+                                                modified_literals++;
+                                            } else {
+                                                // Малое значение — может быть PIC-смещением.
+                                                // Запускаем lookahead только в этом случае.
+                                                bool is_pic_offset = false;
+                                                const uint16_t* scan_ptr = ptr + (insn_size / 2);
+                                                for (int i = 0; i < 12 && (const uint8_t*)scan_ptr < code + code_size; i++) {
+                                                    uint16_t scan_hw = *scan_ptr;
+                                                    if (target_rd < 8 && scan_hw == (0x4478 | target_rd)) {
+                                                        is_pic_offset = true; break;
+                                                    } else if (target_rd >= 8 && scan_hw == (0x44F8 | (target_rd & 7))) {
+                                                        is_pic_offset = true; break;
+                                                    }
+                                                    scan_ptr += GetThumbInstructionSize(scan_hw) / 2;
                                                 }
+                                                // Малые не-PIC значения не ребейзим (они не являются указателями)
+                                                (void)is_pic_offset;
                                             }
                                         }
                                     }
@@ -11741,7 +11757,7 @@ void LoadMachO(const std::string& bundlePath) {
                                     // Это похоже на недоребейзенный указатель: 0x007869F1 + slide(0x10000000)
                                     // = 0x107869F1 — валидный адрес в рабочем диапазоне. Проверяем оба варианта
                                     // (с Thumb-битом и без), чтобы понять, в какой секции он застрял.
-                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440) {
+                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440 || val == 3900836 || val == 3900837) { // 3900836=0x003B85A4, 3900837=0x003B85A5 (Thumb)
                                         char alert_buf[256];
                                         snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT: Целевая переменная %u (0x%X) найдена по адресу 0x%X (секция %s)", val, val, sect.addr + j*4, sectname.c_str());
                                         LogToJava(alert_buf);
@@ -11851,7 +11867,10 @@ void LoadMachO(const std::string& bundlePath) {
                                                     bool sv_mapped = false;
                                                     for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
                                                     if (!sv_mapped) { safe_to_rebase = false; reason = "Data: Unmapped Ptr"; }
-                                                    else if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
+                                                    // FIX: __TEXT,__const содержит бинарные данные (structs, C-strings, jump tables).
+                                                    // isValidString ненадёжен — строки могут начинаться не с ASCII символа.
+                                                    // Достаточно проверки sv_mapped выше. Убираем isValidString-фильтр.
+                                                    // Раньше это пропускало 7 указателей с причиной "Data: Unaligned & Bad ASCII".
                                                 }
                                             }
                                         } else {
