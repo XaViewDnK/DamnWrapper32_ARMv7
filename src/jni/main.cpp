@@ -11586,11 +11586,29 @@ void LoadMachO(const std::string& bundlePath) {
                                                 // Теперь ищем MOVW назад в том же окне что и BACK_WINDOW.
                                                 size_t movt_idx = bi - 1; // индекс найденного MOVT
                                                 size_t mw_back_start = (movt_idx >= BACK_WINDOW) ? movt_idx - BACK_WINDOW : 0;
+                                                // Запоминаем hi16 найденного MOVT для проверки ниже
+                                                uint32_t movt_hi16 = ((arm_ptr[movt_idx] >> 4) & 0xF000) | (arm_ptr[movt_idx] & 0xFFF);
                                                 for (size_t mi = movt_idx; mi > mw_back_start; mi--) {
                                                     uint32_t mw = arm_ptr[mi - 1];
                                                     uint32_t mRd = (mw >> 12) & 0xF;
                                                     if (((mw >> 20) & 0xFF) == 0x30 && mRd == Rm_used) {
-                                                        no_patch[mi - 1] = true; // индекс MOVW
+                                                        // FIX: Проверяем, является ли пара абсолютным указателем.
+                                                        // Если full_addr попадает в [min_vmaddr, max_vmaddr) — это
+                                                        // абсолютный адрес данных, а НЕ PC-relative оффсет.
+                                                        // В таком случае no_patch НЕ выставляем: Pass 2 должен
+                                                        // пропатчить эту пару.
+                                                        // Если full_addr вне диапазона — это реальный PC-оффсет,
+                                                        // помечаем no_patch (Pass 2 тоже пропустит по range-check,
+                                                        // но явный флаг предотвращает случайный патч при граничных
+                                                        // значениях диапазона).
+                                                        uint32_t movw_lo16 = ((mw >> 4) & 0xF000) | (mw & 0xFFF);
+                                                        uint32_t full_addr_check = (movt_hi16 << 16) | movw_lo16;
+                                                        bool is_abs_ptr = (full_addr_check >= min_vmaddr &&
+                                                                           full_addr_check < max_vmaddr &&
+                                                                           full_addr_check > 0x1000);
+                                                        if (!is_abs_ptr) {
+                                                            no_patch[mi - 1] = true; // индекс MOVW (только для PC-оффсетов)
+                                                        }
                                                         break;
                                                     }
                                                     // Прерываем если что-то пишет в Rm_used (новая цепочка)
