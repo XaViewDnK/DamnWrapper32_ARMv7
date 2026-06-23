@@ -5168,6 +5168,20 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "setActivityIndicatorViewStyle:") == 0) return 0;
         }
         if (clsName == "UIImage") {
+            if (strcmp(op, "initWithContentsOfFile:") == 0) {
+                std::string path = GetNSString(a1);
+                int w, h, channels;
+                uint8_t* data = stbi_load(path.c_str(), &w, &h, &channels, 4);
+                if (data) {
+                    HLE_CGImage* cgImg = new HLE_CGImage{w, h, 32, data};
+                    self_ptr[1] = (uint32_t)cgImg;
+                    LogToJava("HLE: [UIImage initWithContentsOfFile] загружен " + path + " (" + std::to_string(w) + "x" + std::to_string(h) + ")");
+                } else {
+                    self_ptr[1] = 0;
+                    LogToJava("HLE_WARN: [UIImage initWithContentsOfFile] не удалось загрузить: " + path);
+                }
+                return (uint64_t)(uintptr_t)self;
+            }
             if (strcmp(op, "initWithData:") == 0) {
                 uint32_t* nsData = (uint32_t*)a1;
                 if (nsData && nsData[1] && nsData[2] > 0) {
