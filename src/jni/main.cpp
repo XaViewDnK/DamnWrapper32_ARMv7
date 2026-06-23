@@ -11592,23 +11592,23 @@ void LoadMachO(const std::string& bundlePath) {
                                                     uint32_t mw = arm_ptr[mi - 1];
                                                     uint32_t mRd = (mw >> 12) & 0xF;
                                                     if (((mw >> 20) & 0xFF) == 0x30 && mRd == Rm_used) {
-                                                        // FIX: Проверяем, является ли пара абсолютным указателем.
-                                                        // Если full_addr попадает в [min_vmaddr, max_vmaddr) — это
-                                                        // абсолютный адрес данных, а НЕ PC-relative оффсет.
-                                                        // В таком случае no_patch НЕ выставляем: Pass 2 должен
-                                                        // пропатчить эту пару.
-                                                        // Если full_addr вне диапазона — это реальный PC-оффсет,
-                                                        // помечаем no_patch (Pass 2 тоже пропустит по range-check,
-                                                        // но явный флаг предотвращает случайный патч при граничных
-                                                        // значениях диапазона).
-                                                        uint32_t movw_lo16 = ((mw >> 4) & 0xF000) | (mw & 0xFFF);
-                                                        uint32_t full_addr_check = (movt_hi16 << 16) | movw_lo16;
-                                                        bool is_abs_ptr = (full_addr_check >= min_vmaddr &&
-                                                                           full_addr_check < max_vmaddr &&
-                                                                           full_addr_check > 0x1000);
-                                                        if (!is_abs_ptr) {
-                                                            no_patch[mi - 1] = true; // индекс MOVW (только для PC-оффсетов)
-                                                        }
+                                                        // Нашли MOVW: этот регистр Rm загружается парой MOVW/MOVT
+                                                        // и ЗАТЕМ используется как оффсет в [PC, Rm].
+                                                        //
+                                                        // ВСЕГДА помечаем no_patch — без проверки is_abs_ptr.
+                                                        //
+                                                        // Почему is_abs_ptr нельзя использовать:
+                                                        //   Pass 1 читает MOVT до того, как Pass 2 его пропатчил.
+                                                        //   Оригинальный MOVT содержит pre-slide hi16 (например 0x0085),
+                                                        //   который попадает в vmaddr-диапазон [0, max_vmaddr) и даёт
+                                                        //   is_abs_ptr=TRUE — ложно-положительное решение «не трогать».
+                                                        //   Pass 2 затем патчит MOVT (0x0085→0x1085), регистр получает
+                                                        //   слайднутый адрес, LDR [PC,Rm] суммирует его с PC (тоже
+                                                        //   слайднутым) → double-slide → fault addr 0x208734A0.
+                                                        //
+                                                        // Семантика [PC, Rm] однозначна: Rm — это оффсет от PC,
+                                                        // слайд на него применять нельзя ни при каких условиях.
+                                                        no_patch[mi - 1] = true;
                                                         break;
                                                     }
                                                     // Прерываем если что-то пишет в Rm_used (новая цепочка)
@@ -11629,22 +11629,13 @@ void LoadMachO(const std::string& bundlePath) {
 
                                     // Проход 2: патчим незапрещённые MOVW/MOVT пары.
                                     //
-                                    // FIX (v3): Вместо «для каждого MOVW ищем MOVT вперёд» используем
-                                    // «для каждого MOVT ищем MOVW назад» (зеркало Pass 1).
-                                    //
-                                    // Проблема предыдущего подхода (forward MOVW→MOVT):
-                                    //   Если в бинаре есть два MOVW Rx близко друг к другу (расстояние ≤ FWND),
-                                    //   оба могут «увидеть» один и тот же MOVT Rx в своих окнах.
-                                    //   Первый MOVW (по адресу) выигрывает гонку и выставляет
-                                    //   movt_patched_set[fi]=true. Когда второй MOVW доходит до этого MOVT,
-                                    //   он получает break и остаётся НЕ пропатченным → pre-slide адрес в R3
-                                    //   → запись/чтение по 0x008E2FB0 → SIGSEGV.
-                                    //
-                                    // Обратный поиск MOVT→MOVW решает проблему: каждый MOVT находит
+                                    // Алгоритм: для каждого MOVT ищем MOVW назад (зеркало Pass 1).
+                                    // Это гарантирует правильное сопоставление: каждый MOVT находит
                                     // БЛИЖАЙШИЙ предшествующий MOVW того же регистра — именно ту пару,
-                                    // которую компилятор и имел в виду. Гонки между двумя MOVW за один
-                                    // MOVT нет, потому что каждый MOVT обрабатывается ровно один раз.
-                                    const size_t BACK_WINDOW_P2 = 16; // шире Pass-1-окна — для надёжности
+                                    // которую сгенерировал компилятор. Проблема «двух MOVW за один MOVT»
+                                    // (когда ранний MOVW захватывал чужой MOVT и оставлял реальный MOVW
+                                    // непропатченным) полностью устраняется.
+                                    const size_t BACK_WINDOW_P2 = 16;
                                     std::vector<bool> movt_patched_set(arm_count, false);
                                     int arm_movt_patched = 0;
                                     for (size_t fi = 0; fi < arm_count; fi++) {
@@ -11659,7 +11650,6 @@ void LoadMachO(const std::string& bundlePath) {
                                             bool is_movw = (((w0 >> 20) & 0xFF) == 0x30) && (bRd == Rd);
                                             bool is_movt = (((w0 >> 20) & 0xFF) == 0x34) && (bRd == Rd);
                                             if (is_movw) {
-                                                // Нашли MOVW того же регистра.
                                                 if (no_patch[bi - 1]) break; // PC-relative пара — не трогаем
                                                 uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
                                                 uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
@@ -11677,7 +11667,6 @@ void LoadMachO(const std::string& bundlePath) {
                                                 break;
                                             }
                                             if (is_movt) break; // другая MOVT-цепочка для того же Rd — стоп
-                                            // Если инструкция записывает в Rd — цепочка прервана
                                             uint32_t bop = (w0 >> 24) & 0xF;
                                             bool writes_rd = (bRd == Rd) &&
                                                              (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
