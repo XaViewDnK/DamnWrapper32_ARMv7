@@ -11275,6 +11275,10 @@ void LoadMachO(const std::string& bundlePath) {
     // Диапазон __stub_helper секции (post-slide). Используется для обнаружения незарезолвленных
     // ленивых слотов после dysymtab-обработки (slot value в диапазоне stub_helper → нет dyld resolver).
     uint32_t stub_helper_start = 0, stub_helper_end = 0;
+    // Диапазоны ВСЕХ stub-секций (__stub_helper, __symbol_stub4, __symbol_stub, __picsymbolstub4 и т.д.)
+    // post-slide адреса. Используются в расширенном STUB-HELPER-FIX.
+    struct StubCodeRange { uint32_t start; uint32_t end; std::string name; };
+    std::vector<StubCodeRange> stub_code_ranges;
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         lseek(fd, cmd_offset, SEEK_SET); load_command lc; read(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { 
@@ -11292,6 +11296,25 @@ void LoadMachO(const std::string& bundlePath) {
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__stub_helper", 16) == 0) { stub_helper_start = sect.addr; stub_helper_end = sect.addr + sect.size; }
+                    // Собираем все stub-секции (тип 8 = S_SYMBOL_STUBS, а также stub_helper)
+                    // для расширенного STUB-HELPER-FIX. Проверяем по имени, т.к. тип у __symbol_stub4 = 8
+                    // и он не попадает в dysym_sections (там только тип 6 и 7).
+                    {
+                        bool is_stub_sec = (type == 8 /* S_SYMBOL_STUBS */);
+                        if (!is_stub_sec) {
+                            // Также добавляем __stub_helper по имени (тип может быть 0 или другим)
+                            const char* sn = sect.sectname;
+                            if (strncmp(sn, "__stub_helper",    16) == 0 ||
+                                strncmp(sn, "__symbol_stub",    13) == 0 ||
+                                strncmp(sn, "__picsymbolstub",  15) == 0) {
+                                is_stub_sec = true;
+                            }
+                        }
+                        if (is_stub_sec) {
+                            std::string scname = machoFixedName(sect.segname) + "," + machoFixedName(sect.sectname);
+                            stub_code_ranges.push_back({sect.addr, sect.addr + sect.size, scname});
+                        }
+                    }
                     
                     MachOSectionInfo sinfo;
                     sinfo.name = machoFixedName(sect.segname) + "," + machoFixedName(sect.sectname);
@@ -12014,28 +12037,57 @@ void LoadMachO(const std::string& bundlePath) {
         // при вызове через такой слот CPU прыгает на __stub_helper entry, который пытается
         // позвать dyld (его нет) → PC = pre/post-slide stub_helper адрес → SIGSEGV.
         //
-        // Решение: после всей обработки финально сканируем dysym-слоты.
-        // Любой слот значение которого попадает в __stub_helper секцию (post-slide диапазон)
-        // — заменяем на CreateDynamicStub. Аналогично ловим pre-slide stub_helper адреса
-        // на случай если dysymtab-loop их не тронул.
-        if (stub_helper_start != 0 || stub_helper_end != 0) {
+        // РАСШИРЕННЫЙ ФИХ: Также ловим слоты указывающие на __symbol_stub4 и другие
+        // stub-секции (тип 8). Паттерн iOS 3.x lazy binding:
+        //   __la_symbol_ptr → (initially) __symbol_stub4 entry → __stub_helper → dyld
+        // После DYSYM-SLOT-FIX слот получает post-slide адрес __symbol_stub4 →
+        // CPU в бесконечном цикле читает тот же слот → SIGSEGV.
+        // Решение: все dysym-слоты значение которых попадает в ЛЮБУЮ stub-секцию
+        // (post-slide или pre-slide) → заменяем на CreateDynamicStub.
+        {
             int sh_fixed = 0;
-            // pre-slide диапазон stub_helper
-            uint32_t sh_pre_start = (stub_helper_start > g_appSlide) ? stub_helper_start - g_appSlide : 0;
-            uint32_t sh_pre_end   = (stub_helper_end   > g_appSlide) ? stub_helper_end   - g_appSlide : 0;
+            // Логируем найденные stub-секции для диагностики
+            {
+                std::string rangeLog = "STUB-HELPER-FIX: stub_code_ranges (" +
+                                       std::to_string(stub_code_ranges.size()) + " секций):";
+                for (const auto& r : stub_code_ranges) {
+                    char rb[128]; snprintf(rb, sizeof(rb), " [%s: 0x%08X-0x%08X]", r.name.c_str(), r.start, r.end);
+                    rangeLog += rb;
+                }
+                LogToJava(rangeLog);
+            }
+
+            // Лямбда: проверяет попадание val в любой stub-диапазон (post или pre-slide)
+            auto inAnyStubRange = [&](uint32_t val, std::string& outName) -> bool {
+                for (const auto& r : stub_code_ranges) {
+                    // post-slide проверка
+                    if (r.start != 0 && val >= r.start && val < r.end) {
+                        outName = r.name + "(post-slide)";
+                        return true;
+                    }
+                    // pre-slide проверка
+                    uint32_t pre_start = (r.start > g_appSlide) ? r.start - g_appSlide : 0;
+                    uint32_t pre_end   = (r.end   > g_appSlide) ? r.end   - g_appSlide : 0;
+                    if (pre_start != 0 && val >= pre_start && val < pre_end) {
+                        outName = r.name + "(pre-slide)";
+                        return true;
+                    }
+                }
+                return false;
+            };
+
             for (const auto& sect : dysym_sections) {
                 uint32_t* slot = (uint32_t*)sect.addr;
                 uint32_t  count = sect.size / 4;
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t val = slot[i];
-                    bool is_stub_helper_post  = (stub_helper_start != 0 && val >= stub_helper_start && val < stub_helper_end);
-                    bool is_stub_helper_pre   = (sh_pre_start != 0 && val >= sh_pre_start && val < sh_pre_end);
-                    if (is_stub_helper_post || is_stub_helper_pre) {
+                    std::string matchedRange;
+                    if (inAnyStubRange(val, matchedRange)) {
                         char name_buf[64]; snprintf(name_buf, sizeof(name_buf), "__unresolved_lazy_0x%08X", val);
                         void* dstub = CreateDynamicStub(std::string(name_buf));
                         char dbg[256]; snprintf(dbg, sizeof(dbg),
-                            "STUB-HELPER-FIX: dysym slot[%u] @ 0x%08X: val 0x%08X → stub %p (was %s stub_helper)",
-                            i, (uint32_t)(sect.addr + i * 4), val, dstub, is_stub_helper_pre ? "pre-slide" : "post-slide");
+                            "STUB-HELPER-FIX: dysym slot[%u] @ 0x%08X: val 0x%08X → stub %p (range: %s)",
+                            i, (uint32_t)(sect.addr + i * 4), val, dstub, matchedRange.c_str());
                         LogToJava(std::string(dbg));
                         slot[i] = (uint32_t)(uintptr_t)dstub;
                         sh_fixed++;
@@ -12044,22 +12096,11 @@ void LoadMachO(const std::string& bundlePath) {
             }
             if (sh_fixed > 0) {
                 LogToJava("STUB-HELPER-FIX: Заменено " + std::to_string(sh_fixed) +
-                          " незарезолвленных stub_helper слотов на DynamicStub."
-                          " stub_helper range: [0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
-                          ", 0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
-                          ")");
+                          " незарезолвленных stub слотов на DynamicStub.");
             } else {
-                LogToJava("STUB-HELPER-FIX: Незарезолвленных stub_helper слотов не найдено."
-                          " stub_helper range: [0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
-                          ", 0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
-                          ")");
+                LogToJava("STUB-HELPER-FIX: Незарезолвленных stub слотов не найдено."
+                          " (stub_code_ranges: " + std::to_string(stub_code_ranges.size()) + " секций)");
             }
-        } else {
-            LogToJava("STUB-HELPER-FIX: __stub_helper секция не найдена, пропускаем.");
         }
     }
     cmd_offset = arch_offset + sizeof(mach_header);
