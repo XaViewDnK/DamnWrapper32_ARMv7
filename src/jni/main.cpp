@@ -11592,23 +11592,15 @@ void LoadMachO(const std::string& bundlePath) {
                                                     uint32_t mw = arm_ptr[mi - 1];
                                                     uint32_t mRd = (mw >> 12) & 0xF;
                                                     if (((mw >> 20) & 0xFF) == 0x30 && mRd == Rm_used) {
-                                                        // FIX: Проверяем, является ли пара абсолютным указателем.
-                                                        // Если full_addr попадает в [min_vmaddr, max_vmaddr) — это
-                                                        // абсолютный адрес данных, а НЕ PC-relative оффсет.
-                                                        // В таком случае no_patch НЕ выставляем: Pass 2 должен
-                                                        // пропатчить эту пару.
-                                                        // Если full_addr вне диапазона — это реальный PC-оффсет,
-                                                        // помечаем no_patch (Pass 2 тоже пропустит по range-check,
-                                                        // но явный флаг предотвращает случайный патч при граничных
-                                                        // значениях диапазона).
-                                                        uint32_t movw_lo16 = ((mw >> 4) & 0xF000) | (mw & 0xFFF);
-                                                        uint32_t full_addr_check = (movt_hi16 << 16) | movw_lo16;
-                                                        bool is_abs_ptr = (full_addr_check >= min_vmaddr &&
-                                                                           full_addr_check < max_vmaddr &&
-                                                                           full_addr_check > 0x1000);
-                                                        if (!is_abs_ptr) {
-                                                            no_patch[mi - 1] = true; // индекс MOVW (только для PC-оффсетов)
-                                                        }
+                                                        // Всегда помечаем no_patch: регистр Rm используется
+                                                        // как оффсет от PC (LDR/ADD [PC,Rm]).
+                                                        // Слайд уже неявно проходит через PC — патчить Rm нельзя,
+                                                        // иначе слайд применится дважды → double-slide → краш.
+                                                        // (Старая логика пропускала пары, где full_addr попадает
+                                                        // в диапазон бинаря, считая их «абсолютными указателями»;
+                                                        // это неверно — адрес в __DATA может оказаться здесь
+                                                        // именно как PC-relative оффсет, а не как standalone ptr.)
+                                                        no_patch[mi - 1] = true; // индекс MOVW
                                                         break;
                                                     }
                                                     // Прерываем если что-то пишет в Rm_used (новая цепочка)
