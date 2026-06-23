@@ -6549,6 +6549,58 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             // Дальше форвардим в нативный код как обычно
         }
 
+        // HLE-FIX: UIImageHelper — перехватываем все три метода до NATIVE-FORWARD.
+        // Нативный код UIImageHelper принимает CGImageRef / CGContextRef, но мы передаём
+        // HLE-указатели (HLE_CGImage*, HLE_CGContext*). Нативный runtime падает, пытаясь
+        // разыменовать их как настоящие CoreGraphics-объекты (SIGILL @ __TEXT + 0x280dd4).
+        // Реализуем методы полностью на стороне HLE.
+        if (cName == "UIImageHelper") {
+            // +[UIImageHelper convertUIImageToBitmapRGBA8:width:height:]
+            // a1 = UIImage* (HLE), a2 = int* outWidth, a3 = int* outHeight
+            // Возвращает void* (RGBA8-буфер), caller освобождает через free().
+            if (strcmp(op, "convertUIImageToBitmapRGBA8:width:height:") == 0) {
+                uint32_t* uiImagePtr = (uint32_t*)a1;
+                if (!uiImagePtr) { LogToJava("HLE-FIX: [convertUIImageToBitmapRGBA8] UIImage == nil, return nullptr"); return 0; }
+                HLE_CGImage* cgImg = (HLE_CGImage*)uiImagePtr[1];
+                if (!cgImg || !cgImg->data) {
+                    LogToJava("HLE-FIX: [convertUIImageToBitmapRGBA8] нет CGImage данных, return nullptr");
+                    return 0;
+                }
+                if (a2) *(int*)a2 = cgImg->width;
+                if (a3) *(int*)a3 = cgImg->height;
+                size_t sz = (size_t)cgImg->width * cgImg->height * 4;
+                void* buf = malloc(sz);
+                if (buf) memcpy(buf, cgImg->data, sz);
+                LogToJava("HLE-FIX: [convertUIImageToBitmapRGBA8] " + std::to_string(cgImg->width) + "x" + std::to_string(cgImg->height) + " -> " + std::to_string((uintptr_t)buf));
+                return (uint64_t)(uintptr_t)buf;
+            }
+            // +[UIImageHelper newBitmapRGBA8ContextFromWidth:height:]
+            // a1 = width (int), a2 = height (int)
+            // Возвращает CGContextRef (наш HLE_CGContext*).
+            if (strcmp(op, "newBitmapRGBA8ContextFromWidth:height:") == 0) {
+                int w = (int)(uintptr_t)a1;
+                int h = (int)(uintptr_t)a2;
+                if (w <= 0 || h <= 0) { LogToJava("HLE-FIX: [newBitmapRGBA8ContextFromWidth] bad size " + std::to_string(w) + "x" + std::to_string(h)); return 0; }
+                HLE_CGContext* ctx = new HLE_CGContext();
+                ctx->width = w; ctx->height = h; ctx->bpp = 8;
+                ctx->bytesPerRow = (size_t)w * 4;
+                ctx->data = calloc(1, ctx->bytesPerRow * h);
+                LogToJava("HLE-FIX: [newBitmapRGBA8ContextFromWidth] " + std::to_string(w) + "x" + std::to_string(h) + " -> " + std::to_string((uintptr_t)ctx));
+                return (uint64_t)(uintptr_t)ctx;
+            }
+            // +[UIImageHelper getBitmapDataFromContext:width:height:]
+            // a1 = CGContextRef (HLE_CGContext*), a2 = int* outWidth, a3 = int* outHeight
+            // Возвращает void* (указатель на пиксельный буфер внутри контекста; НЕ копия).
+            if (strcmp(op, "getBitmapDataFromContext:width:height:") == 0) {
+                HLE_CGContext* ctx = (HLE_CGContext*)a1;
+                if (!ctx) { LogToJava("HLE-FIX: [getBitmapDataFromContext] ctx == nil"); return 0; }
+                if (a2) *(int*)a2 = ctx->width;
+                if (a3) *(int*)a3 = ctx->height;
+                LogToJava("HLE-FIX: [getBitmapDataFromContext] -> data=" + std::to_string((uintptr_t)ctx->data));
+                return (uint64_t)(uintptr_t)ctx->data;
+            }
+        }
+
         void* imp = FindMethodIMP(isa, op);
         if (imp) {
             LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
