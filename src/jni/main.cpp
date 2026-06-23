@@ -4655,6 +4655,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
             return 0;
         }
+        // FIX: [NSString defaultCStringEncoding] должен возвращать NSUTF8StringEncoding (4)
+        // Без этого код в игре получает мусорный указатель вместо enum-значения
+        // и передаёт nullptr из [nil cStringUsingEncoding:mush] в strlen -> SIGSEGV
+        if (clsName == "NSString" && strcmp(op, "defaultCStringEncoding") == 0) {
+            return 4; // NSUTF8StringEncoding
+        }
         if (clsName == "NSString" && strcmp(op, "stringWithFormat:") == 0) {
             std::string fmt = GetNSString(a1);
             void* args[] = {a2, a3, a4, a5};
@@ -5536,6 +5542,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "objectForKey:") == 0 || strcmp(op, "valueForKey:") == 0) {
                 std::string key = GetNSString(a1);
                 LogToJava("[PREF-DEBUG] NSUserDefaults objectForKey/valueForKey: " + key);
+                // FIX: AppleLanguages -> NSArray["en"] чтобы [UIDeviceHardware deviceLanguage] не крашился
+                if (key == "AppleLanguages") {
+                    uint32_t* arrInst = (uint32_t*)calloc(1, 32);
+                    arrInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSArray");
+                    g_arrays[arrInst].push_back(CreateNSString("en"));
+                    return (uint64_t)(uintptr_t)arrInst;
+                }
                 return (uint64_t)(uintptr_t)g_userDefaults[key];
             }
             if (strcmp(op, "setObject:forKey:") == 0) {
@@ -5980,6 +5993,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 return 0;
             }
             if (strcmp(op, "cStringUsingEncoding:") == 0) {
+                if (!self_ptr) return 0; // FIX: защита от вызова у nil-like объекта
                 const char* cstr = (const char*)self_ptr[2];
                 if (cstr && (strstr(cstr, "pngConf") || strstr(cstr, "jungle"))) {
                     LogToJava(std::string("OBJC-DEBUG: [cStringUsingEncoding:] Запрошен C-string: [") + cstr + "]");
