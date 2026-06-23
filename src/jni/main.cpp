@@ -11592,15 +11592,23 @@ void LoadMachO(const std::string& bundlePath) {
                                                     uint32_t mw = arm_ptr[mi - 1];
                                                     uint32_t mRd = (mw >> 12) & 0xF;
                                                     if (((mw >> 20) & 0xFF) == 0x30 && mRd == Rm_used) {
-                                                        // Всегда помечаем no_patch: регистр Rm используется
-                                                        // как оффсет от PC (LDR/ADD [PC,Rm]).
-                                                        // Слайд уже неявно проходит через PC — патчить Rm нельзя,
-                                                        // иначе слайд применится дважды → double-slide → краш.
-                                                        // (Старая логика пропускала пары, где full_addr попадает
-                                                        // в диапазон бинаря, считая их «абсолютными указателями»;
-                                                        // это неверно — адрес в __DATA может оказаться здесь
-                                                        // именно как PC-relative оффсет, а не как standalone ptr.)
-                                                        no_patch[mi - 1] = true; // индекс MOVW
+                                                        // FIX: Проверяем, является ли пара абсолютным указателем.
+                                                        // Если full_addr попадает в [min_vmaddr, max_vmaddr) — это
+                                                        // абсолютный адрес данных, а НЕ PC-relative оффсет.
+                                                        // В таком случае no_patch НЕ выставляем: Pass 2 должен
+                                                        // пропатчить эту пару.
+                                                        // Если full_addr вне диапазона — это реальный PC-оффсет,
+                                                        // помечаем no_patch (Pass 2 тоже пропустит по range-check,
+                                                        // но явный флаг предотвращает случайный патч при граничных
+                                                        // значениях диапазона).
+                                                        uint32_t movw_lo16 = ((mw >> 4) & 0xF000) | (mw & 0xFFF);
+                                                        uint32_t full_addr_check = (movt_hi16 << 16) | movw_lo16;
+                                                        bool is_abs_ptr = (full_addr_check >= min_vmaddr &&
+                                                                           full_addr_check < max_vmaddr &&
+                                                                           full_addr_check > 0x1000);
+                                                        if (!is_abs_ptr) {
+                                                            no_patch[mi - 1] = true; // индекс MOVW (только для PC-оффсетов)
+                                                        }
                                                         break;
                                                     }
                                                     // Прерываем если что-то пишет в Rm_used (новая цепочка)
@@ -11619,31 +11627,40 @@ void LoadMachO(const std::string& bundlePath) {
                                         }
                                     }
 
-                                    // Проход 2: патчим незапрещённые MOVW/MOVT пары
-                                    // FIX: Раньше сканнер искал только СМЕЖНЫЕ пары [MOVW][MOVT].
-                                    // В реальном ARM32 коде компилятор может вставить 1-N инструкций
-                                    // между MOVW и MOVT. В таком случае смежный поиск пропускал пару
-                                    // → адрес оставался pre-slide → SIGSEGV.
-                                    // Новая логика: для каждого MOVW ищем MOVT вперёд в окне FWND_MOVT.
-                                    // ВАЖНО: Pass 1 (no_patch) тоже расширен до поиска MOVW в окне,
-                                    // иначе PC-relative пары будут ошибочно пропатчены.
-                                    const size_t FWND_MOVT = 8;
+                                    // Проход 2: патчим незапрещённые MOVW/MOVT пары.
+                                    //
+                                    // FIX (v3): Вместо «для каждого MOVW ищем MOVT вперёд» используем
+                                    // «для каждого MOVT ищем MOVW назад» (зеркало Pass 1).
+                                    //
+                                    // Проблема предыдущего подхода (forward MOVW→MOVT):
+                                    //   Если в бинаре есть два MOVW Rx близко друг к другу (расстояние ≤ FWND),
+                                    //   оба могут «увидеть» один и тот же MOVT Rx в своих окнах.
+                                    //   Первый MOVW (по адресу) выигрывает гонку и выставляет
+                                    //   movt_patched_set[fi]=true. Когда второй MOVW доходит до этого MOVT,
+                                    //   он получает break и остаётся НЕ пропатченным → pre-slide адрес в R3
+                                    //   → запись/чтение по 0x008E2FB0 → SIGSEGV.
+                                    //
+                                    // Обратный поиск MOVT→MOVW решает проблему: каждый MOVT находит
+                                    // БЛИЖАЙШИЙ предшествующий MOVW того же регистра — именно ту пару,
+                                    // которую компилятор и имел в виду. Гонки между двумя MOVW за один
+                                    // MOVT нет, потому что каждый MOVT обрабатывается ровно один раз.
+                                    const size_t BACK_WINDOW_P2 = 16; // шире Pass-1-окна — для надёжности
                                     std::vector<bool> movt_patched_set(arm_count, false);
                                     int arm_movt_patched = 0;
-                                    for (size_t ai = 0; ai < arm_count; ai++) {
-                                        uint32_t w0 = arm_ptr[ai];
-                                        if (((w0 >> 20) & 0xFF) != 0x30) continue; // не MOVW
-                                        if (no_patch[ai]) continue;
-                                        uint32_t Rd = (w0 >> 12) & 0xF;
-                                        size_t fwd_end = ai + 1 + FWND_MOVT;
-                                        if (fwd_end > arm_count) fwd_end = arm_count;
-                                        for (size_t fi = ai + 1; fi < fwd_end; fi++) {
-                                            uint32_t w1 = arm_ptr[fi];
-                                            uint32_t fRd = (w1 >> 12) & 0xF;
-                                            bool is_movt = (((w1 >> 20) & 0xFF) == 0x34) && (fRd == Rd);
-                                            bool is_movw = (((w1 >> 20) & 0xFF) == 0x30) && (fRd == Rd);
-                                            if (is_movt) {
-                                                if (movt_patched_set[fi]) break;
+                                    for (size_t fi = 0; fi < arm_count; fi++) {
+                                        uint32_t w1 = arm_ptr[fi];
+                                        if (((w1 >> 20) & 0xFF) != 0x34) continue; // не MOVT
+                                        if (movt_patched_set[fi]) continue;
+                                        uint32_t Rd = (w1 >> 12) & 0xF;
+                                        size_t back_start = (fi >= BACK_WINDOW_P2) ? fi - BACK_WINDOW_P2 : 0;
+                                        for (size_t bi = fi; bi > back_start; bi--) {
+                                            uint32_t w0 = arm_ptr[bi - 1];
+                                            uint32_t bRd = (w0 >> 12) & 0xF;
+                                            bool is_movw = (((w0 >> 20) & 0xFF) == 0x30) && (bRd == Rd);
+                                            bool is_movt = (((w0 >> 20) & 0xFF) == 0x34) && (bRd == Rd);
+                                            if (is_movw) {
+                                                // Нашли MOVW того же регистра.
+                                                if (no_patch[bi - 1]) break; // PC-relative пара — не трогаем
                                                 uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
                                                 uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
                                                 uint32_t full_addr = (hi16 << 16) | lo16;
@@ -11651,18 +11668,21 @@ void LoadMachO(const std::string& bundlePath) {
                                                 uint32_t patched = full_addr + g_appSlide;
                                                 uint32_t new_lo = patched & 0xFFFF;
                                                 uint32_t new_hi = (patched >> 16) & 0xFFFF;
-                                                uint32_t* pp = const_cast<uint32_t*>(&arm_ptr[ai]);
-                                                pp[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
+                                                uint32_t* pp0 = const_cast<uint32_t*>(&arm_ptr[bi - 1]);
+                                                pp0[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
                                                 uint32_t* pp1 = const_cast<uint32_t*>(&arm_ptr[fi]);
                                                 pp1[0] = (w1 & 0xFFF0F000) | ((new_hi & 0xF000) << 4) | (new_hi & 0xFFF);
                                                 movt_patched_set[fi] = true;
                                                 arm_movt_patched++;
                                                 break;
                                             }
-                                            if (is_movw) break; // новая цепочка — прерываем
-                                            uint32_t bop = (w1 >> 24) & 0xF;
-                                            bool writes_rd = (fRd == Rd) && (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
-                                                             (((w1 >> 20) & 0xFF) != 0x30) && (((w1 >> 20) & 0xFF) != 0x34);
+                                            if (is_movt) break; // другая MOVT-цепочка для того же Rd — стоп
+                                            // Если инструкция записывает в Rd — цепочка прервана
+                                            uint32_t bop = (w0 >> 24) & 0xF;
+                                            bool writes_rd = (bRd == Rd) &&
+                                                             (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
+                                                             (((w0 >> 20) & 0xFF) != 0x30) &&
+                                                             (((w0 >> 20) & 0xFF) != 0x34);
                                             if (writes_rd) break;
                                         }
                                     }
