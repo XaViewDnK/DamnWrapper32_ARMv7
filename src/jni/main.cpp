@@ -4921,7 +4921,15 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return (uint64_t)(uintptr_t)CreateNSString(g_appBundlePath);
         }
         if (clsName == "NSBundle" && strcmp(op, "infoDictionary") == 0) {
-            uint32_t* dictInst = (uint32_t*)calloc(1, 32); dictInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSDictionary"); return (uint64_t)(uintptr_t)dictInst;
+            uint32_t* dictInst = (uint32_t*)calloc(1, 32); dictInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSDictionary");
+            // FIX: Заполняем словарь ключами версии, чтобы [dict valueForKey:@"CFBundleVersion"]
+            // не вернул nil -> игра без проверки вызывала [nil UTF8String] -> SIGSEGV (0x00000000).
+            g_dictionariesHLE[dictInst]["CFBundleVersion"] = CreateNSString("1.0");
+            g_dictionariesHLE[dictInst]["CFBundleShortVersionString"] = CreateNSString("1.0");
+            g_dictionariesHLE[dictInst]["CFBundleIdentifier"] = CreateNSString("com.damnwrapper");
+            g_dictionariesHLE[dictInst]["CFBundleName"] = CreateNSString("App");
+            g_dictionariesHLE[dictInst]["CFBundleExecutable"] = CreateNSString("App");
+            return (uint64_t)(uintptr_t)dictInst;
         }
         if (clsName == "NSBundle" && strcmp(op, "objectForInfoDictionaryKey:") == 0) {
             std::string key = GetNSString(a1);
