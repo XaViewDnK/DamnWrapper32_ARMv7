@@ -4237,6 +4237,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     if (strcmp(op, "becomeFirstResponder") == 0 || strcmp(op, "resignFirstResponder") == 0) return 0;
     if (strcmp(op, "initWithFrame:") == 0) {
         float x, y, w, h; memcpy(&x, &a1, 4); memcpy(&y, &a2, 4); memcpy(&w, &a3, 4); memcpy(&h, &a4, 4);
+        // Если frame нулевой (игра передала UIScreen.bounds который был 0x0) — используем реальный размер поверхности
+        if (w <= 0.0f || h <= 0.0f) { w = (float)g_surfaceWidth; h = (float)g_surfaceHeight; }
         g_views[self].frame = {x, y, w, h}; 
     }
     if (strcmp(op, "setCenter:") == 0) {
@@ -5612,6 +5614,10 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "stringByReplacingOccurrencesOfString:withString:") == 0) return (uint64_t)(uintptr_t)CreateNSString("");
             if (strcmp(op, "setObject:forKey:") == 0) {
                 g_dictionariesHLE[self][GetNSString(a2)] = a1; 
+                return 0;
+            }
+            if (strcmp(op, "setValue:forKey:") == 0) {
+                g_dictionariesHLE[self][GetNSString(a2)] = a1;
                 return 0;
             }
             if (strcmp(op, "removeObjectForKey:") == 0) {
@@ -12290,6 +12296,12 @@ void* NativeExecutionThread(void* arg) {
     char eglBuf[256];
     snprintf(eglBuf, sizeof(eglBuf), "[MEGA-DEBUG] NativeExecutionThread init: Ctx=%p, Dpy=%p, Surf=%p, SurfSize=%dx%d", ctx, dpy, surf, w, h);
     LogToJava(eglBuf);
+    // Обновляем g_surfaceWidth/Height из реального EGL-размера, если они не были заданы или равны 0
+    if (w > 0 && h > 0) {
+        g_surfaceWidth  = w;
+        g_surfaceHeight = h;
+        LogToJava("[EGL-FIX] g_surfaceWidth/Height обновлены из EGL: " + std::to_string(w) + "x" + std::to_string(h));
+    }
     // --------------------------------------------------------------------
 
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);
