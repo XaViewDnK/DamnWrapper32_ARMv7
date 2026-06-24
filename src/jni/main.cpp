@@ -281,7 +281,7 @@ struct CGState {
 };
 
 struct HLE_CGContext {
-    int width; int height; int bpp; void* data;
+    int width; int height; int bpp; size_t bytesPerRow; void* data;
     std::vector<CGState> stateStack;
     CGState currentState;
     std::vector<CGPathElement> currentPath;
@@ -4237,6 +4237,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     if (strcmp(op, "becomeFirstResponder") == 0 || strcmp(op, "resignFirstResponder") == 0) return 0;
     if (strcmp(op, "initWithFrame:") == 0) {
         float x, y, w, h; memcpy(&x, &a1, 4); memcpy(&y, &a2, 4); memcpy(&w, &a3, 4); memcpy(&h, &a4, 4);
+        // Если frame нулевой (игра передала UIScreen.bounds который был 0x0) — используем реальный размер поверхности
+        if (w <= 0.0f || h <= 0.0f) { w = (float)g_surfaceWidth; h = (float)g_surfaceHeight; }
         g_views[self].frame = {x, y, w, h}; 
     }
     if (strcmp(op, "setCenter:") == 0) {
@@ -4655,6 +4657,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
             return 0;
         }
+        // FIX: [NSString defaultCStringEncoding] должен возвращать NSUTF8StringEncoding (4)
+        // Без этого код в игре получает мусорный указатель вместо enum-значения
+        // и передаёт nullptr из [nil cStringUsingEncoding:mush] в strlen -> SIGSEGV
+        if (clsName == "NSString" && strcmp(op, "defaultCStringEncoding") == 0) {
+            return 4; // NSUTF8StringEncoding
+        }
         if (clsName == "NSString" && strcmp(op, "stringWithFormat:") == 0) {
             std::string fmt = GetNSString(a1);
             void* args[] = {a2, a3, a4, a5};
@@ -4921,7 +4929,15 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return (uint64_t)(uintptr_t)CreateNSString(g_appBundlePath);
         }
         if (clsName == "NSBundle" && strcmp(op, "infoDictionary") == 0) {
-            uint32_t* dictInst = (uint32_t*)calloc(1, 32); dictInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSDictionary"); return (uint64_t)(uintptr_t)dictInst;
+            uint32_t* dictInst = (uint32_t*)calloc(1, 32); dictInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSDictionary");
+            // FIX: Заполняем словарь ключами версии, чтобы [dict valueForKey:@"CFBundleVersion"]
+            // не вернул nil -> игра без проверки вызывала [nil UTF8String] -> SIGSEGV (0x00000000).
+            g_dictionariesHLE[dictInst]["CFBundleVersion"] = CreateNSString("1.0");
+            g_dictionariesHLE[dictInst]["CFBundleShortVersionString"] = CreateNSString("1.0");
+            g_dictionariesHLE[dictInst]["CFBundleIdentifier"] = CreateNSString("com.damnwrapper");
+            g_dictionariesHLE[dictInst]["CFBundleName"] = CreateNSString("App");
+            g_dictionariesHLE[dictInst]["CFBundleExecutable"] = CreateNSString("App");
+            return (uint64_t)(uintptr_t)dictInst;
         }
         if (clsName == "NSBundle" && strcmp(op, "objectForInfoDictionaryKey:") == 0) {
             std::string key = GetNSString(a1);
@@ -5154,6 +5170,20 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "setActivityIndicatorViewStyle:") == 0) return 0;
         }
         if (clsName == "UIImage") {
+            if (strcmp(op, "initWithContentsOfFile:") == 0) {
+                std::string path = GetNSString(a1);
+                int w, h, channels;
+                uint8_t* data = stbi_load(path.c_str(), &w, &h, &channels, 4);
+                if (data) {
+                    HLE_CGImage* cgImg = new HLE_CGImage{w, h, 32, data};
+                    self_ptr[1] = (uint32_t)cgImg;
+                    LogToJava("HLE: [UIImage initWithContentsOfFile] загружен " + path + " (" + std::to_string(w) + "x" + std::to_string(h) + ")");
+                } else {
+                    self_ptr[1] = 0;
+                    LogToJava("HLE_WARN: [UIImage initWithContentsOfFile] не удалось загрузить: " + path);
+                }
+                return (uint64_t)(uintptr_t)self;
+            }
             if (strcmp(op, "initWithData:") == 0) {
                 uint32_t* nsData = (uint32_t*)a1;
                 if (nsData && nsData[1] && nsData[2] > 0) {
@@ -5528,6 +5558,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "objectForKey:") == 0 || strcmp(op, "valueForKey:") == 0) {
                 std::string key = GetNSString(a1);
                 LogToJava("[PREF-DEBUG] NSUserDefaults objectForKey/valueForKey: " + key);
+                // FIX: AppleLanguages -> NSArray["en"] чтобы [UIDeviceHardware deviceLanguage] не крашился
+                if (key == "AppleLanguages") {
+                    uint32_t* arrInst = (uint32_t*)calloc(1, 32);
+                    arrInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSArray");
+                    g_arrays[arrInst].push_back(CreateNSString("en"));
+                    return (uint64_t)(uintptr_t)arrInst;
+                }
                 return (uint64_t)(uintptr_t)g_userDefaults[key];
             }
             if (strcmp(op, "setObject:forKey:") == 0) {
@@ -5972,6 +6009,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 return 0;
             }
             if (strcmp(op, "cStringUsingEncoding:") == 0) {
+                if (!self_ptr) return 0; // FIX: защита от вызова у nil-like объекта
                 const char* cstr = (const char*)self_ptr[2];
                 if (cstr && (strstr(cstr, "pngConf") || strstr(cstr, "jungle"))) {
                     LogToJava(std::string("OBJC-DEBUG: [cStringUsingEncoding:] Запрошен C-string: [") + cstr + "]");
@@ -6527,6 +6565,58 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             // Дальше форвардим в нативный код как обычно
         }
 
+        // HLE-FIX: UIImageHelper — перехватываем все три метода до NATIVE-FORWARD.
+        // Нативный код UIImageHelper принимает CGImageRef / CGContextRef, но мы передаём
+        // HLE-указатели (HLE_CGImage*, HLE_CGContext*). Нативный runtime падает, пытаясь
+        // разыменовать их как настоящие CoreGraphics-объекты (SIGILL @ __TEXT + 0x280dd4).
+        // Реализуем методы полностью на стороне HLE.
+        if (cName == "UIImageHelper") {
+            // +[UIImageHelper convertUIImageToBitmapRGBA8:width:height:]
+            // a1 = UIImage* (HLE), a2 = int* outWidth, a3 = int* outHeight
+            // Возвращает void* (RGBA8-буфер), caller освобождает через free().
+            if (strcmp(op, "convertUIImageToBitmapRGBA8:width:height:") == 0) {
+                uint32_t* uiImagePtr = (uint32_t*)a1;
+                if (!uiImagePtr) { LogToJava("HLE-FIX: [convertUIImageToBitmapRGBA8] UIImage == nil, return nullptr"); return 0; }
+                HLE_CGImage* cgImg = (HLE_CGImage*)uiImagePtr[1];
+                if (!cgImg || !cgImg->data) {
+                    LogToJava("HLE-FIX: [convertUIImageToBitmapRGBA8] нет CGImage данных, return nullptr");
+                    return 0;
+                }
+                if (a2) *(int*)a2 = cgImg->width;
+                if (a3) *(int*)a3 = cgImg->height;
+                size_t sz = (size_t)cgImg->width * cgImg->height * 4;
+                void* buf = malloc(sz);
+                if (buf) memcpy(buf, cgImg->data, sz);
+                LogToJava("HLE-FIX: [convertUIImageToBitmapRGBA8] " + std::to_string(cgImg->width) + "x" + std::to_string(cgImg->height) + " -> " + std::to_string((uintptr_t)buf));
+                return (uint64_t)(uintptr_t)buf;
+            }
+            // +[UIImageHelper newBitmapRGBA8ContextFromWidth:height:]
+            // a1 = width (int), a2 = height (int)
+            // Возвращает CGContextRef (наш HLE_CGContext*).
+            if (strcmp(op, "newBitmapRGBA8ContextFromWidth:height:") == 0) {
+                int w = (int)(uintptr_t)a1;
+                int h = (int)(uintptr_t)a2;
+                if (w <= 0 || h <= 0) { LogToJava("HLE-FIX: [newBitmapRGBA8ContextFromWidth] bad size " + std::to_string(w) + "x" + std::to_string(h)); return 0; }
+                HLE_CGContext* ctx = new HLE_CGContext();
+                ctx->width = w; ctx->height = h; ctx->bpp = 8;
+                ctx->bytesPerRow = (size_t)w * 4;
+                ctx->data = calloc(1, ctx->bytesPerRow * h);
+                LogToJava("HLE-FIX: [newBitmapRGBA8ContextFromWidth] " + std::to_string(w) + "x" + std::to_string(h) + " -> " + std::to_string((uintptr_t)ctx));
+                return (uint64_t)(uintptr_t)ctx;
+            }
+            // +[UIImageHelper getBitmapDataFromContext:width:height:]
+            // a1 = CGContextRef (HLE_CGContext*), a2 = int* outWidth, a3 = int* outHeight
+            // Возвращает void* (указатель на пиксельный буфер внутри контекста; НЕ копия).
+            if (strcmp(op, "getBitmapDataFromContext:width:height:") == 0) {
+                HLE_CGContext* ctx = (HLE_CGContext*)a1;
+                if (!ctx) { LogToJava("HLE-FIX: [getBitmapDataFromContext] ctx == nil"); return 0; }
+                if (a2) *(int*)a2 = ctx->width;
+                if (a3) *(int*)a3 = ctx->height;
+                LogToJava("HLE-FIX: [getBitmapDataFromContext] -> data=" + std::to_string((uintptr_t)ctx->data));
+                return (uint64_t)(uintptr_t)ctx->data;
+            }
+        }
+
         void* imp = FindMethodIMP(isa, op);
         if (imp) {
             LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
@@ -7021,6 +7111,10 @@ extern "C" void* wrap_NSClassFromString(void* nsstr) {
 
 extern "C" int32_t wrap_OSAtomicOr32Barrier(uint32_t theMask, volatile uint32_t *theValue) {
     return __sync_or_and_fetch(theValue, theMask);
+}
+
+extern "C" int32_t wrap_OSAtomicAdd32Barrier(int32_t theAmount, volatile int32_t *theValue) {
+    return __sync_add_and_fetch(theValue, theAmount);
 }
 
 extern "C" bool wrap_OSAtomicTestAndClearBarrier(uint32_t n, volatile void *theAddress) {
@@ -8240,13 +8334,18 @@ extern "C" {
 extern "C" void* wrap_CGBitmapContextCreate(void* data, size_t width, size_t height, size_t bitsPerComponent, size_t bytesPerRow, void* space, uint32_t bitmapInfo) {
     HLE_CGContext* ctx = new HLE_CGContext();
     ctx->width = width; ctx->height = height; ctx->bpp = bitsPerComponent;
-    ctx->data = data ? data : calloc(1, bytesPerRow * height);
+    ctx->bytesPerRow = bytesPerRow ? bytesPerRow : (width * (bitsPerComponent / 8) * 4);
+    ctx->data = data ? data : calloc(1, ctx->bytesPerRow * height);
     LogToJava("HLE: CGBitmapContextCreate(" + std::to_string(width) + "x" + std::to_string(height) + ") -> " + std::to_string((uintptr_t)ctx));
     return ctx;
 }
 extern "C" void* wrap_CGBitmapContextGetData(void* ctx) {
     if (!ctx) return nullptr;
     return ((HLE_CGContext*)ctx)->data;
+}
+extern "C" size_t wrap_CGBitmapContextGetBytesPerRow(void* ctx) {
+    if (!ctx) return 0;
+    return ((HLE_CGContext*)ctx)->bytesPerRow;
 }
 extern "C" void* wrap_CGBitmapContextCreateImage(void* c) {
     if (!c) return nullptr;
@@ -10677,7 +10776,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_D(pthread_exit), STB_D(pthread_detach), STB_D(pthread_kill), STB_W(pthread_mutex_trylock), STB_W(pthread_cond_timedwait), STB_D(pthread_getschedparam), STB_D(pthread_setschedparam), STB_D(pthread_mutexattr_init), STB_D(pthread_mutexattr_destroy), STB_D(pthread_mutexattr_settype), STB_D(sched_get_priority_max), STB_D(sched_get_priority_min),
     {"_class_copyMethodList", (void*)Stub_GenericUnimplemented}, STB_W(class_getName), STB_W(class_getInstanceSize), STB_W(class_getSuperclass), {"_class_getProperty", (void*)Stub_GenericUnimplemented}, STB_W(class_getInstanceMethod), STB_W(class_getClassMethod), STB_W(ivar_getName), STB_W(ivar_getOffset), STB_W(method_getImplementation), STB_W(method_getName), STB_W(objc_copyStruct), STB_W(objc_getClassList), STB_W(objc_getProperty), STB_W(objc_lookUpClass), STB_W(object_getClass), STB_W(protocol_getMethodDescription), STB_W(objc_getAssociatedObject), STB_W(objc_setAssociatedObject), STB_W(objc_retain),
     STB_W(class_addMethod), STB_W(class_addProperty), STB_W(class_addProtocol), STB_W(class_getInstanceVariable), STB_W(class_getIvarLayout), STB_W(class_isMetaClass), STB_W(class_respondsToSelector), STB_W(objc_getClass), STB_W(objc_getMetaClass), STB_W(objc_getProtocol), STB_W(objc_getRequiredClass), STB_W(objc_initializeClassPair), STB_W(objc_registerClassPair), STB_W(object_getIvar), STB_W(object_setIvar), STB_W(property_copyAttributeList), STB_W(sel_getUid),
-    STB_W(OSAtomicOr32Barrier), STB_W(OSAtomicTestAndClearBarrier), STB_W(OSSpinLockLock), STB_W(OSSpinLockTry), STB_W(OSSpinLockUnlock),
+    STB_W(OSAtomicOr32Barrier), STB_W(OSAtomicAdd32Barrier), STB_W(OSAtomicTestAndClearBarrier), STB_W(OSSpinLockLock), STB_W(OSSpinLockTry), STB_W(OSSpinLockUnlock),
 
     STB_D(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_D(glCopyTexImage2D), STB_D(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, STB_D(glDepthRangef), {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), STB_D(glPolygonOffset), STB_D(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_D(glTexParameterf), STB_D(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
 
@@ -10687,7 +10786,7 @@ std::map<std::string, void*> g_hleStubs = {
  STB_W(CFStringCreateExternalRepresentation), STB_W(CFStringCreateFromExternalRepresentation), STB_W(CFStringCreateWithCStringNoCopy), STB_W(CFStringCreateWithCharacters), STB_W(CFStringGetCharacters), STB_W(CFStringGetMaximumSizeForEncoding), STB_W(CFStringGetTypeID), STB_W(CFURLCreateFromFileSystemRepresentation), STB_W(CFURLCreateStringByAddingPercentEscapes), STB_W(CFURLCreateStringByReplacingPercentEscapes), STB_W(CFURLCreateWithString), STB_W(CFArrayCreate), STB_W(CFArrayCreateMutable), STB_W(CFArrayGetCount), STB_W(CFArrayGetValueAtIndex), STB_W(CFArrayAppendValue), STB_W(CFArrayRemoveAllValues), STB_W(CFDictionaryCreateMutable), STB_W(CFDictionaryGetValue), STB_W(CFDictionarySetValue), STB_W(CFDictionaryRemoveValue), STB_W(CFBundleGetInfoDictionary), STB_W(CFBundleGetMainBundle), STB_W(CFBundleGetIdentifier), STB_W(CFBundleGetValueForInfoDictionaryKey), STB_W(CFBundleCopyResourcesDirectoryURL), STB_W(CFURLCopyFileSystemPath), STB_W(CFURLGetFileSystemRepresentation), STB_W(CFRunLoopGetCurrent), STB_W(CFRunLoopGetMain), STB_W(CFUUIDCreate), STB_W(CFUUIDCreateString), STB_W(CFTimeZoneCopySystem), STB_W(CFTimeZoneCopyDefault), STB_W(CFTimeZoneGetName), STB_W(CFTimeZoneGetSecondsFromGMT), STB_W(CFAbsoluteTimeGetGregorianDate), STB_W(CFAbsoluteTimeGetDayOfWeek), STB_W(CC_MD5), STB_W(CC_SHA1), STB_W(CC_SHA256), STB_W(CCCrypt), STB_W(CCCryptorCreate), STB_W(CCCryptorUpdate), STB_W(CCCryptorFinal), STB_W(CCCryptorRelease), STB_W(CCCryptorGetOutputLength), STB_W(AudioComponentFindNext), STB_W(AudioComponentInstanceNew), STB_W(UIGraphicsGetCurrentContext), STB_W(UIGraphicsPushContext), STB_W(UIGraphicsPopContext), STB_W(UIGraphicsBeginImageContext), STB_W(UIGraphicsEndImageContext), STB_W(UIGraphicsGetImageFromCurrentImageContext), STB_W(UIRectFill), STB_W(UIImagePNGRepresentation), STB_W(NSAllocateObject), STB_W(NSStringFromClass), STB_W(NSStringFromSelector), STB_W(CFBitVectorCreate), STB_W(CFBitVectorCreateMutableCopy), STB_W(CFBitVectorGetBitAtIndex), STB_W(CFBitVectorSetBitAtIndex),
     STB_V(kCFAllocatorDefault), STB_V(kCFAllocatorNull), STB_V(kCFBooleanFalse), STB_V(kCFBooleanTrue), STB_V(kCFErrorDescriptionKey), STB_V(kCFHTTPVersion1_1), STB_V(kCFPreferencesAnyHost), STB_V(kCFPreferencesCurrentUser), STB_V(kCFStreamPropertyHTTPResponseHeader), STB_V(kCFStreamPropertyHTTPShouldAutoredirect), STB_V(kSecAttrAccessGroup), STB_V(kSecAttrAccount), STB_V(kSecAttrGeneric), STB_V(kSecAttrService), STB_V(kSecClass), STB_V(kSecClassGenericPassword), STB_V(kSecMatchLimit), STB_V(kSecMatchLimitOne), STB_V(kSecReturnAttributes), STB_V(kSecReturnData), STB_V(kSecValueData), STB_V(kCFRunLoopDefaultMode), STB_V(kCFRunLoopCommonModes), STB_V(kCFTypeArrayCallBacks), STB_V(kCFTypeDictionaryKeyCallBacks), STB_V(kCFTypeDictionaryValueCallBacks), STB_V(kCFBundleIdentifierKey), STB_V(kCFNumberNaN), STB_V(kCFNumberNegativeInfinity), STB_V(kCFNumberPositiveInfinity), {"_ADBannerContentSizeIdentifierLandscape", (void*)&hle_ADBannerContentSizeIdentifierLandscape_ptr}, {"_ADBannerContentSizeIdentifierPortrait", (void*)&hle_ADBannerContentSizeIdentifierPortrait_ptr},
     
-    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
+    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGBitmapContextGetBytesPerRow), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
     {"_SCNetworkReachabilityScheduleWithRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }}, {"_SCNetworkReachabilitySetCallback", (void*)+[](void* target, void* callout, void* context) -> bool { return true; }}, {"_SCNetworkReachabilityUnscheduleFromRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }},
     {"__Block_object_assign", (void*)wrap_Block_object_assign}, {"__Block_copy", (void*)wrap_Block_copy}, {"__Block_release", (void*)wrap_Block_release},
 
@@ -11275,6 +11374,10 @@ void LoadMachO(const std::string& bundlePath) {
     // Диапазон __stub_helper секции (post-slide). Используется для обнаружения незарезолвленных
     // ленивых слотов после dysymtab-обработки (slot value в диапазоне stub_helper → нет dyld resolver).
     uint32_t stub_helper_start = 0, stub_helper_end = 0;
+    // Диапазоны ВСЕХ stub-секций (__stub_helper, __symbol_stub4, __symbol_stub, __picsymbolstub4 и т.д.)
+    // post-slide адреса. Используются в расширенном STUB-HELPER-FIX.
+    struct StubCodeRange { uint32_t start; uint32_t end; std::string name; };
+    std::vector<StubCodeRange> stub_code_ranges;
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         lseek(fd, cmd_offset, SEEK_SET); load_command lc; read(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { 
@@ -11292,6 +11395,25 @@ void LoadMachO(const std::string& bundlePath) {
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__stub_helper", 16) == 0) { stub_helper_start = sect.addr; stub_helper_end = sect.addr + sect.size; }
+                    // Собираем все stub-секции (тип 8 = S_SYMBOL_STUBS, а также stub_helper)
+                    // для расширенного STUB-HELPER-FIX. Проверяем по имени, т.к. тип у __symbol_stub4 = 8
+                    // и он не попадает в dysym_sections (там только тип 6 и 7).
+                    {
+                        bool is_stub_sec = (type == 8 /* S_SYMBOL_STUBS */);
+                        if (!is_stub_sec) {
+                            // Также добавляем __stub_helper по имени (тип может быть 0 или другим)
+                            const char* sn = sect.sectname;
+                            if (strncmp(sn, "__stub_helper",    16) == 0 ||
+                                strncmp(sn, "__symbol_stub",    13) == 0 ||
+                                strncmp(sn, "__picsymbolstub",  15) == 0) {
+                                is_stub_sec = true;
+                            }
+                        }
+                        if (is_stub_sec) {
+                            std::string scname = machoFixedName(sect.segname) + "," + machoFixedName(sect.sectname);
+                            stub_code_ranges.push_back({sect.addr, sect.addr + sect.size, scname});
+                        }
+                    }
                     
                     MachOSectionInfo sinfo;
                     sinfo.name = machoFixedName(sect.segname) + "," + machoFixedName(sect.sectname);
@@ -11463,42 +11585,58 @@ void LoadMachO(const std::string& bundlePath) {
                                     }
                                     
                                     if (is_ldr_pc && literal_addr >= min_vmaddr && literal_addr < max_vmaddr) {
-                                        // Интеллектуальный Lookahead: Ищем ADD Rd, PC (паттерн позиционно-независимого кода)
-                                        bool is_pic_offset = false;
-                                        const uint16_t* scan_ptr = ptr + (insn_size / 2);
-                                        for (int i = 0; i < 12 && (const uint8_t*)scan_ptr < code + code_size; i++) {
-                                            uint16_t scan_hw = *scan_ptr;
-                                            if (target_rd < 8 && scan_hw == (0x4478 | target_rd)) {
-                                                is_pic_offset = true; break;
-                                            } else if (target_rd >= 8 && scan_hw == (0x44F8 | (target_rd & 7))) {
-                                                is_pic_offset = true; break;
+                                        // FIX: читаем значение из literal pool ДО PIC-lookahead.
+                                        // Если значение само по себе попадает в диапазон бинаря [min_vmaddr, max_vmaddr],
+                                        // это ЗАВЕДОМО абсолютный указатель, а не PIC-смещение.
+                                        // PIC-смещения (switch/GOT) — маленькие относительные числа, никогда не совпадающие
+                                        // с диапазоном адресов самого бинаря (~0x3000..0x800000).
+                                        // Старый код запускал lookahead первым и мог ложно пометить абсолютный pointer
+                                        // как PIC, если в следующих 12 инструкциях случайно встречался ADD Rd,PC
+                                        // (из другой функции или из пролога следующей). Это приводило к крэшу:
+                                        // PC=0x003B85A4 — пул не был пропатчен из-за ложного is_pic_offset=true.
+                                        bool is_valid_memory = false;
+                                        uint32_t shifted_literal = literal_addr + g_appSlide;
+                                        for (const auto& sInfo : g_machoSections) {
+                                            if (shifted_literal >= sInfo.start && shifted_literal < sInfo.end) {
+                                                is_valid_memory = true;
+                                                break;
                                             }
-                                            scan_ptr += GetThumbInstructionSize(scan_hw) / 2;
                                         }
 
-                                        // Если это НЕ относительное PIC смещение, значит это абсолютный указатель - делаем ребейз
-                                        if (!is_pic_offset) {
-                                            bool is_valid_memory = false;
-                                            uint32_t shifted_literal = literal_addr + g_appSlide;
-                                            for (const auto& sInfo : g_machoSections) {
-                                                if (shifted_literal >= sInfo.start && shifted_literal < sInfo.end) {
-                                                    is_valid_memory = true;
-                                                    break;
-                                                }
+                                        if (is_valid_memory) {
+                                            uint32_t val = 0;
+                                            memcpy(&val, (void*)shifted_literal, 4);
+                                            uint32_t val_masked = val & ~1u;
+
+                                            // REBASE-ALERT для отладки конкретных адресов
+                                            if (val == 3900836 || val == 3900837) { // 0x003B85A4 / 0x003B85A5
+                                                char alert_buf[256];
+                                                snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT (Thumb LDR-PC): val=0x%X найден в пуле по literal_addr=0x%X", val, literal_addr);
+                                                LogToJava(alert_buf);
                                             }
-                                            
-                                            if (is_valid_memory) {
-                                                uint32_t val = 0;
-                                                memcpy(&val, (void*)shifted_literal, 4);
-                                                
-                                                // Thumb function pointers имеют bit 0 = 1. Маскируем для проверки диапазона,
-                                                // но сохраняем бит при записи (только +slide, не очищая bit 0).
-                                                uint32_t val_masked = val & ~1u;
-                                                if (val_masked >= min_vmaddr && val_masked < max_vmaddr && val_masked > 0x1000) {
-                                                    val += g_appSlide;
-                                                    memcpy((void*)shifted_literal, &val, 4);
-                                                    modified_literals++;
+
+                                            if (val_masked >= min_vmaddr && val_masked < max_vmaddr && val_masked > 0x1000) {
+                                                // Значение в диапазоне бинаря — это абсолютный pointer.
+                                                // PIC lookahead не нужен: PIC-смещения никогда не попадают в этот диапазон.
+                                                val += g_appSlide;
+                                                memcpy((void*)shifted_literal, &val, 4);
+                                                modified_literals++;
+                                            } else {
+                                                // Малое значение — может быть PIC-смещением.
+                                                // Запускаем lookahead только в этом случае.
+                                                bool is_pic_offset = false;
+                                                const uint16_t* scan_ptr = ptr + (insn_size / 2);
+                                                for (int i = 0; i < 12 && (const uint8_t*)scan_ptr < code + code_size; i++) {
+                                                    uint16_t scan_hw = *scan_ptr;
+                                                    if (target_rd < 8 && scan_hw == (0x4478 | target_rd)) {
+                                                        is_pic_offset = true; break;
+                                                    } else if (target_rd >= 8 && scan_hw == (0x44F8 | (target_rd & 7))) {
+                                                        is_pic_offset = true; break;
+                                                    }
+                                                    scan_ptr += GetThumbInstructionSize(scan_hw) / 2;
                                                 }
+                                                // Малые не-PIC значения не ребейзим (они не являются указателями)
+                                                (void)is_pic_offset;
                                             }
                                         }
                                     }
@@ -11570,11 +11708,29 @@ void LoadMachO(const std::string& bundlePath) {
                                                 // Теперь ищем MOVW назад в том же окне что и BACK_WINDOW.
                                                 size_t movt_idx = bi - 1; // индекс найденного MOVT
                                                 size_t mw_back_start = (movt_idx >= BACK_WINDOW) ? movt_idx - BACK_WINDOW : 0;
+                                                // Запоминаем hi16 найденного MOVT для проверки ниже
+                                                uint32_t movt_hi16 = ((arm_ptr[movt_idx] >> 4) & 0xF000) | (arm_ptr[movt_idx] & 0xFFF);
                                                 for (size_t mi = movt_idx; mi > mw_back_start; mi--) {
                                                     uint32_t mw = arm_ptr[mi - 1];
                                                     uint32_t mRd = (mw >> 12) & 0xF;
                                                     if (((mw >> 20) & 0xFF) == 0x30 && mRd == Rm_used) {
-                                                        no_patch[mi - 1] = true; // индекс MOVW
+                                                        // Нашли MOVW: этот регистр Rm загружается парой MOVW/MOVT
+                                                        // и ЗАТЕМ используется как оффсет в [PC, Rm].
+                                                        //
+                                                        // ВСЕГДА помечаем no_patch — без проверки is_abs_ptr.
+                                                        //
+                                                        // Почему is_abs_ptr нельзя использовать:
+                                                        //   Pass 1 читает MOVT до того, как Pass 2 его пропатчил.
+                                                        //   Оригинальный MOVT содержит pre-slide hi16 (например 0x0085),
+                                                        //   который попадает в vmaddr-диапазон [0, max_vmaddr) и даёт
+                                                        //   is_abs_ptr=TRUE — ложно-положительное решение «не трогать».
+                                                        //   Pass 2 затем патчит MOVT (0x0085→0x1085), регистр получает
+                                                        //   слайднутый адрес, LDR [PC,Rm] суммирует его с PC (тоже
+                                                        //   слайднутым) → double-slide → fault addr 0x208734A0.
+                                                        //
+                                                        // Семантика [PC, Rm] однозначна: Rm — это оффсет от PC,
+                                                        // слайд на него применять нельзя ни при каких условиях.
+                                                        no_patch[mi - 1] = true;
                                                         break;
                                                     }
                                                     // Прерываем если что-то пишет в Rm_used (новая цепочка)
@@ -11593,31 +11749,30 @@ void LoadMachO(const std::string& bundlePath) {
                                         }
                                     }
 
-                                    // Проход 2: патчим незапрещённые MOVW/MOVT пары
-                                    // FIX: Раньше сканнер искал только СМЕЖНЫЕ пары [MOVW][MOVT].
-                                    // В реальном ARM32 коде компилятор может вставить 1-N инструкций
-                                    // между MOVW и MOVT. В таком случае смежный поиск пропускал пару
-                                    // → адрес оставался pre-slide → SIGSEGV.
-                                    // Новая логика: для каждого MOVW ищем MOVT вперёд в окне FWND_MOVT.
-                                    // ВАЖНО: Pass 1 (no_patch) тоже расширен до поиска MOVW в окне,
-                                    // иначе PC-relative пары будут ошибочно пропатчены.
-                                    const size_t FWND_MOVT = 8;
+                                    // Проход 2: патчим незапрещённые MOVW/MOVT пары.
+                                    //
+                                    // Алгоритм: для каждого MOVT ищем MOVW назад (зеркало Pass 1).
+                                    // Это гарантирует правильное сопоставление: каждый MOVT находит
+                                    // БЛИЖАЙШИЙ предшествующий MOVW того же регистра — именно ту пару,
+                                    // которую сгенерировал компилятор. Проблема «двух MOVW за один MOVT»
+                                    // (когда ранний MOVW захватывал чужой MOVT и оставлял реальный MOVW
+                                    // непропатченным) полностью устраняется.
+                                    const size_t BACK_WINDOW_P2 = 16;
                                     std::vector<bool> movt_patched_set(arm_count, false);
                                     int arm_movt_patched = 0;
-                                    for (size_t ai = 0; ai < arm_count; ai++) {
-                                        uint32_t w0 = arm_ptr[ai];
-                                        if (((w0 >> 20) & 0xFF) != 0x30) continue; // не MOVW
-                                        if (no_patch[ai]) continue;
-                                        uint32_t Rd = (w0 >> 12) & 0xF;
-                                        size_t fwd_end = ai + 1 + FWND_MOVT;
-                                        if (fwd_end > arm_count) fwd_end = arm_count;
-                                        for (size_t fi = ai + 1; fi < fwd_end; fi++) {
-                                            uint32_t w1 = arm_ptr[fi];
-                                            uint32_t fRd = (w1 >> 12) & 0xF;
-                                            bool is_movt = (((w1 >> 20) & 0xFF) == 0x34) && (fRd == Rd);
-                                            bool is_movw = (((w1 >> 20) & 0xFF) == 0x30) && (fRd == Rd);
-                                            if (is_movt) {
-                                                if (movt_patched_set[fi]) break;
+                                    for (size_t fi = 0; fi < arm_count; fi++) {
+                                        uint32_t w1 = arm_ptr[fi];
+                                        if (((w1 >> 20) & 0xFF) != 0x34) continue; // не MOVT
+                                        if (movt_patched_set[fi]) continue;
+                                        uint32_t Rd = (w1 >> 12) & 0xF;
+                                        size_t back_start = (fi >= BACK_WINDOW_P2) ? fi - BACK_WINDOW_P2 : 0;
+                                        for (size_t bi = fi; bi > back_start; bi--) {
+                                            uint32_t w0 = arm_ptr[bi - 1];
+                                            uint32_t bRd = (w0 >> 12) & 0xF;
+                                            bool is_movw = (((w0 >> 20) & 0xFF) == 0x30) && (bRd == Rd);
+                                            bool is_movt = (((w0 >> 20) & 0xFF) == 0x34) && (bRd == Rd);
+                                            if (is_movw) {
+                                                if (no_patch[bi - 1]) break; // PC-relative пара — не трогаем
                                                 uint32_t lo16 = ((w0 >> 4) & 0xF000) | (w0 & 0xFFF);
                                                 uint32_t hi16 = ((w1 >> 4) & 0xF000) | (w1 & 0xFFF);
                                                 uint32_t full_addr = (hi16 << 16) | lo16;
@@ -11625,18 +11780,20 @@ void LoadMachO(const std::string& bundlePath) {
                                                 uint32_t patched = full_addr + g_appSlide;
                                                 uint32_t new_lo = patched & 0xFFFF;
                                                 uint32_t new_hi = (patched >> 16) & 0xFFFF;
-                                                uint32_t* pp = const_cast<uint32_t*>(&arm_ptr[ai]);
-                                                pp[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
+                                                uint32_t* pp0 = const_cast<uint32_t*>(&arm_ptr[bi - 1]);
+                                                pp0[0] = (w0 & 0xFFF0F000) | ((new_lo & 0xF000) << 4) | (new_lo & 0xFFF);
                                                 uint32_t* pp1 = const_cast<uint32_t*>(&arm_ptr[fi]);
                                                 pp1[0] = (w1 & 0xFFF0F000) | ((new_hi & 0xF000) << 4) | (new_hi & 0xFFF);
                                                 movt_patched_set[fi] = true;
                                                 arm_movt_patched++;
                                                 break;
                                             }
-                                            if (is_movw) break; // новая цепочка — прерываем
-                                            uint32_t bop = (w1 >> 24) & 0xF;
-                                            bool writes_rd = (fRd == Rd) && (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
-                                                             (((w1 >> 20) & 0xFF) != 0x30) && (((w1 >> 20) & 0xFF) != 0x34);
+                                            if (is_movt) break; // другая MOVT-цепочка для того же Rd — стоп
+                                            uint32_t bop = (w0 >> 24) & 0xF;
+                                            bool writes_rd = (bRd == Rd) &&
+                                                             (bop <= 0x3 || (bop >= 0x8 && bop <= 0xF)) &&
+                                                             (((w0 >> 20) & 0xFF) != 0x30) &&
+                                                             (((w0 >> 20) & 0xFF) != 0x34);
                                             if (writes_rd) break;
                                         }
                                     }
@@ -11741,7 +11898,7 @@ void LoadMachO(const std::string& bundlePath) {
                                     // Это похоже на недоребейзенный указатель: 0x007869F1 + slide(0x10000000)
                                     // = 0x107869F1 — валидный адрес в рабочем диапазоне. Проверяем оба варианта
                                     // (с Thumb-битом и без), чтобы понять, в какой секции он застрял.
-                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440) {
+                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440 || val == 3900836 || val == 3900837) { // 3900836=0x003B85A4, 3900837=0x003B85A5 (Thumb)
                                         char alert_buf[256];
                                         snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT: Целевая переменная %u (0x%X) найдена по адресу 0x%X (секция %s)", val, val, sect.addr + j*4, sectname.c_str());
                                         LogToJava(alert_buf);
@@ -11851,7 +12008,10 @@ void LoadMachO(const std::string& bundlePath) {
                                                     bool sv_mapped = false;
                                                     for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
                                                     if (!sv_mapped) { safe_to_rebase = false; reason = "Data: Unmapped Ptr"; }
-                                                    else if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
+                                                    // FIX: __TEXT,__const содержит бинарные данные (structs, C-strings, jump tables).
+                                                    // isValidString ненадёжен — строки могут начинаться не с ASCII символа.
+                                                    // Достаточно проверки sv_mapped выше. Убираем isValidString-фильтр.
+                                                    // Раньше это пропускало 7 указателей с причиной "Data: Unaligned & Bad ASCII".
                                                 }
                                             }
                                         } else {
@@ -11976,28 +12136,57 @@ void LoadMachO(const std::string& bundlePath) {
         // при вызове через такой слот CPU прыгает на __stub_helper entry, который пытается
         // позвать dyld (его нет) → PC = pre/post-slide stub_helper адрес → SIGSEGV.
         //
-        // Решение: после всей обработки финально сканируем dysym-слоты.
-        // Любой слот значение которого попадает в __stub_helper секцию (post-slide диапазон)
-        // — заменяем на CreateDynamicStub. Аналогично ловим pre-slide stub_helper адреса
-        // на случай если dysymtab-loop их не тронул.
-        if (stub_helper_start != 0 || stub_helper_end != 0) {
+        // РАСШИРЕННЫЙ ФИХ: Также ловим слоты указывающие на __symbol_stub4 и другие
+        // stub-секции (тип 8). Паттерн iOS 3.x lazy binding:
+        //   __la_symbol_ptr → (initially) __symbol_stub4 entry → __stub_helper → dyld
+        // После DYSYM-SLOT-FIX слот получает post-slide адрес __symbol_stub4 →
+        // CPU в бесконечном цикле читает тот же слот → SIGSEGV.
+        // Решение: все dysym-слоты значение которых попадает в ЛЮБУЮ stub-секцию
+        // (post-slide или pre-slide) → заменяем на CreateDynamicStub.
+        {
             int sh_fixed = 0;
-            // pre-slide диапазон stub_helper
-            uint32_t sh_pre_start = (stub_helper_start > g_appSlide) ? stub_helper_start - g_appSlide : 0;
-            uint32_t sh_pre_end   = (stub_helper_end   > g_appSlide) ? stub_helper_end   - g_appSlide : 0;
+            // Логируем найденные stub-секции для диагностики
+            {
+                std::string rangeLog = "STUB-HELPER-FIX: stub_code_ranges (" +
+                                       std::to_string(stub_code_ranges.size()) + " секций):";
+                for (const auto& r : stub_code_ranges) {
+                    char rb[128]; snprintf(rb, sizeof(rb), " [%s: 0x%08X-0x%08X]", r.name.c_str(), r.start, r.end);
+                    rangeLog += rb;
+                }
+                LogToJava(rangeLog);
+            }
+
+            // Лямбда: проверяет попадание val в любой stub-диапазон (post или pre-slide)
+            auto inAnyStubRange = [&](uint32_t val, std::string& outName) -> bool {
+                for (const auto& r : stub_code_ranges) {
+                    // post-slide проверка
+                    if (r.start != 0 && val >= r.start && val < r.end) {
+                        outName = r.name + "(post-slide)";
+                        return true;
+                    }
+                    // pre-slide проверка
+                    uint32_t pre_start = (r.start > g_appSlide) ? r.start - g_appSlide : 0;
+                    uint32_t pre_end   = (r.end   > g_appSlide) ? r.end   - g_appSlide : 0;
+                    if (pre_start != 0 && val >= pre_start && val < pre_end) {
+                        outName = r.name + "(pre-slide)";
+                        return true;
+                    }
+                }
+                return false;
+            };
+
             for (const auto& sect : dysym_sections) {
                 uint32_t* slot = (uint32_t*)sect.addr;
                 uint32_t  count = sect.size / 4;
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t val = slot[i];
-                    bool is_stub_helper_post  = (stub_helper_start != 0 && val >= stub_helper_start && val < stub_helper_end);
-                    bool is_stub_helper_pre   = (sh_pre_start != 0 && val >= sh_pre_start && val < sh_pre_end);
-                    if (is_stub_helper_post || is_stub_helper_pre) {
+                    std::string matchedRange;
+                    if (inAnyStubRange(val, matchedRange)) {
                         char name_buf[64]; snprintf(name_buf, sizeof(name_buf), "__unresolved_lazy_0x%08X", val);
                         void* dstub = CreateDynamicStub(std::string(name_buf));
                         char dbg[256]; snprintf(dbg, sizeof(dbg),
-                            "STUB-HELPER-FIX: dysym slot[%u] @ 0x%08X: val 0x%08X → stub %p (was %s stub_helper)",
-                            i, (uint32_t)(sect.addr + i * 4), val, dstub, is_stub_helper_pre ? "pre-slide" : "post-slide");
+                            "STUB-HELPER-FIX: dysym slot[%u] @ 0x%08X: val 0x%08X → stub %p (range: %s)",
+                            i, (uint32_t)(sect.addr + i * 4), val, dstub, matchedRange.c_str());
                         LogToJava(std::string(dbg));
                         slot[i] = (uint32_t)(uintptr_t)dstub;
                         sh_fixed++;
@@ -12006,22 +12195,11 @@ void LoadMachO(const std::string& bundlePath) {
             }
             if (sh_fixed > 0) {
                 LogToJava("STUB-HELPER-FIX: Заменено " + std::to_string(sh_fixed) +
-                          " незарезолвленных stub_helper слотов на DynamicStub."
-                          " stub_helper range: [0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
-                          ", 0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
-                          ")");
+                          " незарезолвленных stub слотов на DynamicStub.");
             } else {
-                LogToJava("STUB-HELPER-FIX: Незарезолвленных stub_helper слотов не найдено."
-                          " stub_helper range: [0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_start) +
-                          ", 0x" +
-                          [](uint32_t v){ char b[16]; snprintf(b,sizeof(b),"%08X",v); return std::string(b); }(stub_helper_end) +
-                          ")");
+                LogToJava("STUB-HELPER-FIX: Незарезолвленных stub слотов не найдено."
+                          " (stub_code_ranges: " + std::to_string(stub_code_ranges.size()) + " секций)");
             }
-        } else {
-            LogToJava("STUB-HELPER-FIX: __stub_helper секция не найдена, пропускаем.");
         }
     }
     cmd_offset = arch_offset + sizeof(mach_header);
@@ -12114,6 +12292,12 @@ void* NativeExecutionThread(void* arg) {
     char eglBuf[256];
     snprintf(eglBuf, sizeof(eglBuf), "[MEGA-DEBUG] NativeExecutionThread init: Ctx=%p, Dpy=%p, Surf=%p, SurfSize=%dx%d", ctx, dpy, surf, w, h);
     LogToJava(eglBuf);
+    // Обновляем g_surfaceWidth/Height из реального EGL-размера, если они не были заданы или равны 0
+    if (w > 0 && h > 0) {
+        g_surfaceWidth  = w;
+        g_surfaceHeight = h;
+        LogToJava("[EGL-FIX] g_surfaceWidth/Height обновлены из EGL: " + std::to_string(w) + "x" + std::to_string(h));
+    }
     // --------------------------------------------------------------------
 
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);
