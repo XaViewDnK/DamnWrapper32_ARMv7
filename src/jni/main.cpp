@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <ucontext.h>
 #include <map>
+#include <set>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -130,6 +131,9 @@ EGLDisplay g_eglDisplay = EGL_NO_DISPLAY; EGLContext g_eglContext = EGL_NO_CONTE
 void* g_currentEAGLContext = nullptr;
 int g_surfaceWidth = 480; int g_surfaceHeight = 320;
 uint32_t g_entryPoint = 0; uint32_t g_appSlide = 0; std::map<std::string, uint32_t> g_appSymbols;
+// Имена символов гостя, помеченных N_ARM_THUMB_DEF: адрес в symtab чётный,
+// но переходить на него можно только с установленным битом 0.
+std::set<std::string> g_appThumbSymbols;
 std::map<uintptr_t, std::string> g_missingSymbolAddrs;
 std::vector<uint32_t> g_initFuncs;
 
@@ -5647,14 +5651,21 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "bytes") == 0 || strcmp(op, "length") == 0) return 0;
         }
         if (clsName == "NSData") {
-            if (strcmp(op, "dataWithContentsOfFile:") == 0) {
+            if (strcmp(op, "dataWithContentsOfFile:") == 0 || strcmp(op, "dataWithContentsOfMappedFile:") == 0) {
                 std::string path = GetNSString(a1);
-                std::ifstream in(path, std::ios::binary);
-                if (in.is_open()) {
-                    std::stringstream buffer; buffer << in.rdbuf();
-                    return (uint64_t)(uintptr_t)CreateNSString(buffer.str());
+                std::ifstream in(path, std::ios::binary | std::ios::ate);
+                if (!in.is_open()) return 0;
+                std::streamsize size = in.tellg();
+                in.seekg(0, std::ios::beg);
+                uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)(uintptr_t)self;
+                if (size > 0) {
+                    uint8_t* binData = (uint8_t*)malloc((size_t)size + 1);
+                    in.read((char*)binData, size);
+                    binData[size] = 0;
+                    inst[1] = (uint32_t)(uintptr_t)binData;
+                    inst[2] = (uint32_t)size;
                 }
-                return 0;
+                return (uint64_t)(uintptr_t)inst;
             }
         }
         // -----------------------------
@@ -11587,6 +11598,98 @@ extern "C" void* wrap_cxx_string_resize_char(void*, size_t, char);
 extern "C" void* wrap_cxx_string_operator_assign(void*, void*);
 extern "C" char* wrap_cxx_string_operator_index(void*, size_t);
 extern "C" void* wrap_cxx_string_operator_plus_assign(void*, void*);
+// --- HLE LLVM libc++ (std::__1), нужен для MCPE 0.7.3.0 ---
+extern uint32_t hle_lcxx_ctype_char_id[4];
+extern void* hle_lcxx_stdinp_ptr;
+extern "C" void wrap_lcxx_str_init_ptr_len(void*, const char*, size_t);
+extern "C" void wrap_lcxx_str_init_ptr_len_res(void*, const char*, size_t, size_t);
+extern "C" void wrap_lcxx_str_init_len_char(void*, size_t, char);
+extern "C" void wrap_lcxx_str_grow_by(void*, size_t, size_t, size_t, size_t, size_t, size_t);
+extern "C" void* wrap_lcxx_str_append_ptr_len(void*, const char*, size_t);
+extern "C" void* wrap_lcxx_str_append_ptr(void*, const char*);
+extern "C" void* wrap_lcxx_str_assign_ptr(void*, const char*);
+extern "C" void* wrap_lcxx_str_assign_str(void*, const void*);
+extern "C" void* wrap_lcxx_str_insert_ptr(void*, size_t, const char*);
+extern "C" void* wrap_lcxx_str_resize(void*, size_t, char);
+extern "C" void wrap_lcxx_str_reserve(void*, size_t);
+extern "C" void wrap_lcxx_str_push_back(void*, char);
+extern "C" void* wrap_lcxx_str_erase(void*, size_t, size_t);
+extern "C" void* wrap_lcxx_str_replace_ptr_len(void*, size_t, size_t, const char*, size_t);
+extern "C" void* wrap_lcxx_str_copy_ctor(void*, const void*);
+extern "C" void* wrap_lcxx_str_ctor_sub(void*, const void*, size_t, size_t, void*);
+extern "C" void* wrap_lcxx_str_dtor(void*);
+extern "C" size_t wrap_lcxx_str_find_char(const void*, char, size_t);
+extern "C" size_t wrap_lcxx_str_find_ptr_len(const void*, const char*, size_t, size_t);
+extern "C" size_t wrap_lcxx_str_rfind_ptr_len(const void*, const char*, size_t, size_t);
+extern "C" size_t wrap_lcxx_str_find_last_not_of(const void*, const char*, size_t, size_t);
+extern "C" int wrap_lcxx_str_compare_ptr(const void*, const char*);
+extern "C" void wrap_lcxx_mutex_lock(void*);
+extern "C" void wrap_lcxx_mutex_unlock(void*);
+extern "C" void* wrap_lcxx_mutex_dtor(void*);
+extern "C" void wrap_lcxx_cv_notify_one(void*);
+extern "C" void wrap_lcxx_cv_notify_all(void*);
+extern "C" void wrap_lcxx_cv_wait(void*, void*);
+extern "C" void* wrap_lcxx_cv_dtor(void*);
+extern "C" void wrap_lcxx_thread_join(void*);
+extern "C" void* wrap_lcxx_thread_dtor(void*);
+extern "C" unsigned wrap_lcxx_thread_hw_concurrency();
+extern "C" void wrap_lcxx_sleep_for(const long long*);
+extern "C" void* wrap_lcxx_thread_struct_ctor(void*);
+extern "C" void* wrap_lcxx_thread_struct_dtor(void*);
+extern "C" void* wrap_lcxx_thread_local_data();
+extern "C" void wrap_lcxx_swc_add_shared(void*);
+extern "C" void wrap_lcxx_swc_release_shared(void*);
+extern "C" void* wrap_lcxx_swc_dtor(void*);
+extern "C" const void* wrap_lcxx_swc_get_deleter(const void*, const void*);
+extern "C" size_t wrap_lcxx_next_prime(size_t);
+extern "C" void wrap_lcxx_throw_length_error(void*);
+extern "C" void wrap_lcxx_throw_system_error(int, const char*);
+extern "C" const char* wrap_lcxx_exception_what(void*);
+extern "C" void* wrap_lcxx_exception_dtor(void*);
+extern "C" void* wrap_lcxx_use_facet(const void*, const void*);
+extern "C" void* wrap_lcxx_locale_dtor(void*);
+extern "C" void* wrap_lcxx_sb_dtor(void*);
+extern "C" void wrap_lcxx_sb_imbue(void*, const void*);
+extern "C" void* wrap_lcxx_sb_setbuf(void*, char*, int);
+extern "C" int wrap_lcxx_sb_sync(void*);
+extern "C" int wrap_lcxx_sb_showmanyc(void*);
+extern "C" int wrap_lcxx_sb_uflow(void*);
+extern "C" int wrap_lcxx_sb_xsgetn(void*, char*, int);
+extern "C" int wrap_lcxx_sb_xsputn(void*, const char*, int);
+extern "C" void* wrap_lcxx_sb_ctor(void*);
+extern "C" void wrap_lcxx_ios_base_init(void*, void*);
+extern "C" void wrap_lcxx_ios_base_clear(void*, uint32_t);
+extern "C" void wrap_lcxx_ios_base_set_badbit(void*);
+extern "C" void* wrap_lcxx_ios_base_getloc(void*, void*);
+extern "C" void* wrap_lcxx_basic_ios_dtor(void*);
+extern "C" void* wrap_lcxx_os_ls_bool(void*, bool);
+extern "C" void* wrap_lcxx_os_ls_int(void*, int);
+extern "C" void* wrap_lcxx_os_ls_uint(void*, unsigned);
+extern "C" void* wrap_lcxx_os_ls_ulong(void*, unsigned long);
+extern "C" void* wrap_lcxx_os_ls_short(void*, short);
+extern "C" void* wrap_lcxx_os_ls_longlong(void*, long long);
+extern "C" void* wrap_lcxx_os_ls_double(void*, double);
+extern "C" void* wrap_lcxx_os_ls_float(void*, float);
+extern "C" void* wrap_lcxx_os_sentry_ctor(void*, void*);
+extern "C" void* wrap_lcxx_os_sentry_dtor(void*);
+extern "C" void* wrap_lcxx_is_sentry_ctor(void*, void*, bool);
+extern "C" void* wrap_lcxx_stream_dtor(void*);
+extern "C" void wrap_lcxx_stream_dtor_del(void*);
+extern "C" void wrap_lcxx_stream_thunk_dtor_del(void*);
+extern "C" int wrap_lcxx_divmodsi4(int, int, int*);
+extern "C" void* wrap_lcxx_signal(int, void*);
+extern "C" void* wrap_lcxx_gmtime(const time_t*);
+extern "C" void wrap_lcxx_ftime(void*);
+extern "C" int wrap_lcxx_pthread_condattr_init(void*);
+extern "C" int wrap_lcxx_pthread_condattr_destroy(void*);
+extern "C" int wrap_lcxx_pthread_attr_setschedparam(void*, const void*);
+extern "C" int wrap_lcxx_deflateInit_(z_streamp, int, const char*, int);
+extern "C" void* wrap_lcxx_new_nothrow(size_t, const void*);
+extern "C" int wrap_lcxx_cxa_atexit(void*, void*, void*);
+extern "C" void wrap_lcxx_cxa_end_catch();
+extern "C" void wrap_lcxx_cxa_guard_abort(void*);
+extern "C" void wrap_lcxx_objc_end_catch();
+
 extern "C" void wrap_List_node_base_hook(void*, void*);
 extern "C" void wrap_List_node_base_unhook(void*);
 extern "C" void wrap_List_node_base_transfer(void*, void*, void*);
@@ -11876,6 +11979,112 @@ std::map<std::string, void*> g_hleStubs = {
     {"__ZNSt9basic_iosIcSt11char_traitsIcEE5clearESt12_Ios_Iostate", (void*)wrap_cxx_basic_ios_clear},
     {"__ZSt9use_facetISt5ctypeIcEERKT_RKSt6locale", (void*)wrap_cxx_use_facet_ctype_char},
     {"__ZSt9use_facetISt5ctypeIwEERKT_RKSt6locale", (void*)wrap_cxx_use_facet_ctype_wchar},
+
+    // --- libc++ (std::__1), MCPE 0.7.3.0 ---
+    {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE16find_last_not_ofEPKcmm", (void*)wrap_lcxx_str_find_last_not_of},
+    {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm", (void*)wrap_lcxx_str_find_ptr_len},
+    {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm", (void*)wrap_lcxx_str_find_char},
+    {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEPKcmm", (void*)wrap_lcxx_str_rfind_ptr_len},
+    {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc", (void*)wrap_lcxx_str_compare_ptr},
+    {"__ZNKSt3__119__shared_weak_count13__get_deleterERKSt9type_info", (void*)wrap_lcxx_swc_get_deleter},
+    {"__ZNKSt3__120__vector_base_commonILb1EE20__throw_length_errorEv", (void*)wrap_lcxx_throw_length_error},
+    {"__ZNKSt3__121__basic_string_commonILb1EE20__throw_length_errorEv", (void*)wrap_lcxx_throw_length_error},
+    {"__ZNKSt3__16locale9use_facetERNS0_2idE", (void*)wrap_lcxx_use_facet},
+    {"__ZNKSt3__18ios_base6getlocEv", (void*)wrap_lcxx_ios_base_getloc},
+    {"__ZNKSt9exception4whatEv", (void*)wrap_lcxx_exception_what},
+    {"__ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILx1ELx1000000000EEEEE", (void*)wrap_lcxx_sleep_for},
+    {"__ZNSt3__112__next_primeEm", (void*)wrap_lcxx_next_prime},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5eraseEmm", (void*)wrap_lcxx_str_erase},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm", (void*)wrap_lcxx_str_init_ptr_len},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcmm", (void*)wrap_lcxx_str_init_ptr_len_res},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc", (void*)wrap_lcxx_str_init_len_char},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc", (void*)wrap_lcxx_str_append_ptr},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm", (void*)wrap_lcxx_str_append_ptr_len},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc", (void*)wrap_lcxx_str_assign_ptr},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc", (void*)wrap_lcxx_str_insert_ptr},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc", (void*)wrap_lcxx_str_resize},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm", (void*)wrap_lcxx_str_replace_ptr_len},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm", (void*)wrap_lcxx_str_reserve},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm", (void*)wrap_lcxx_str_grow_by},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc", (void*)wrap_lcxx_str_push_back},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_", (void*)wrap_lcxx_str_copy_ctor},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_mmRKS4_", (void*)wrap_lcxx_str_ctor_sub},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev", (void*)wrap_lcxx_str_dtor},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_", (void*)wrap_lcxx_str_assign_str},
+    {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", (void*)wrap_lcxx_is_sentry_ctor},
+    {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED0Ev", (void*)wrap_lcxx_stream_dtor_del},
+    {"__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED1Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", (void*)wrap_lcxx_os_sentry_ctor},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev", (void*)wrap_lcxx_os_sentry_dtor},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEED0Ev", (void*)wrap_lcxx_stream_dtor_del},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEED1Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEED2Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEb", (void*)wrap_lcxx_os_ls_bool},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEd", (void*)wrap_lcxx_os_ls_double},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEf", (void*)wrap_lcxx_os_ls_float},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEi", (void*)wrap_lcxx_os_ls_int},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEj", (void*)wrap_lcxx_os_ls_uint},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEm", (void*)wrap_lcxx_os_ls_ulong},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEs", (void*)wrap_lcxx_os_ls_short},
+    {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEx", (void*)wrap_lcxx_os_ls_longlong},
+    {"__ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEED0Ev", (void*)wrap_lcxx_stream_dtor_del},
+    {"__ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEED1Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEED2Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZNSt3__115__thread_structC1Ev", (void*)wrap_lcxx_thread_struct_ctor},
+    {"__ZNSt3__115__thread_structD1Ev", (void*)wrap_lcxx_thread_struct_dtor},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE4syncEv", (void*)wrap_lcxx_sb_sync},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5imbueERKNS_6localeE", (void*)wrap_lcxx_sb_imbue},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5uflowEv", (void*)wrap_lcxx_sb_uflow},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6setbufEPci", (void*)wrap_lcxx_sb_setbuf},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsgetnEPci", (void*)wrap_lcxx_sb_xsgetn},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsputnEPKci", (void*)wrap_lcxx_sb_xsputn},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9showmanycEv", (void*)wrap_lcxx_sb_showmanyc},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev", (void*)wrap_lcxx_sb_ctor},
+    {"__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED2Ev", (void*)wrap_lcxx_sb_dtor},
+    {"__ZNSt3__118condition_variable10notify_allEv", (void*)wrap_lcxx_cv_notify_all},
+    {"__ZNSt3__118condition_variable10notify_oneEv", (void*)wrap_lcxx_cv_notify_one},
+    {"__ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE", (void*)wrap_lcxx_cv_wait},
+    {"__ZNSt3__118condition_variableD1Ev", (void*)wrap_lcxx_cv_dtor},
+    {"__ZNSt3__119__shared_weak_count12__add_sharedEv", (void*)wrap_lcxx_swc_add_shared},
+    {"__ZNSt3__119__shared_weak_count16__release_sharedEv", (void*)wrap_lcxx_swc_release_shared},
+    {"__ZNSt3__119__shared_weak_countD2Ev", (void*)wrap_lcxx_swc_dtor},
+    {"__ZNSt3__119__thread_local_dataEv", (void*)wrap_lcxx_thread_local_data},
+    {"__ZNSt3__120__throw_system_errorEiPKc", (void*)wrap_lcxx_throw_system_error},
+    {"__ZNSt3__15ctypeIcE2idE", (void*)&hle_lcxx_ctype_char_id},
+    {"__ZNSt3__15mutex4lockEv", (void*)wrap_lcxx_mutex_lock},
+    {"__ZNSt3__15mutex6unlockEv", (void*)wrap_lcxx_mutex_unlock},
+    {"__ZNSt3__15mutexD1Ev", (void*)wrap_lcxx_mutex_dtor},
+    {"__ZNSt3__16localeD1Ev", (void*)wrap_lcxx_locale_dtor},
+    {"__ZNSt3__16thread20hardware_concurrencyEv", (void*)wrap_lcxx_thread_hw_concurrency},
+    {"__ZNSt3__16thread4joinEv", (void*)wrap_lcxx_thread_join},
+    {"__ZNSt3__16threadD1Ev", (void*)wrap_lcxx_thread_dtor},
+    {"__ZNSt3__18ios_base33__set_badbit_and_consider_rethrowEv", (void*)wrap_lcxx_ios_base_set_badbit},
+    {"__ZNSt3__18ios_base4initEPv", (void*)wrap_lcxx_ios_base_init},
+    {"__ZNSt3__18ios_base5clearEj", (void*)wrap_lcxx_ios_base_clear},
+    {"__ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev", (void*)wrap_lcxx_basic_ios_dtor},
+    {"__ZNSt9exceptionD2Ev", (void*)wrap_lcxx_exception_dtor},
+    {"__ZThn8_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED0Ev", (void*)wrap_lcxx_stream_thunk_dtor_del},
+    {"__ZThn8_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED1Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZTv0_n12_NSt3__113basic_istreamIcNS_11char_traitsIcEEED0Ev", (void*)wrap_lcxx_stream_thunk_dtor_del},
+    {"__ZTv0_n12_NSt3__113basic_istreamIcNS_11char_traitsIcEEED1Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZTv0_n12_NSt3__113basic_ostreamIcNS_11char_traitsIcEEED0Ev", (void*)wrap_lcxx_stream_thunk_dtor_del},
+    {"__ZTv0_n12_NSt3__113basic_ostreamIcNS_11char_traitsIcEEED1Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZTv0_n12_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED0Ev", (void*)wrap_lcxx_stream_thunk_dtor_del},
+    {"__ZTv0_n12_NSt3__114basic_iostreamIcNS_11char_traitsIcEEED1Ev", (void*)wrap_lcxx_stream_dtor},
+    {"__ZnwmRKSt9nothrow_t", (void*)wrap_lcxx_new_nothrow},
+    {"___cxa_atexit", (void*)wrap_lcxx_cxa_atexit},
+    {"___cxa_end_catch", (void*)wrap_lcxx_cxa_end_catch},
+    {"___cxa_guard_abort", (void*)wrap_lcxx_cxa_guard_abort},
+    {"___divmodsi4", (void*)wrap_lcxx_divmodsi4},
+    {"___stdinp", (void*)&hle_lcxx_stdinp_ptr},
+    {"_deflateInit_", (void*)wrap_lcxx_deflateInit_},
+    {"_ftime", (void*)wrap_lcxx_ftime},
+    {"_gmtime", (void*)wrap_lcxx_gmtime},
+    {"_objc_end_catch", (void*)wrap_lcxx_objc_end_catch},
+    {"_pthread_attr_setschedparam", (void*)wrap_lcxx_pthread_attr_setschedparam},
+    {"_pthread_condattr_destroy", (void*)wrap_lcxx_pthread_condattr_destroy},
+    {"_pthread_condattr_init", (void*)wrap_lcxx_pthread_condattr_init},
+    {"_signal", (void*)wrap_lcxx_signal},
 };
 
 // Контейнеры для сортировки (map сам сортирует ключи по алфавиту)
@@ -11973,8 +12182,8 @@ void* CreateAlignedTrampoline(void* real_func) {
 // --------------------------------------------------------------
 
 void* ResolveSymbol(const std::string& name) {
-    if (g_appSymbols.count(name)) return (void*)g_appSymbols[name];
-    if (g_appSymbols.count("_" + name)) return (void*)g_appSymbols["_" + name];
+    if (g_appSymbols.count(name)) return (void*)(g_appSymbols[name] | (g_appThumbSymbols.count(name) ? 1u : 0u));
+    if (g_appSymbols.count("_" + name)) return (void*)(g_appSymbols["_" + name] | (g_appThumbSymbols.count("_" + name) ? 1u : 0u));
     
     std::string hleName = g_hleStubs.count(name) ? name : (g_hleStubs.count("_" + name) ? "_" + name : "");
     if (!hleName.empty()) {
@@ -12398,7 +12607,10 @@ void LoadMachO(const std::string& bundlePath) {
         for (uint32_t i = 0; i < symtab.nsyms; i++) {
             if (symTable[i].n_un.n_strx > 0) {
                 std::string symName = &strTable[symTable[i].n_un.n_strx];
-                if (symTable[i].n_sect > 0) g_appSymbols[symName] = symTable[i].n_value + g_appSlide;
+                if (symTable[i].n_sect > 0) {
+                    g_appSymbols[symName] = symTable[i].n_value + g_appSlide;
+                    if (symTable[i].n_desc & 0x0008) g_appThumbSymbols.insert(symName);
+                }
                 if (symName == "_glCompileShader") isES2 = true;
                 if (symName == "_glEnableClientState" || symName == "_glVertexPointer") isES1 = true;
             } 
@@ -13833,6 +14045,706 @@ extern "C" void* wrap_object_getIvar(void* obj, void* ivar) { return nullptr; }
 extern "C" void wrap_object_setIvar(void* obj, void* ivar, void* value) {}
 extern "C" void* wrap_property_copyAttributeList(void* property, uint32_t* outCount) { if (outCount) *outCount = 0; return nullptr; }
 extern "C" void* wrap_sel_getUid(const char* str) { return wrap_sel_registerName(str); }
+
+// =====================================================================
+// HLE LLVM libc++ (std::__1)
+// MCPE 0.7.3.0 собрана против libc++, а не против libstdc++, поэтому вся
+// стандартная библиотека приходит отдельным набором импортов.
+// ABI строки подтверждён дизассемблером гостя (tst.w rX, #0x1 на первом
+// слове): long { cap|1, size, data }, short { size<<1, data[11] }.
+// =====================================================================
+namespace lcxx {
+
+struct StrLong { uint32_t cap; uint32_t size; char* data; };
+static const size_t kMinCap = 11;
+static const size_t kNpos = (size_t)-1;
+
+static inline bool IsLong(const void* s) { return (*(const uint32_t*)s & 1u) != 0; }
+static inline size_t Size(const void* s) {
+    uint32_t w = *(const uint32_t*)s;
+    return (w & 1u) ? ((const StrLong*)s)->size : (size_t)((w & 0xffu) >> 1);
+}
+static inline char* Data(const void* s) {
+    return IsLong(s) ? ((StrLong*)s)->data : (char*)((char*)s + 1);
+}
+static inline size_t Cap(const void* s) {
+    return IsLong(s) ? ((size_t)(((const StrLong*)s)->cap & ~1u) - 1) : (kMinCap - 1);
+}
+static inline void SetSize(void* s, size_t n) {
+    if (IsLong(s)) ((StrLong*)s)->size = (uint32_t)n;
+    else *(uint8_t*)s = (uint8_t)(n << 1);
+}
+static inline size_t Recommend(size_t s) {
+    if (s < kMinCap) return kMinCap - 1;
+    size_t guess = ((s + 1 + 15) & ~(size_t)15) - 1;
+    if (guess == kMinCap) ++guess;
+    return guess;
+}
+static void Reallocate(void* s, size_t want) {
+    size_t oldSize = Size(s);
+    if (want < oldSize) want = oldSize;
+    size_t cap = Recommend(want);
+    char* buf = (char*)wrap_malloc(cap + 1);
+    if (!buf) return;
+    memcpy(buf, Data(s), oldSize);
+    buf[oldSize] = '\0';
+    char* old = IsLong(s) ? ((StrLong*)s)->data : nullptr;
+    StrLong* L = (StrLong*)s;
+    L->cap = (uint32_t)((cap + 1) | 1u);
+    L->size = (uint32_t)oldSize;
+    L->data = buf;
+    if (old) wrap_free(old);
+}
+static inline void Reserve(void* s, size_t want) { if (want > Cap(s)) Reallocate(s, want); }
+static inline void Grow(void* s, size_t want) {
+    size_t c = Cap(s);
+    if (want <= c) return;
+    Reallocate(s, want > 2 * c ? want : 2 * c);
+}
+static inline void SetSizeTerm(void* s, size_t n) { SetSize(s, n); Data(s)[n] = '\0'; }
+static void Init(void* s, const char* p, size_t n) {
+    if (n <= kMinCap - 1) {
+        *(uint32_t*)s = 0;
+        *(uint8_t*)s = (uint8_t)(n << 1);
+        char* d = (char*)s + 1;
+        if (p && n) memcpy(d, p, n);
+        d[n] = '\0';
+    } else {
+        size_t cap = Recommend(n);
+        char* buf = (char*)wrap_malloc(cap + 1);
+        StrLong* L = (StrLong*)s;
+        if (!buf) { *(uint32_t*)s = 0; return; }
+        L->cap = (uint32_t)((cap + 1) | 1u);
+        L->size = (uint32_t)n;
+        L->data = buf;
+        if (p && n) memcpy(buf, p, n);
+        buf[n] = '\0';
+    }
+}
+static void Assign(void* s, const char* p, size_t n) {
+    if (n > Cap(s)) Reallocate(s, n);
+    if (n > Cap(s)) return;
+    char* d = Data(s);
+    if (p && n) memmove(d, p, n);
+    d[n] = '\0';
+    SetSize(s, n);
+}
+
+} // namespace lcxx
+
+extern "C" void wrap_lcxx_str_init_ptr_len(void* s, const char* p, size_t n) { lcxx::Init(s, p, n); }
+extern "C" void wrap_lcxx_str_init_ptr_len_res(void* s, const char* p, size_t n, size_t res) {
+    lcxx::Init(s, p, n);
+    if (res > n) lcxx::Reserve(s, res);
+}
+extern "C" void wrap_lcxx_str_init_len_char(void* s, size_t n, char c) {
+    lcxx::Init(s, nullptr, n);
+    if (n <= lcxx::Cap(s)) { memset(lcxx::Data(s), c, n); lcxx::Data(s)[n] = '\0'; }
+}
+extern "C" void wrap_lcxx_str_grow_by(void* s, size_t old_cap, size_t delta_cap, size_t old_sz,
+                                      size_t n_copy, size_t n_del, size_t n_add) {
+    char* old_p = lcxx::Data(s);
+    size_t want = old_cap + delta_cap;
+    if (2 * old_cap > want) want = 2 * old_cap;
+    size_t cap = lcxx::Recommend(want);
+    char* np = (char*)wrap_malloc(cap + 1);
+    if (!np) { LogToJava("HLE libc++: __grow_by OOM"); return; }
+    if (n_copy) memcpy(np, old_p, n_copy);
+    size_t sec = (old_sz > n_del + n_copy) ? (old_sz - n_del - n_copy) : 0;
+    if (sec) memcpy(np + n_copy + n_add, old_p + n_copy + n_del, sec);
+    np[cap] = '\0';
+    bool wasLong = lcxx::IsLong(s);
+    lcxx::StrLong* L = (lcxx::StrLong*)s;
+    L->cap = (uint32_t)((cap + 1) | 1u);
+    L->size = (uint32_t)old_sz;
+    L->data = np;
+    if (wasLong && old_cap + 1 != lcxx::kMinCap) wrap_free(old_p);
+}
+extern "C" void* wrap_lcxx_str_append_ptr_len(void* s, const char* p, size_t n) {
+    if (n && p) {
+        size_t sz = lcxx::Size(s);
+        lcxx::Grow(s, sz + n);
+        if (sz + n > lcxx::Cap(s)) return s;
+        char* d = lcxx::Data(s);
+        memmove(d + sz, p, n);
+        d[sz + n] = '\0';
+        lcxx::SetSize(s, sz + n);
+    }
+    return s;
+}
+extern "C" void* wrap_lcxx_str_append_ptr(void* s, const char* p) {
+    return wrap_lcxx_str_append_ptr_len(s, p, p ? strlen(p) : 0);
+}
+extern "C" void* wrap_lcxx_str_assign_ptr(void* s, const char* p) {
+    lcxx::Assign(s, p, p ? strlen(p) : 0);
+    return s;
+}
+extern "C" void* wrap_lcxx_str_assign_str(void* s, const void* o) {
+    if (s != o && o) lcxx::Assign(s, lcxx::Data(o), lcxx::Size(o));
+    return s;
+}
+extern "C" void* wrap_lcxx_str_insert_ptr(void* s, size_t pos, const char* p) {
+    size_t n = p ? strlen(p) : 0;
+    size_t sz = lcxx::Size(s);
+    if (pos > sz) pos = sz;
+    if (!n) return s;
+    std::string tmp(p, n);
+    lcxx::Grow(s, sz + n);
+    if (sz + n > lcxx::Cap(s)) return s;
+    char* d = lcxx::Data(s);
+    memmove(d + pos + n, d + pos, sz - pos);
+    memcpy(d + pos, tmp.data(), n);
+    lcxx::SetSizeTerm(s, sz + n);
+    return s;
+}
+extern "C" void* wrap_lcxx_str_resize(void* s, size_t n, char c) {
+    size_t sz = lcxx::Size(s);
+    if (n > sz) {
+        lcxx::Grow(s, n);
+        if (n > lcxx::Cap(s)) return s;
+        memset(lcxx::Data(s) + sz, c, n - sz);
+    }
+    lcxx::SetSizeTerm(s, n);
+    return s;
+}
+extern "C" void wrap_lcxx_str_reserve(void* s, size_t n) { lcxx::Reserve(s, n); }
+extern "C" void wrap_lcxx_str_push_back(void* s, char c) {
+    size_t sz = lcxx::Size(s);
+    lcxx::Grow(s, sz + 1);
+    if (sz + 1 > lcxx::Cap(s)) return;
+    char* d = lcxx::Data(s);
+    d[sz] = c; d[sz + 1] = '\0';
+    lcxx::SetSize(s, sz + 1);
+}
+extern "C" void* wrap_lcxx_str_erase(void* s, size_t pos, size_t n) {
+    size_t sz = lcxx::Size(s);
+    if (pos > sz) pos = sz;
+    size_t m = (n > sz - pos) ? (sz - pos) : n;
+    char* d = lcxx::Data(s);
+    memmove(d + pos, d + pos + m, sz - pos - m);
+    lcxx::SetSizeTerm(s, sz - m);
+    return s;
+}
+extern "C" void* wrap_lcxx_str_replace_ptr_len(void* s, size_t pos, size_t n1, const char* p, size_t n2) {
+    size_t sz = lcxx::Size(s);
+    if (pos > sz) pos = sz;
+    if (n1 > sz - pos) n1 = sz - pos;
+    std::string tmp(p ? p : "", p ? n2 : 0);
+    size_t nsz = sz - n1 + n2;
+    lcxx::Grow(s, nsz);
+    if (nsz > lcxx::Cap(s)) return s;
+    char* d = lcxx::Data(s);
+    memmove(d + pos + n2, d + pos + n1, sz - pos - n1);
+    if (n2) memcpy(d + pos, tmp.data(), n2);
+    lcxx::SetSizeTerm(s, nsz);
+    return s;
+}
+extern "C" void* wrap_lcxx_str_copy_ctor(void* s, const void* o) {
+    if (o) lcxx::Init(s, lcxx::Data(o), lcxx::Size(o));
+    else lcxx::Init(s, nullptr, 0);
+    return s;
+}
+extern "C" void* wrap_lcxx_str_ctor_sub(void* s, const void* o, size_t pos, size_t n, void* alloc) {
+    (void)alloc;
+    size_t sz = o ? lcxx::Size(o) : 0;
+    if (pos > sz) pos = sz;
+    size_t m = (n > sz - pos) ? (sz - pos) : n;
+    lcxx::Init(s, o ? lcxx::Data(o) + pos : nullptr, m);
+    return s;
+}
+extern "C" void* wrap_lcxx_str_dtor(void* s) {
+    if (s && lcxx::IsLong(s)) { wrap_free(((lcxx::StrLong*)s)->data); *(uint32_t*)s = 0; }
+    return s;
+}
+extern "C" size_t wrap_lcxx_str_find_char(const void* s, char c, size_t pos) {
+    size_t sz = lcxx::Size(s);
+    if (pos >= sz) return lcxx::kNpos;
+    const char* d = lcxx::Data(s);
+    const void* r = memchr(d + pos, c, sz - pos);
+    return r ? (size_t)((const char*)r - d) : lcxx::kNpos;
+}
+extern "C" size_t wrap_lcxx_str_find_ptr_len(const void* s, const char* p, size_t pos, size_t n) {
+    size_t sz = lcxx::Size(s);
+    if (n == 0) return pos <= sz ? pos : lcxx::kNpos;
+    if (pos > sz || n > sz - pos) return lcxx::kNpos;
+    const char* d = lcxx::Data(s);
+    for (size_t i = pos; i + n <= sz; ++i) if (memcmp(d + i, p, n) == 0) return i;
+    return lcxx::kNpos;
+}
+extern "C" size_t wrap_lcxx_str_rfind_ptr_len(const void* s, const char* p, size_t pos, size_t n) {
+    size_t sz = lcxx::Size(s);
+    if (n > sz) return lcxx::kNpos;
+    size_t last = sz - n;
+    if (pos > last) pos = last;
+    const char* d = lcxx::Data(s);
+    for (size_t i = pos + 1; i-- > 0; ) if (n == 0 || memcmp(d + i, p, n) == 0) return i;
+    return lcxx::kNpos;
+}
+extern "C" size_t wrap_lcxx_str_find_last_not_of(const void* s, const char* p, size_t pos, size_t n) {
+    size_t sz = lcxx::Size(s);
+    if (sz == 0) return lcxx::kNpos;
+    const char* d = lcxx::Data(s);
+    size_t i = (pos >= sz) ? (sz - 1) : pos;
+    for (;; --i) {
+        if (n == 0 || !memchr(p, d[i], n)) return i;
+        if (i == 0) break;
+    }
+    return lcxx::kNpos;
+}
+extern "C" int wrap_lcxx_str_compare_ptr(const void* s, const char* p) {
+    size_t sz = lcxx::Size(s);
+    const char* d = lcxx::Data(s);
+    size_t n = p ? strlen(p) : 0;
+    size_t m = sz < n ? sz : n;
+    int r = m ? memcmp(d, p, m) : 0;
+    if (r) return r < 0 ? -1 : 1;
+    return sz < n ? -1 : (sz > n ? 1 : 0);
+}
+
+// --- libc++: mutex / condition_variable / thread ---
+// Объекты гостя размечены под iOS-овые pthread_mutex_t/pthread_cond_t, отдавать их
+// нативному pthread нельзя — держим настоящие примитивы сбоку, по адресу гостя.
+static std::map<void*, pthread_mutex_t*> g_lcxxMutexes;
+static std::map<void*, pthread_cond_t*> g_lcxxConds;
+static pthread_mutex_t g_lcxxSideLock = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t* LcxxMutexFor(void* p) {
+    pthread_mutex_lock(&g_lcxxSideLock);
+    pthread_mutex_t*& m = g_lcxxMutexes[p];
+    if (!m) { m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t)); pthread_mutex_init(m, nullptr); }
+    pthread_mutex_t* r = m;
+    pthread_mutex_unlock(&g_lcxxSideLock);
+    return r;
+}
+static pthread_cond_t* LcxxCondFor(void* p) {
+    pthread_mutex_lock(&g_lcxxSideLock);
+    pthread_cond_t*& c = g_lcxxConds[p];
+    if (!c) { c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); }
+    pthread_cond_t* r = c;
+    pthread_mutex_unlock(&g_lcxxSideLock);
+    return r;
+}
+
+extern "C" void wrap_lcxx_mutex_lock(void* m) { pthread_mutex_lock(LcxxMutexFor(m)); }
+extern "C" void wrap_lcxx_mutex_unlock(void* m) { pthread_mutex_unlock(LcxxMutexFor(m)); }
+extern "C" void* wrap_lcxx_mutex_dtor(void* m) {
+    pthread_mutex_lock(&g_lcxxSideLock);
+    auto it = g_lcxxMutexes.find(m);
+    if (it != g_lcxxMutexes.end()) { pthread_mutex_destroy(it->second); free(it->second); g_lcxxMutexes.erase(it); }
+    pthread_mutex_unlock(&g_lcxxSideLock);
+    return m;
+}
+extern "C" void wrap_lcxx_cv_notify_one(void* c) { pthread_cond_signal(LcxxCondFor(c)); }
+extern "C" void wrap_lcxx_cv_notify_all(void* c) { pthread_cond_broadcast(LcxxCondFor(c)); }
+extern "C" void wrap_lcxx_cv_wait(void* c, void* ul) {
+    void* gm = ul ? *(void**)ul : nullptr;   // unique_lock: { mutex* __m_; bool __owns_; }
+    if (!gm) return;
+    pthread_cond_wait(LcxxCondFor(c), LcxxMutexFor(gm));
+}
+extern "C" void* wrap_lcxx_cv_dtor(void* c) {
+    pthread_mutex_lock(&g_lcxxSideLock);
+    auto it = g_lcxxConds.find(c);
+    if (it != g_lcxxConds.end()) { pthread_cond_destroy(it->second); free(it->second); g_lcxxConds.erase(it); }
+    pthread_mutex_unlock(&g_lcxxSideLock);
+    return c;
+}
+extern "C" void wrap_lcxx_thread_join(void* t) {
+    pthread_t h = *(pthread_t*)t;
+    if (h) { pthread_join(h, nullptr); *(pthread_t*)t = 0; }
+}
+extern "C" void* wrap_lcxx_thread_dtor(void* t) {
+    pthread_t h = *(pthread_t*)t;
+    if (h) { pthread_detach(h); *(pthread_t*)t = 0; }
+    return t;
+}
+extern "C" unsigned wrap_lcxx_thread_hw_concurrency() {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (unsigned)n : 1u;
+}
+extern "C" void wrap_lcxx_sleep_for(const long long* ns) {
+    if (!ns) return;
+    long long v = *ns;
+    if (v <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = (time_t)(v / 1000000000LL);
+    ts.tv_nsec = (long)(v % 1000000000LL);
+    nanosleep(&ts, nullptr);
+}
+extern "C" void* wrap_lcxx_thread_struct_ctor(void* p) { if (p) *(uint32_t*)p = 0; return p; }
+extern "C" void* wrap_lcxx_thread_struct_dtor(void* p) { return p; }
+
+static pthread_key_t g_lcxxTlsKey;
+static uint32_t g_lcxxTlsPtrObj = 0;      // __thread_specific_ptr<> == { pthread_key_t }
+static pthread_once_t g_lcxxTlsOnce = PTHREAD_ONCE_INIT;
+static void LcxxTlsInit() { pthread_key_create(&g_lcxxTlsKey, nullptr); g_lcxxTlsPtrObj = (uint32_t)g_lcxxTlsKey; }
+extern "C" void* wrap_lcxx_thread_local_data() {
+    pthread_once(&g_lcxxTlsOnce, LcxxTlsInit);
+    return &g_lcxxTlsPtrObj;
+}
+
+// --- libc++: __shared_weak_count ---
+struct LcxxSWC { void** vptr; int32_t shared_owners; int32_t weak_owners; };
+extern "C" void wrap_lcxx_swc_add_shared(void* p) {
+    if (p) __sync_fetch_and_add(&((LcxxSWC*)p)->shared_owners, 1);
+}
+extern "C" void wrap_lcxx_swc_release_shared(void* p) {
+    if (!p) return;
+    LcxxSWC* c = (LcxxSWC*)p;
+    typedef void (*Fn)(void*);
+    if (__sync_fetch_and_add(&c->shared_owners, -1) == 0) {
+        void** vt = c->vptr;
+        if (vt && vt[2]) ((Fn)vt[2])(p);           // __on_zero_shared
+        if (__sync_fetch_and_add(&c->weak_owners, -1) == 0) {
+            vt = c->vptr;
+            if (vt && vt[3]) ((Fn)vt[3])(p);       // __on_zero_shared_weak
+        }
+    }
+}
+extern "C" void* wrap_lcxx_swc_dtor(void* p) { return p; }
+extern "C" const void* wrap_lcxx_swc_get_deleter(const void* p, const void* ti) { (void)p; (void)ti; return nullptr; }
+
+extern "C" size_t wrap_lcxx_next_prime(size_t n) {
+    if (n <= 2) return 2;
+    for (size_t x = n | 1; ; x += 2) {
+        bool prime = true;
+        for (size_t d = 3; d * d <= x; d += 2) if (x % d == 0) { prime = false; break; }
+        if (prime) return x;
+    }
+}
+extern "C" void wrap_lcxx_throw_length_error(void* self) {
+    (void)self;
+    LogToJava("C++ EXCEPTION (libc++): length_error");
+    wrap_abort();
+}
+extern "C" void wrap_lcxx_throw_system_error(int ev, const char* what) {
+    LogToJava(std::string("C++ EXCEPTION (libc++): system_error ") + std::to_string(ev) + " " + (what ? what : ""));
+    wrap_abort();
+}
+extern "C" const char* wrap_lcxx_exception_what(void* self) { (void)self; return "std::exception"; }
+extern "C" void* wrap_lcxx_exception_dtor(void* self) { return self; }
+
+// --- libc++: locale + фиктивный ctype<char> ---
+// Гость инлайнит ctype<char>::is()/widen(), поэтому фасету нужны и таблица масок
+// в раскладке Darwin, и настоящая таблица виртуальных функций.
+static unsigned long g_lcxxCtypeTab[256];
+static void* g_lcxxCtypeVT[16];
+static uint32_t g_lcxxCtypeObj[4];        // facet{vptr,shared} + __tab_ + __del_
+uint32_t hle_lcxx_ctype_char_id[4] = {0, 0, 0, 0};
+static uint32_t g_lcxxLocaleImp = 0;
+
+extern "C" void* wrap_lcxx_ctype_dtor(void* p) { return p; }
+extern "C" void wrap_lcxx_ctype_on_zero(void* p) { (void)p; }
+extern "C" char wrap_lcxx_ctype_do_toupper(void* p, char c) { (void)p; return (char)toupper((unsigned char)c); }
+extern "C" const char* wrap_lcxx_ctype_do_toupper_r(void* p, char* lo, const char* hi) {
+    (void)p; for (; lo < hi; ++lo) *lo = (char)toupper((unsigned char)*lo); return hi;
+}
+extern "C" char wrap_lcxx_ctype_do_tolower(void* p, char c) { (void)p; return (char)tolower((unsigned char)c); }
+extern "C" const char* wrap_lcxx_ctype_do_tolower_r(void* p, char* lo, const char* hi) {
+    (void)p; for (; lo < hi; ++lo) *lo = (char)tolower((unsigned char)*lo); return hi;
+}
+extern "C" char wrap_lcxx_ctype_do_widen(void* p, char c) { (void)p; return c; }
+extern "C" const char* wrap_lcxx_ctype_do_widen_r(void* p, const char* lo, const char* hi, char* dst) {
+    (void)p; while (lo != hi) *dst++ = *lo++; return hi;
+}
+extern "C" char wrap_lcxx_ctype_do_narrow(void* p, char c, char dflt) { (void)p; (void)dflt; return c; }
+extern "C" const char* wrap_lcxx_ctype_do_narrow_r(void* p, const char* lo, const char* hi, char dflt, char* dst) {
+    (void)p; (void)dflt; while (lo != hi) *dst++ = *lo++; return hi;
+}
+
+static void LcxxCtypeInit() {
+    // Значения масок взяты из <ctype.h> Darwin: гость сравнивает именно с ними.
+    const unsigned long A = 0x00000100, C = 0x00000200, D = 0x00000400, G = 0x00000800,
+                        L = 0x00001000, P = 0x00002000, S = 0x00004000, U = 0x00008000,
+                        X = 0x00010000, B = 0x00020000, R = 0x00040000;
+    for (int i = 0; i < 256; ++i) {
+        unsigned long m = 0;
+        if (isalpha(i)) m |= A;
+        if (iscntrl(i)) m |= C;
+        if (isdigit(i)) m |= D;
+        if (isgraph(i)) m |= G;
+        if (islower(i)) m |= L;
+        if (ispunct(i)) m |= P;
+        if (isspace(i)) m |= S;
+        if (isupper(i)) m |= U;
+        if (isxdigit(i)) m |= X;
+        if (i == ' ' || i == '\t') m |= B;
+        if (isprint(i)) m |= R;
+        g_lcxxCtypeTab[i] = m;
+    }
+    g_lcxxCtypeVT[0] = (void*)wrap_lcxx_ctype_dtor;
+    g_lcxxCtypeVT[1] = (void*)wrap_lcxx_ctype_dtor;
+    g_lcxxCtypeVT[2] = (void*)wrap_lcxx_ctype_on_zero;
+    g_lcxxCtypeVT[3] = (void*)wrap_lcxx_ctype_do_toupper;
+    g_lcxxCtypeVT[4] = (void*)wrap_lcxx_ctype_do_toupper_r;
+    g_lcxxCtypeVT[5] = (void*)wrap_lcxx_ctype_do_tolower;
+    g_lcxxCtypeVT[6] = (void*)wrap_lcxx_ctype_do_tolower_r;
+    g_lcxxCtypeVT[7] = (void*)wrap_lcxx_ctype_do_widen;
+    g_lcxxCtypeVT[8] = (void*)wrap_lcxx_ctype_do_widen_r;
+    g_lcxxCtypeVT[9] = (void*)wrap_lcxx_ctype_do_narrow;
+    g_lcxxCtypeVT[10] = (void*)wrap_lcxx_ctype_do_narrow_r;
+    g_lcxxCtypeObj[0] = (uint32_t)(uintptr_t)&g_lcxxCtypeVT[0];
+    g_lcxxCtypeObj[1] = 0x40000000;     // счётчик ссылок: фасет не должен освободиться
+    g_lcxxCtypeObj[2] = (uint32_t)(uintptr_t)&g_lcxxCtypeTab[0];
+    g_lcxxCtypeObj[3] = 0;
+}
+extern "C" void* wrap_lcxx_use_facet(const void* loc, const void* id) {
+    (void)loc; (void)id;
+    if (!g_lcxxCtypeObj[0]) LcxxCtypeInit();
+    return &g_lcxxCtypeObj[0];
+}
+extern "C" void* wrap_lcxx_locale_dtor(void* p) { return p; }
+
+// --- libc++: iostreams ---
+// Раскладка ios_base из libc++ (18 слов), basic_ios добавляет __tie_ (+72) и __fill_ (+76).
+struct LcxxIosBase {
+    void* vptr; uint32_t fmtflags; int32_t precision; int32_t width;
+    uint32_t rdstate; uint32_t exceptions; void* rdbuf; void* loc;
+    void* fn; void* index; uint32_t event_size; uint32_t event_cap;
+    void* iarray; uint32_t iarray_size; uint32_t iarray_cap;
+    void* parray; uint32_t parray_size; uint32_t parray_cap;
+};
+static const uint32_t LCXX_BADBIT = 1;
+static const uint32_t LCXX_FAILBIT = 4;
+static const uint32_t LCXX_DEC = 0x0002, LCXX_HEX = 0x0008, LCXX_LEFT = 0x0020,
+                      LCXX_OCT = 0x0040, LCXX_SHOWBASE = 0x0200, LCXX_SHOWPOS = 0x0800,
+                      LCXX_SKIPWS = 0x1000, LCXX_UPPERCASE = 0x4000, LCXX_BOOLALPHA = 0x0001;
+
+// basic_ios — виртуальная база; её смещение лежит в таблице по [vptr-12].
+static LcxxIosBase* LcxxIosOf(void* stream) {
+    if (!stream) return nullptr;
+    char* vptr = *(char**)stream;
+    if (!vptr) return nullptr;
+    int32_t off = *(int32_t*)(vptr - 12);
+    return (LcxxIosBase*)((char*)stream + off);
+}
+
+struct LcxxStreambuf {
+    void** vptr; void* loc;
+    char *binp, *ninp, *einp;
+    char *bout, *nout, *eout;
+};
+static void* g_lcxxStreambufVT[16];
+
+extern "C" void* wrap_lcxx_sb_dtor(void* p) { return p; }
+extern "C" void wrap_lcxx_sb_imbue(void* p, const void* loc) { (void)p; (void)loc; }
+extern "C" void* wrap_lcxx_sb_setbuf(void* p, char* s, int n) { (void)s; (void)n; return p; }
+extern "C" void* wrap_lcxx_sb_seekoff(void* ret, void* p, long long off, int way, int which) {
+    (void)p; (void)off; (void)way; (void)which;
+    memset(ret, 0, 136); *(long long*)((char*)ret + 128) = -1;
+    return ret;
+}
+extern "C" void* wrap_lcxx_sb_seekpos(void* ret, void* p, void* pos, int which) {
+    (void)p; (void)pos; (void)which;
+    memset(ret, 0, 136); *(long long*)((char*)ret + 128) = -1;
+    return ret;
+}
+extern "C" int wrap_lcxx_sb_sync(void* p) { (void)p; return 0; }
+extern "C" int wrap_lcxx_sb_showmanyc(void* p) { (void)p; return 0; }
+extern "C" int wrap_lcxx_sb_underflow(void* p) { (void)p; return -1; }
+extern "C" int wrap_lcxx_sb_pbackfail(void* p, int c) { (void)p; (void)c; return -1; }
+extern "C" int wrap_lcxx_sb_overflow(void* p, int c) { (void)p; (void)c; return -1; }
+extern "C" int wrap_lcxx_sb_uflow(void* p) {
+    LcxxStreambuf* sb = (LcxxStreambuf*)p;
+    typedef int (*Fn)(void*);
+    void** vt = sb->vptr;
+    if (!vt || !vt[9]) return -1;
+    if (((Fn)vt[9])(p) == -1) return -1;
+    return (unsigned char)*sb->ninp++;
+}
+extern "C" int wrap_lcxx_sb_xsgetn(void* p, char* s, int n) {
+    LcxxStreambuf* sb = (LcxxStreambuf*)p;
+    void** vt = sb->vptr;
+    typedef int (*Fn)(void*);
+    int i = 0;
+    while (i < n) {
+        if (sb->ninp < sb->einp) {
+            int len = (int)(sb->einp - sb->ninp);
+            if (len > n - i) len = n - i;
+            memcpy(s, sb->ninp, len);
+            s += len; i += len; sb->ninp += len;
+        } else {
+            if (!vt || !vt[10]) break;
+            int c = ((Fn)vt[10])(p);
+            if (c == -1) break;
+            *s++ = (char)c; ++i;
+        }
+    }
+    return i;
+}
+extern "C" int wrap_lcxx_sb_xsputn(void* p, const char* s, int n) {
+    LcxxStreambuf* sb = (LcxxStreambuf*)p;
+    void** vt = sb->vptr;
+    typedef int (*Fn2)(void*, int);
+    int i = 0;
+    while (i < n) {
+        if (sb->nout >= sb->eout) {
+            if (!vt || !vt[13]) break;
+            if (((Fn2)vt[13])(p, (unsigned char)*s) == -1) break;
+            ++s; ++i;
+        } else {
+            int len = (int)(sb->eout - sb->nout);
+            if (len > n - i) len = n - i;
+            memcpy(sb->nout, s, len);
+            s += len; i += len; sb->nout += len;
+        }
+    }
+    return i;
+}
+extern "C" void* wrap_lcxx_sb_ctor(void* p) {
+    if (!g_lcxxStreambufVT[6]) {
+        g_lcxxStreambufVT[0] = (void*)wrap_lcxx_sb_dtor;
+        g_lcxxStreambufVT[1] = (void*)wrap_lcxx_sb_dtor;
+        g_lcxxStreambufVT[2] = (void*)wrap_lcxx_sb_imbue;
+        g_lcxxStreambufVT[3] = (void*)wrap_lcxx_sb_setbuf;
+        g_lcxxStreambufVT[4] = (void*)wrap_lcxx_sb_seekoff;
+        g_lcxxStreambufVT[5] = (void*)wrap_lcxx_sb_seekpos;
+        g_lcxxStreambufVT[6] = (void*)wrap_lcxx_sb_sync;
+        g_lcxxStreambufVT[7] = (void*)wrap_lcxx_sb_showmanyc;
+        g_lcxxStreambufVT[8] = (void*)wrap_lcxx_sb_xsgetn;
+        g_lcxxStreambufVT[9] = (void*)wrap_lcxx_sb_underflow;
+        g_lcxxStreambufVT[10] = (void*)wrap_lcxx_sb_uflow;
+        g_lcxxStreambufVT[11] = (void*)wrap_lcxx_sb_pbackfail;
+        g_lcxxStreambufVT[12] = (void*)wrap_lcxx_sb_xsputn;
+        g_lcxxStreambufVT[13] = (void*)wrap_lcxx_sb_overflow;
+    }
+    memset(p, 0, sizeof(LcxxStreambuf));
+    ((LcxxStreambuf*)p)->vptr = &g_lcxxStreambufVT[0];
+    return p;
+}
+
+extern "C" void wrap_lcxx_ios_base_init(void* p, void* sb) {
+    LcxxIosBase* io = (LcxxIosBase*)p;
+    memset((char*)io + 4, 0, sizeof(LcxxIosBase) - 4);
+    io->rdbuf = sb;
+    io->rdstate = sb ? 0 : LCXX_BADBIT;
+    io->fmtflags = LCXX_SKIPWS | LCXX_DEC;
+    io->precision = 6;
+    io->loc = &g_lcxxLocaleImp;
+}
+extern "C" void wrap_lcxx_ios_base_clear(void* p, uint32_t state) {
+    LcxxIosBase* io = (LcxxIosBase*)p;
+    io->rdstate = io->rdbuf ? state : (state | LCXX_BADBIT);
+}
+extern "C" void wrap_lcxx_ios_base_set_badbit(void* p) {
+    ((LcxxIosBase*)p)->rdstate |= LCXX_BADBIT;
+}
+extern "C" void* wrap_lcxx_ios_base_getloc(void* ret, void* p) {
+    (void)p;
+    *(void**)ret = &g_lcxxLocaleImp;
+    return ret;
+}
+extern "C" void* wrap_lcxx_basic_ios_dtor(void* p) { return p; }
+
+static void LcxxOsPut(void* os, const char* s, size_t n) {
+    LcxxIosBase* io = LcxxIosOf(os);
+    if (!io) return;
+    void* sb = io->rdbuf;
+    if (!sb) { io->rdstate |= LCXX_BADBIT; return; }
+    void** vt = *(void***)sb;
+    typedef int (*Fn)(void*, const char*, int);
+    if (!vt || !vt[12]) return;
+    int pad = (io->width > (int)n) ? (io->width - (int)n) : 0;
+    char fill = *((char*)io + 76);
+    if (!fill) fill = ' ';
+    bool left = (io->fmtflags & LCXX_LEFT) != 0;
+    char padbuf[64];
+    if (pad && !left) { int r = pad; while (r > 0) { int k = r > 64 ? 64 : r; memset(padbuf, fill, k); ((Fn)vt[12])(sb, padbuf, k); r -= k; } }
+    ((Fn)vt[12])(sb, s, (int)n);
+    if (pad && left) { int r = pad; while (r > 0) { int k = r > 64 ? 64 : r; memset(padbuf, fill, k); ((Fn)vt[12])(sb, padbuf, k); r -= k; } }
+    io->width = 0;
+}
+static void LcxxOsNum(void* os, long long v, unsigned long long uv, bool sgn) {
+    LcxxIosBase* io = LcxxIosOf(os);
+    uint32_t f = io ? io->fmtflags : LCXX_DEC;
+    char buf[80];
+    int n;
+    if (f & LCXX_HEX)
+        n = snprintf(buf, sizeof(buf), (f & LCXX_SHOWBASE) ? ((f & LCXX_UPPERCASE) ? "0X%llX" : "0x%llx")
+                                                           : ((f & LCXX_UPPERCASE) ? "%llX" : "%llx"), uv);
+    else if (f & LCXX_OCT)
+        n = snprintf(buf, sizeof(buf), (f & LCXX_SHOWBASE) ? "0%llo" : "%llo", uv);
+    else if (sgn)
+        n = snprintf(buf, sizeof(buf), ((f & LCXX_SHOWPOS) && v >= 0) ? "+%lld" : "%lld", v);
+    else
+        n = snprintf(buf, sizeof(buf), "%llu", uv);
+    if (n > 0) LcxxOsPut(os, buf, (size_t)n);
+}
+extern "C" void* wrap_lcxx_os_ls_bool(void* os, bool v) {
+    LcxxIosBase* io = LcxxIosOf(os);
+    if (io && (io->fmtflags & LCXX_BOOLALPHA)) { const char* s = v ? "true" : "false"; LcxxOsPut(os, s, strlen(s)); }
+    else LcxxOsNum(os, v ? 1 : 0, v ? 1 : 0, true);
+    return os;
+}
+extern "C" void* wrap_lcxx_os_ls_int(void* os, int v) { LcxxOsNum(os, v, (unsigned long long)(unsigned int)v, true); return os; }
+extern "C" void* wrap_lcxx_os_ls_uint(void* os, unsigned v) { LcxxOsNum(os, v, v, false); return os; }
+extern "C" void* wrap_lcxx_os_ls_ulong(void* os, unsigned long v) { LcxxOsNum(os, (long long)v, v, false); return os; }
+extern "C" void* wrap_lcxx_os_ls_short(void* os, short v) { LcxxOsNum(os, v, (unsigned long long)(unsigned short)v, true); return os; }
+extern "C" void* wrap_lcxx_os_ls_longlong(void* os, long long v) { LcxxOsNum(os, v, (unsigned long long)v, true); return os; }
+extern "C" void* wrap_lcxx_os_ls_double(void* os, double v) {
+    LcxxIosBase* io = LcxxIosOf(os);
+    int prec = io ? io->precision : 6;
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%.*g", prec > 0 ? prec : 6, v);
+    if (n > 0) LcxxOsPut(os, buf, (size_t)n);
+    return os;
+}
+extern "C" void* wrap_lcxx_os_ls_float(void* os, float v) { return wrap_lcxx_os_ls_double(os, (double)v); }
+
+extern "C" void* wrap_lcxx_os_sentry_ctor(void* s, void* os) {
+    LcxxIosBase* io = LcxxIosOf(os);
+    *(uint8_t*)s = (io && io->rdstate == 0) ? 1 : 0;
+    *(void**)((char*)s + 4) = os;
+    return s;
+}
+extern "C" void* wrap_lcxx_os_sentry_dtor(void* s) { return s; }
+extern "C" void* wrap_lcxx_is_sentry_ctor(void* s, void* is, bool noskipws) {
+    (void)noskipws;
+    LcxxIosBase* io = LcxxIosOf(is);
+    bool ok = (io && io->rdstate == 0);
+    // Поток уже не good — sentry обязана выставить failbit, иначе вызывающий
+    // цикл (например, while (getline(...))) никогда не увидит конца потока.
+    if (io && !ok) io->rdstate |= LCXX_FAILBIT;
+    *(uint8_t*)s = ok ? 1 : 0;
+    return s;
+}
+// Деструкторы потоков в libc++ пустые; работу делает только удаляющий вариант (D0).
+extern "C" void* wrap_lcxx_stream_dtor(void* p) { return p; }
+extern "C" void wrap_lcxx_stream_dtor_del(void* p) { if (p) wrap_free(p); }
+// В thunk-варианте адрес полного объекта не восстановить — освобождать нечего.
+extern "C" void wrap_lcxx_stream_thunk_dtor_del(void* p) { (void)p; }
+
+// --- прочие импорты, появившиеся в 0.7.3.0 ---
+void* hle_lcxx_stdinp_ptr = nullptr;
+extern "C" int wrap_lcxx_divmodsi4(int a, int b, int* rem) {
+    if (b == 0) { if (rem) *rem = 0; return 0; }
+    int q = a / b;
+    if (rem) *rem = a - q * b;
+    return q;
+}
+extern "C" void* wrap_lcxx_signal(int sig, void* handler) { (void)sig; (void)handler; return nullptr; }
+extern "C" void* wrap_lcxx_gmtime(const time_t* t) { return t ? (void*)gmtime(t) : nullptr; }
+struct LcxxTimeb { time_t time; unsigned short millitm; short timezone; short dstflag; };
+extern "C" void wrap_lcxx_ftime(void* tp) {
+    if (!tp) return;
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    LcxxTimeb* b = (LcxxTimeb*)tp;
+    b->time = tv.tv_sec;
+    b->millitm = (unsigned short)(tv.tv_usec / 1000);
+    b->timezone = 0;
+    b->dstflag = 0;
+}
+extern "C" int wrap_lcxx_pthread_condattr_init(void* a) { (void)a; return 0; }
+extern "C" int wrap_lcxx_pthread_condattr_destroy(void* a) { (void)a; return 0; }
+extern "C" int wrap_lcxx_pthread_attr_setschedparam(void* a, const void* p) { (void)a; (void)p; return 0; }
+extern "C" int wrap_lcxx_deflateInit_(z_streamp strm, int level, const char* version, int stream_size) {
+    return deflateInit_(strm, level, version, stream_size);
+}
+extern "C" void* wrap_lcxx_new_nothrow(size_t n, const void* nt) { (void)nt; return wrap_malloc(n); }
+extern "C" int wrap_lcxx_cxa_atexit(void* f, void* arg, void* dso) { (void)f; (void)arg; (void)dso; return 0; }
+extern "C" void wrap_lcxx_cxa_end_catch() {}
+extern "C" void wrap_lcxx_cxa_guard_abort(void* g) { if (g) *(uint32_t*)g = 0; }
+extern "C" void wrap_lcxx_objc_end_catch() {}
 
 // --- HLE std::stringstream ---
 // В libstdc++ гостя istream-подобъект лежит по базе объекта, ostream-подобъект по базе+8,
