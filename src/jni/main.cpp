@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <vector>
 #include <string>
+#include <mutex>
 #include <fstream>
 #include <sstream>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include <fnmatch.h>
 #include <unwind.h>
 #include <zlib.h>
+#include "symbolizer.h"
 
 // Подключение stb_truetype
 #define STB_TRUETYPE_IMPLEMENTATION
@@ -182,6 +184,18 @@ struct UITextCache {
 // --- RENDERER STATE ---
 ANativeWindow* g_nativeWindow = nullptr;
 std::vector<uint32_t> g_cpuColorBuffer;
+
+struct VertexAttribState {
+    GLint enabled = 0;
+    GLint size = 4;
+    GLenum type = GL_FLOAT;
+    GLsizei stride = 0;
+    GLboolean normalized = GL_FALSE;
+    const GLvoid* pointer = nullptr;
+    GLuint vbo = 0;
+    float constantValue[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // Белый по умолчанию, чтобы текстуры не умножались на ноль
+};
+VertexAttribState g_vertexAttribs[16];
 std::vector<float> g_cpuDepthBuffer;
 float g_cpuClearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 std::map<GLuint, std::map<std::string, GLuint>> g_attribLocations;
@@ -226,6 +240,7 @@ std::vector<std::vector<std::vector<float>>> g_paletteStacks(32, std::vector<std
 
 GLenum g_alphaFunc = GL_ALWAYS;
 GLclampf g_alphaRef = 0.0f;
+bool g_alphaTestEnabled = false;
 GLenum g_shadeModel = GL_SMOOTH;
 bool g_blendEnabled = false;
 GLenum g_depthFunc = 0x0201; // GL_LESS
@@ -450,6 +465,14 @@ struct HLEUIView {
     bool exclusiveTouch = false; int lineBreakMode = 0; void* font = nullptr; void* uiColorObj = nullptr;
 };
 std::map<void*, HLEUIView> g_views;
+// Дерево видов строит игровой поток, а рисует его поток GL — без этого замка
+// обход в рендере наталкивается на реаллокацию children посреди reloadData.
+std::recursive_mutex g_uiTreeMutex;
+volatile int g_dbgReloadCount = 0, g_dbgSections = 0, g_dbgRows = 0, g_dbgCellsAdded = 0, g_dbgRawSections = -1, g_dbgHasSecIMP = -1;   // ВРЕМЕННЫЕ
+void* g_dbgReloadSelf = nullptr; void* g_dbgReloadDs = nullptr; void* g_dbgLastCell = nullptr;
+struct HLESlider { float minValue = 0.0f, maxValue = 1.0f, value = 0.0f; };
+std::map<void*, HLESlider> g_sliders;
+std::map<void*, std::string> g_barItemTitles;   // UINavigationItem / UIBarButtonItem -> подпись
 std::map<void*, void*> g_viewControllersViews;
 std::map<void*, HLEColor> g_uiColors;
 std::map<void*, void*> g_layerDrawableProperties;
@@ -457,12 +480,17 @@ std::map<int, void*> g_pointerToUI;
 
 void* g_mainView = nullptr;
 void* g_presentedView = nullptr;
+std::vector<void*> g_modalStack;   // модалки складываются стопкой, как в UIKit
+std::vector<void*> g_modalPresenters;          // кто показал каждую модалку
+std::map<void*, void*> g_presentedByVC;        // контроллер -> его текущая модалка
 void* g_accelerometerDelegate = nullptr;
 
 // File System & Foundation HLE State
 std::string g_sandboxDir;
 std::string g_appBundlePath;
 std::string g_execPath;
+std::map<void*, std::string> g_bundlePaths;   // NSBundle -> корень бандла
+std::map<void*, std::string> g_nibNames;      // UINib / UIViewController -> имя nib-а
 std::map<void*, std::vector<void*>> g_arrays;
 std::map<void*, std::map<std::string, void*>> g_dictionariesHLE;
 std::map<std::string, void*> g_userDefaults; // Простейшее хранилище UserDefaults
@@ -1195,12 +1223,46 @@ void CrashHandler(int sig, siginfo_t *info, void *context) {
         return res;
     };
 
+    // Пред-проход символайзера: собираем адреса всех кадров и разрешаем их в
+    // "файл:строка" одним проходом по .debug_line (иначе проход на каждый адрес).
+    void* unwind_buf[64];
+    int unwind_count = 0;
+    {
+        BacktraceState st = {unwind_buf, unwind_buf + 64};
+        _Unwind_Backtrace(UnwindCallback, &st);
+        unwind_count = (int)(st.current - unwind_buf);
+    }
+    SymInit();
+    SymBatchReset();
+    SymBatchAdd(pc, false);
+    SymBatchAdd(lr, true);
+    for (int i = 0; i < unwind_count; i++) SymBatchAdd((uintptr_t)unwind_buf[i], i > 0);
+    {
+        uint32_t walk_fp = fp;
+        for (int d = 0; d < 20 && walk_fp >= 0x1000 && walk_fp % 4 == 0; d++) {
+            uint32_t next_fp = 0, ret_addr = 0;
+            if (!SafeRead32(walk_fp, &next_fp) || !SafeRead32(walk_fp + 4, &ret_addr)) break;
+            SymBatchAdd(ret_addr, true);
+            walk_fp = next_fp;
+        }
+        uint32_t* stk = (uint32_t*)sp;
+        if ((uintptr_t)stk > 0x1000 && (uintptr_t)stk % 4 == 0) {
+            for (int i = 0; i < 128; i++) {
+                uint32_t v = 0;
+                if (!SafeRead32((uintptr_t)(stk + i), &v)) break;
+                SymBatchAdd(v, true);
+            }
+        }
+    }
+    SymBatchResolve();
+
     append("\n==================================================\n!!! FATAL NATIVE CRASH !!!\nSignal: %d\nThread ID: %ld\nFault Address: 0x%08x%s\n", sig, (long)pthread_self(), fault_addr, fault_addr < 0x1000 ? " -> [Null Pointer Dereference]" : "");
     append("Fault Memory Area: %s\n", GetModuleInfoForAddress(fault_addr).c_str());
+    append("Symbolizer: %s\n", SymStatus());
 
 #if defined(__arm__)
     if (uc) {
-        append("Crash Module: %s\nLR Module: %s\n\n", GetModuleInfoForAddress(pc).c_str(), GetModuleInfoForAddress(lr).c_str());
+        append("Crash Module: %s%s\nLR Module: %s%s\n\n", GetModuleInfoForAddress(pc).c_str(), SymSuffix(pc, false), GetModuleInfoForAddress(lr).c_str(), SymSuffix(lr, true));
         
         append("Dumping registers for current thread:\n");
         for (int i = 0; i < 16; i++) {
@@ -1248,7 +1310,7 @@ void CrashHandler(int sig, siginfo_t *info, void *context) {
                 if (val > 0x10000) {
                     std::string mod = GetModuleInfoForAddress(val);
                     if (mod != "Unknown Module / Heap" || !probe.empty()) {
-                        append("0x%08x: 0x%08x -> %s%s\n", (uint32_t)sp_ptr, val, mod.c_str(), probe.c_str());
+                        append("0x%08x: 0x%08x -> %s%s%s\n", (uint32_t)sp_ptr, val, mod.c_str(), probe.c_str(), SymSuffix(val, true));
                     } else {
                         append("0x%08x: 0x%08x\n", (uint32_t)sp_ptr, val);
                     }
@@ -1262,8 +1324,8 @@ void CrashHandler(int sig, siginfo_t *info, void *context) {
         }
 
         append("\nAttempting to produce stack trace (Frame Pointer walk):\n");
-        append(" 0. 0x%08x (PC) -> %s\n", pc, GetModuleInfoForAddress(pc).c_str());
-        append(" 1. 0x%08x (LR) -> %s\n", lr, GetModuleInfoForAddress(lr).c_str());
+        append(" 0. 0x%08x (PC) -> %s%s\n", pc, GetModuleInfoForAddress(pc).c_str(), SymSuffix(pc, false));
+        append(" 1. 0x%08x (LR) -> %s%s\n", lr, GetModuleInfoForAddress(lr).c_str(), SymSuffix(lr, true));
         
         uint32_t current_fp = fp;
         int depth = 2;
@@ -1279,19 +1341,15 @@ void CrashHandler(int sig, siginfo_t *info, void *context) {
                 break;
             }
             
-            append("%2d. 0x%08x -> %s\n", depth, ret_addr, GetModuleInfoForAddress(ret_addr).c_str());
+            append("%2d. 0x%08x -> %s%s\n", depth, ret_addr, GetModuleInfoForAddress(ret_addr).c_str(), SymSuffix(ret_addr, true));
             current_fp = next_fp;
             depth++;
         }
 
         append("\nAndroid Unwind Native Backtrace (Accurate C++ Stack):\n");
-        void* buffer[64];
-        BacktraceState state = {buffer, buffer + 64};
-        _Unwind_Backtrace(UnwindCallback, &state);
-        int count = state.current - buffer;
-        for (int i = 0; i < count; i++) {
-            uintptr_t u_pc = (uintptr_t)buffer[i];
-            append(" %2d. 0x%08x -> %s\n", i, (uint32_t)u_pc, GetModuleInfoForAddress(u_pc).c_str());
+        for (int i = 0; i < unwind_count; i++) {
+            uintptr_t u_pc = (uintptr_t)unwind_buf[i];
+            append(" %2d. 0x%08x -> %s%s\n", i, (uint32_t)u_pc, GetModuleInfoForAddress(u_pc).c_str(), SymSuffix(u_pc, i > 0));
         }
 
     }
@@ -1507,6 +1565,7 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
     }
 }
 
+
 extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     bool isSpamOn = (g_spamFiltersMask & (1 << 5)) != 0;
     static int swap_cnt = 0; swap_cnt++;
@@ -1681,7 +1740,9 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
     EGLBoolean res = EGL_TRUE;
     if (g_gpuOffloadMask & 1) {
         // --- GPU ОВЕРЛЕИ ---
-        if (g_onScreenDebugOverlay || g_showPerfOverlay) {
+        // Модальные экраны UIKit живут только в CPU-буфере. Без этой заливки
+        // они не попадают на экран вообще, пока не включён debug/FPS-оверлей.
+        if (g_onScreenDebugOverlay || g_showPerfOverlay || g_presentedView) {
             static GLuint overlayTex = 0;
             static GLuint overlayProg = 0;
             if (overlayTex == 0) {
@@ -1699,12 +1760,16 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
                 overlayProg = glCreateProgram(); glAttachShader(overlayProg, vsh); glAttachShader(overlayProg, fsh);
                 glBindAttribLocation(overlayProg, 0, "pos"); glBindAttribLocation(overlayProg, 1, "uv");
                 glLinkProgram(overlayProg);
+
             }
             
             GLint oldProg; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg);
-            GLint oldTex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
             GLint oldActiveTex; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex);
             GLint oldArrayBuf; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &oldArrayBuf);
+            // Оверлей рисует на юните 0, поэтому запоминать надо привязку именно юнита 0,
+            // а не того, который игра оставила активным.
+            glActiveTexture(GL_TEXTURE0);
+            GLint oldTex0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex0);
             GLboolean blendEnabled = glIsEnabled(GL_BLEND);
             GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
             GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
@@ -1735,13 +1800,23 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
             glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            glDisableVertexAttribArray(0);
-            glDisableVertexAttribArray(1);
-            
+            // Возвращаем массивы 0 и 1 ровно как их выставила игра. Раньше их просто
+            // выключали, а указатели оставались смотреть на стек этой функции — игры,
+            // которые задают состояние один раз при старте, после первого кадра
+            // переставали рисовать что-либо.
+            for (GLuint i = 0; i < 2; i++) {
+                const VertexAttribState& a = g_vertexAttribs[i];
+                glBindBuffer(GL_ARRAY_BUFFER, a.vbo);
+                glVertexAttribPointer(i, a.size, a.type, a.normalized, a.stride, a.pointer);
+                if (a.enabled) glEnableVertexAttribArray(i);
+                else glDisableVertexAttribArray(i);
+            }
+
             glUseProgram(oldProg);
+            glBindTexture(GL_TEXTURE_2D, oldTex0);
             glActiveTexture(oldActiveTex);
-            glBindTexture(GL_TEXTURE_2D, oldTex);
             glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
+            glBlendFunc(g_blendSrc, g_blendDst);
             if (!blendEnabled) glDisable(GL_BLEND);
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
@@ -1868,17 +1943,6 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
 
 std::map<GLenum, GLuint> g_boundBuffers;
 
-struct VertexAttribState {
-    GLint enabled = 0;
-    GLint size = 4;
-    GLenum type = GL_FLOAT;
-    GLsizei stride = 0;
-    const GLvoid* pointer = nullptr;
-    GLuint vbo = 0;
-    float constantValue[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // ИСПРАВЛЕНО: Белый цвет по умолчанию, чтобы текстуры не умножались на ноль
-};
-VertexAttribState g_vertexAttribs[16];
-
 GLuint g_vboIdCounter = 1;
 extern "C" void Stub_glGenBuffers(GLsizei n, GLuint *buffers) {
     for (int i = 0; i < n; i++) buffers[i] = g_vboIdCounter++;
@@ -1930,6 +1994,7 @@ extern "C" void Stub_glVertexAttribPointer(GLuint index, GLint size, GLenum type
         g_vertexAttribs[index].size = size;
         g_vertexAttribs[index].type = type;
         g_vertexAttribs[index].stride = stride;
+        g_vertexAttribs[index].normalized = normalized;
         g_vertexAttribs[index].pointer = pointer;
         g_vertexAttribs[index].vbo = g_boundBuffers[0x8892]; // Запоминаем текущий GL_ARRAY_BUFFER
     }
@@ -3313,6 +3378,146 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
 }
 
 
+// ==========================================
+// FIXED-FUNCTION ES 1.1 НА GPU
+// Игры эпохи 3.1.3 не создают шейдеров вообще, а в ES2-контексте без
+// привязанной программы glDraw* не рисует ничего. Подставляем свою программу,
+// повторяющую то, что делает CPUExtractAndDraw.
+// ==========================================
+static GLuint g_ffProgram = 0;
+static GLint g_ffLocMvp = -1, g_ffLocTexEnable = -1, g_ffLocTex = -1;
+static GLint g_ffLocConstColor = -1, g_ffLocUseColorArray = -1;
+static GLint g_ffLocAlphaFunc = -1, g_ffLocAlphaRef = -1;
+static GLint g_ffLocRot = -1, g_ffLocPointSize = -1;
+static bool g_ffFailed = false;
+
+static void MatMul4(const float* a, const float* b, float* out) {
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++)
+            out[c*4+r] = a[0*4+r]*b[c*4+0] + a[1*4+r]*b[c*4+1] + a[2*4+r]*b[c*4+2] + a[3*4+r]*b[c*4+3];
+}
+
+static bool EnsureFixedFunctionProgram() {
+    if (g_ffProgram != 0) return true;
+    if (g_ffFailed) return false;
+
+    const char* vs =
+        "attribute vec4 a_pos;\n"
+        "attribute vec4 a_color;\n"
+        "attribute vec2 a_uv;\n"
+        "uniform mat4 u_mvp;\n"
+        "uniform vec4 u_constColor;\n"
+        "uniform float u_useColorArray;\n"
+        "uniform float u_rot;\n"
+        "uniform float u_pointSize;\n"
+        "varying vec4 v_color;\n"
+        "varying vec2 v_uv;\n"
+        "void main() {\n"
+        "  v_color = mix(u_constColor, a_color, u_useColorArray);\n"
+        "  v_uv = a_uv;\n"
+        "  vec4 p = u_mvp * a_pos;\n"
+        "  if (u_rot > 0.5) p.xy = vec2(-p.y, p.x);\n"
+        "  gl_Position = p;\n"
+        "  gl_PointSize = u_pointSize;\n"
+        "}\n";
+    const char* fs =
+        "precision mediump float;\n"
+        "varying vec4 v_color;\n"
+        "varying vec2 v_uv;\n"
+        "uniform sampler2D u_tex;\n"
+        "uniform float u_texEnable;\n"
+        "uniform float u_alphaRef;\n"
+        "uniform int u_alphaFunc;\n"
+        "void main() {\n"
+        "  vec4 c = v_color;\n"
+        "  if (u_texEnable > 0.5) c *= texture2D(u_tex, v_uv);\n"
+        "  if (u_alphaFunc == 0) discard;\n"
+        "  else if (u_alphaFunc == 1 && !(c.a <  u_alphaRef)) discard;\n"
+        "  else if (u_alphaFunc == 2 && !(c.a == u_alphaRef)) discard;\n"
+        "  else if (u_alphaFunc == 3 && !(c.a <= u_alphaRef)) discard;\n"
+        "  else if (u_alphaFunc == 4 && !(c.a >  u_alphaRef)) discard;\n"
+        "  else if (u_alphaFunc == 5 && !(c.a != u_alphaRef)) discard;\n"
+        "  else if (u_alphaFunc == 6 && !(c.a >= u_alphaRef)) discard;\n"
+        "  gl_FragColor = c;\n"
+        "}\n";
+
+    GLuint vsh = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vsh, 1, &vs, nullptr); glCompileShader(vsh);
+    GLuint fsh = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fsh, 1, &fs, nullptr); glCompileShader(fsh);
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vsh); glAttachShader(prog, fsh);
+    glBindAttribLocation(prog, 0, "a_pos");   // соответствует glVertexPointer
+    glBindAttribLocation(prog, 1, "a_color"); // соответствует glColorPointer
+    glBindAttribLocation(prog, 2, "a_uv");    // соответствует glTexCoordPointer (юнит 0)
+    glLinkProgram(prog);
+
+    GLint linkOk = 0; glGetProgramiv(prog, GL_LINK_STATUS, &linkOk);
+    if (!linkOk) {
+        char info[512]; GLsizei n = 0;
+        glGetProgramInfoLog(prog, sizeof(info), &n, info);
+        SyncLog(std::string("[RENDER] FFP: не удалось слинковать программу: ") + info);
+        glDeleteProgram(prog); glDeleteShader(vsh); glDeleteShader(fsh);
+        g_ffFailed = true;
+        return false;
+    }
+    glDeleteShader(vsh); glDeleteShader(fsh);
+
+    g_ffProgram = prog;
+    g_ffLocMvp           = glGetUniformLocation(prog, "u_mvp");
+    g_ffLocTexEnable     = glGetUniformLocation(prog, "u_texEnable");
+    g_ffLocTex           = glGetUniformLocation(prog, "u_tex");
+    g_ffLocConstColor    = glGetUniformLocation(prog, "u_constColor");
+    g_ffLocUseColorArray = glGetUniformLocation(prog, "u_useColorArray");
+    g_ffLocAlphaFunc     = glGetUniformLocation(prog, "u_alphaFunc");
+    g_ffLocAlphaRef      = glGetUniformLocation(prog, "u_alphaRef");
+    g_ffLocRot           = glGetUniformLocation(prog, "u_rot");
+    g_ffLocPointSize     = glGetUniformLocation(prog, "u_pointSize");
+    SyncLog("[RENDER] FFP: программа эмуляции ES 1.1 готова, prog=" + std::to_string(prog)
+        + " loc mvp=" + std::to_string(g_ffLocMvp)
+        + " texEn=" + std::to_string(g_ffLocTexEnable)
+        + " tex=" + std::to_string(g_ffLocTex)
+        + " constColor=" + std::to_string(g_ffLocConstColor)
+        + " useColorArr=" + std::to_string(g_ffLocUseColorArray)
+        + " alphaFunc=" + std::to_string(g_ffLocAlphaFunc)
+        + " rot=" + std::to_string(g_ffLocRot));
+    return true;
+}
+
+// Возвращает true, если кадр рисуется нашей fixed-function программой.
+static bool ApplyFixedFunctionState(bool needRot) {
+    if (g_activeESVersion != 1) return false;
+
+    GLint curProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &curProg);
+    // Игра сама привязала шейдер — не вмешиваемся.
+    if (curProg != 0 && (GLuint)curProg != g_ffProgram) return false;
+    if (!EnsureFixedFunctionProgram()) return false;
+
+    glUseProgram(g_ffProgram);
+
+    float mvp[16];
+    MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), mvp);
+    glUniformMatrix4fv(g_ffLocMvp, 1, GL_FALSE, mvp);
+
+    bool useTex = g_texture2DEnabled && g_cpuActiveTexture != 0 && g_vertexAttribs[2].enabled;
+    glUniform1f(g_ffLocTexEnable, useTex ? 1.0f : 0.0f);
+    glUniform1i(g_ffLocTex, 0);
+
+    const float* cc = g_vertexAttribs[1].constantValue;
+    glUniform4f(g_ffLocConstColor, cc[0], cc[1], cc[2], cc[3]);
+    glUniform1f(g_ffLocUseColorArray, g_vertexAttribs[1].enabled ? 1.0f : 0.0f);
+
+    int af = g_alphaTestEnabled ? (int)g_alphaFunc - 0x0200 : 7; // 7 = GL_ALWAYS
+    if (af < 0 || af > 7) af = 7;
+    glUniform1i(g_ffLocAlphaFunc, af);
+    glUniform1f(g_ffLocAlphaRef, g_alphaRef);
+
+    glUniform1f(g_ffLocRot, needRot ? 1.0f : 0.0f);
+    glUniform1f(g_ffLocPointSize, g_pointSize);
+    return true;
+}
+
 extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     SyncLog("[GL-TRACE] glDrawArrays(mode=" + std::to_string(mode) + ", first=" + std::to_string(first) + ", count=" + std::to_string(count) + ")");
     g_frameHasDraw = true;
@@ -3327,10 +3532,12 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
             }
         }
         bool needRot = (g_gameViewportH > g_gameViewportW && targetW > targetH);
-        GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-        if (prog > 0) {
-            GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
-            if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+        if (!ApplyFixedFunctionState(needRot)) {
+            GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+            if (prog > 0) {
+                GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
+                if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+            }
         }
         glDrawArrays(mode, first, count);
     } else {
@@ -3351,10 +3558,12 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
             }
         }
         bool needRot = (g_gameViewportH > g_gameViewportW && targetW > targetH);
-        GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-        if (prog > 0) {
-            GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
-            if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+        if (!ApplyFixedFunctionState(needRot)) {
+            GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+            if (prog > 0) {
+                GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
+                if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+            }
         }
         glDrawElements(mode, count, type, indices);
     } else {
@@ -3365,21 +3574,46 @@ extern "C" void MegaDebug_glUseProgram(GLuint program) {
     SyncLog("[GL-TRACE] glUseProgram(prog=" + std::to_string(program) + ")");
     glUseProgram(program);
 }
+// ES 1.1 знает капабилити, которых в ES 2.0 нет. Прокидывать их в железо нельзя:
+// драйвер отвечает GL_INVALID_ENUM, и ошибка залипает на весь кадр.
+static bool IsES1OnlyCap(GLenum cap) {
+    switch (cap) {
+        case 0x0DE1: // GL_TEXTURE_2D
+        case 0x0BC0: // GL_ALPHA_TEST
+        case 0x0B60: // GL_FOG
+        case 0x0B50: // GL_LIGHTING
+        case 0x0B57: // GL_COLOR_MATERIAL
+        case 0x0BA1: // GL_NORMALIZE
+        case 0x803A: // GL_RESCALE_NORMAL
+        case 0x0B10: // GL_POINT_SMOOTH
+        case 0x0B20: // GL_LINE_SMOOTH
+        case 0x8861: // GL_POINT_SPRITE_OES
+        case 0x8840: // GL_MATRIX_PALETTE_OES
+        case 0x0C60: // GL_TEXTURE_GEN_S
+        case 0x0C61: // GL_TEXTURE_GEN_T
+            return true;
+        default:
+            // GL_LIGHT0..7 и GL_CLIP_PLANE0..5
+            return (cap >= 0x4000 && cap <= 0x4007) || (cap >= 0x3000 && cap <= 0x3005);
+    }
+}
 extern "C" void MegaDebug_glEnable(GLenum cap) {
     if (cap == GL_BLEND) g_blendEnabled = true;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = true;
     else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = true;
+    else if (cap == 0x0BC0) g_alphaTestEnabled = true; // GL_ALPHA_TEST
     else if (cap == 0x0B44) g_cullFaceEnabled = true; // GL_CULL_FACE
     else if (cap == 0x8840) g_matrixPaletteEnabled = true; // GL_MATRIX_PALETTE_OES
-    if (g_gpuOffloadMask & 32) glEnable(cap);
+    if ((g_gpuOffloadMask & 32) && !IsES1OnlyCap(cap)) glEnable(cap);
 }
 extern "C" void MegaDebug_glDisable(GLenum cap) {
     if (cap == GL_BLEND) g_blendEnabled = false;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = false;
     else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = false;
+    else if (cap == 0x0BC0) g_alphaTestEnabled = false;
     else if (cap == 0x0B44) g_cullFaceEnabled = false;
     else if (cap == 0x8840) g_matrixPaletteEnabled = false;
-    if (g_gpuOffloadMask & 32) glDisable(cap);
+    if ((g_gpuOffloadMask & 32) && !IsES1OnlyCap(cap)) glDisable(cap);
 }
 extern "C" void MegaDebug_glCullFace(GLenum mode) { g_cullFaceMode = mode; if (g_gpuOffloadMask & 32) glCullFace(mode); }
 extern "C" void MegaDebug_glFrontFace(GLenum mode) { g_frontFace = mode; if (g_gpuOffloadMask & 32) glFrontFace(mode); }
@@ -3446,6 +3680,16 @@ extern "C" void wrap_glUniform1i(GLint location, GLint v0) {
 
 extern "C" void wrap_glGetFloatv(GLenum pname, GLfloat *data) {
     uint32_t lr = (uint32_t)__builtin_return_address(0);
+    // Матричных enum-ов ES1 в ES2-контексте нет: драйвер вернул бы GL_INVALID_ENUM,
+    // не тронув буфер, и игра прочитала бы мусор. Minecraft строит из этих матриц
+    // фрустум, поэтому отдаём их из теневого стека враппера.
+    if (data && (pname == 0x0BA6 || pname == 0x0BA7 || pname == 0x0BA8)) {
+        const std::vector<float>* src =
+            (pname == 0x0BA6) ? &g_modelViewStack.back() :
+            (pname == 0x0BA7) ? &g_projectionStack.back() : &g_textureStack.back();
+        memcpy(data, src->data(), 16 * sizeof(float));
+        return;
+    }
     if (pname == 0x0BA2) { // GL_VIEWPORT
         glGetFloatv(pname, data);
         LogToJava(">>>>>>>> [SIZE-CRITICAL] glGetFloatv(GL_VIEWPORT) <<<<<<<< Caller: " + GetModuleInfoForAddress(lr));
@@ -3612,7 +3856,7 @@ void UpdateTextCache(void* view, const std::string& text, float logicalH) {
 // CUSTOM HLE ES 2.0 UI RENDERER
 // ==========================================
 
-void DrawViewRecursive(void* view, float parentX, float parentY) {
+void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = false) {
     if (!view || !g_views.count(view)) return;
     auto& v = g_views[view];
     if (v.hidden) return;
@@ -3640,6 +3884,18 @@ void DrawViewRecursive(void* view, float parentX, float parentY) {
         CPUDrawSolidRect(x, y, w, h, 0.2f, 0.8f, 0.2f, 1.0f);
         float sqW = w / 2.0f; float sqX = isOn ? (x + w - sqW) : x;
         CPUDrawSolidRect(sqX, y, sqW, h, 1.0f, 1.0f, 1.0f, 1.0f);
+    } else if (type == "UISlider") {
+        auto& sl = g_sliders[view];
+        float span = sl.maxValue - sl.minValue;
+        float t = span > 0.0f ? (sl.value - sl.minValue) / span : 0.0f;
+        if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+        float trackY = y + h / 2.0f - 1.5f;
+        CPUDrawSolidRect(x, trackY, w, 3.0f, 0.6f, 0.6f, 0.6f, 1.0f);
+        CPUDrawSolidRect(x, trackY, w * t, 3.0f, 0.2f, 0.5f, 1.0f, 1.0f);
+        CPUDrawSolidRect(x + w * t - 6.0f, y + h / 2.0f - 7.0f, 12.0f, 14.0f, 1.0f, 1.0f, 1.0f, 1.0f, 6.0f);
+    } else if (type == "UITextField") {
+        CPUDrawSolidRect(x, y, w, h, 0.75f, 0.75f, 0.75f, 1.0f, 3.0f);
+        CPUDrawSolidRect(x + 1.0f, y + 1.0f, w - 2.0f, h - 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.5f);
     } else if (type == "UIActivityIndicatorView") {
         CPUDrawSolidRect(x + w/2.0f - 10, y + h/2.0f - 10, 20, 20, 1.0f, 0.5f, 0.0f, 1.0f, 5.0f);
     } else if (type == "UIImageView") {
@@ -3651,7 +3907,11 @@ void DrawViewRecursive(void* view, float parentX, float parentY) {
     } else if (v.hasBg) {
         HLEColor c = v.bgColor;
         float finalAlpha = c.a * v.alpha;
-        if (finalAlpha > 0.0f) {
+        // При выводе через GPU кадр игры живёт в реальном фреймбуфере, а CPU-буфер
+        // накладывается поверх него. Фон корневого вью на iOS лежит ПОД GL-слоем,
+        // поэтому заливать им весь экран здесь нельзя — он закроет кадр игры.
+        bool bgUnderGL = isRoot && (g_gpuOffloadMask & 1);
+        if (finalAlpha > 0.0f && !bgUnderGL) {
             CPUDrawSolidRect(x, y, w, h, c.r, c.g, c.b, finalAlpha, v.cornerRadius);
         }
     }
@@ -3710,10 +3970,33 @@ void DrawViewRecursive(void* view, float parentX, float parentY) {
     }
 }
 
+
+static int CountSubtree(void* v, int depth) {   // ВРЕМЕННЫЙ
+    if (!v || depth > 6 || !g_views.count(v)) return 0;
+    int n = 1;
+    for (void* c : g_views[v].children) n += CountSubtree(c, depth + 1);
+    return n;
+}
+
 void RenderHLEUI() {
+    std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
     void* activeView = g_presentedView ? g_presentedView : g_mainView;
+    {   // ВРЕМЕННЫЙ
+        static int frame = 0;
+        if (++frame % 120 == 0)
+            __android_log_print(ANDROID_LOG_WARN, "DW32DIAG",
+                                "modals=%d active=%p узлов=%d | reload=%d self=%p ds=%p секций=%d(сыр=%d imp=%d) строк=%d ячеек=%d последняя=%p",
+                                (int)g_modalStack.size(), activeView, CountSubtree(activeView, 0),
+                                g_dbgReloadCount, g_dbgReloadSelf, g_dbgReloadDs,
+                                g_dbgSections, g_dbgRawSections, g_dbgHasSecIMP,
+                                g_dbgRows, g_dbgCellsAdded, g_dbgLastCell);
+    }
+    if (!g_modalStack.empty()) {
+        for (void* v : g_modalStack) DrawViewRecursive(v, 0.0f, 0.0f, true);
+        return;
+    }
     if (!activeView) return;
-    DrawViewRecursive(activeView, 0.0f, 0.0f);
+    DrawViewRecursive(activeView, 0.0f, 0.0f, true);
 }
 
 
@@ -3795,7 +4078,656 @@ extern "C" uint64_t Stub_mach_absolute_time();
 extern "C" uint64_t Stub_objc_msgSend(void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8);
 extern "C" uint64_t Stub_objc_msgSendSuper2(void* super_struct, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8);
 extern "C" void* Stub_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7);
+
+// CGRect приезжает в msgSend через регистры VFP, а Stub_objc_msgSend снимает s0-s3
+// с вызывающего кода. Для собственных вызовов setFrame:/initWithFrame: там мусор,
+// поэтому FPU-аргументы выставляем руками и идём мимо Stub.
+extern float g_fpu_args[4];
+extern float g_fpu_ret[4];
+extern int g_fpu_ret_flag;
+uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8);
+static inline uint64_t HLE_MsgSendRect(void* obj, const char* sel, float x, float y, float w, float h) {
+    // Идём мимо Stub, поэтому его пролог/эпилог повторяем руками: сохраняем чужие
+    // FPU-аргументы и гасим g_fpu_ret_flag, иначе он утечёт в следующий вызов игры.
+    float savedArgs[4]; memcpy(savedArgs, g_fpu_args, sizeof(savedArgs));
+    int savedFlag = g_fpu_ret_flag;
+    float savedRet[4]; memcpy(savedRet, g_fpu_ret, sizeof(savedRet));
+    g_fpu_ret_flag = 0;
+    g_fpu_args[0] = x; g_fpu_args[1] = y; g_fpu_args[2] = w; g_fpu_args[3] = h;
+    uint32_t px, py, pw, ph;
+    memcpy(&px, &x, 4); memcpy(&py, &y, 4); memcpy(&pw, &w, 4); memcpy(&ph, &h, 4);
+    uint64_t ret = Impl_objc_msgSend(obj, sel, (void*)(uintptr_t)px, (void*)(uintptr_t)py,
+                                     (void*)(uintptr_t)pw, (void*)(uintptr_t)ph,
+                                     nullptr, nullptr, nullptr, nullptr);
+    memcpy(g_fpu_args, savedArgs, sizeof(savedArgs));
+    memcpy(g_fpu_ret, savedRet, sizeof(savedRet));
+    g_fpu_ret_flag = savedFlag;
+    return ret;
+}
+static inline uint64_t HLE_MsgSendRectBits(void* obj, const char* sel, uint32_t px, uint32_t py, uint32_t pw, uint32_t ph) {
+    float x, y, w, h;
+    memcpy(&x, &px, 4); memcpy(&y, &py, 4); memcpy(&w, &pw, 4); memcpy(&h, &ph, 4);
+    return HLE_MsgSendRect(obj, sel, x, y, w, h);
+}
 extern "C" void* Stub_objc_msgSendSuper2_stret(void* ret_addr, void* super_struct, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7);
+
+// ============================================================================
+// РЕСУРСНЫЕ АРХИВЫ: XML property list и NIBArchive
+// Экраны, собранные в Interface Builder, приезжают в игре не кодом, а .nib;
+// InAppSettingsKit точно так же читает список настроек из .plist. Без разбора
+// этих файлов такие экраны остаются пустыми.
+// ============================================================================
+
+void* HLE_NewInstanceOf(const std::string& clsName) {
+    uint32_t* inst = (uint32_t*)calloc(1, 32);
+    void* cls = ResolveSymbol("OBJC_CLASS_$_" + clsName);
+    if (!cls && g_hleClasses.count(clsName)) cls = g_hleClasses[clsName];
+    inst[0] = (uint32_t)(uintptr_t)cls;
+    return inst;
+}
+
+void* HLE_NewNumberInt(int32_t v) {
+    uint32_t* inst = (uint32_t*)HLE_NewInstanceOf("NSNumber");
+    inst[1] = (uint32_t)v; inst[2] = 9; return inst;
+}
+
+void* HLE_NewNumberFloat(float v) {
+    uint32_t* inst = (uint32_t*)HLE_NewInstanceOf("NSNumber");
+    memcpy(&inst[1], &v, 4); inst[2] = 12; return inst;
+}
+
+void* HLE_NewArray(const std::vector<void*>& items) {
+    void* inst = HLE_NewInstanceOf("NSArray");
+    g_arrays[inst] = items;
+    return inst;
+}
+
+// --- Поиск ивара по имени в настоящем Objective-C классе из образа игры -----
+// Раскладка class_ro_t (ARM32): +8 instanceSize, +16 name, +28 ivar_list_t.
+// ivar_list_t: +0 entsize, +4 count, +8 первый ivar_t{offsetPtr,name,type,...}.
+void* HLE_FindIvar(uint32_t classAddr, const std::string& name) {
+    uint32_t cls = classAddr;
+    for (int depth = 0; cls > 0x1000 && depth < 16; depth++) {
+        uint32_t magic = 0;
+        if (!SafeRead32(cls, &magic) || magic == 0xDEADBEEF) break;
+        uint32_t dataField = 0;
+        if (!SafeRead32(cls + 16, &dataField)) break;
+        uint32_t ro = dataField & ~3u;
+        if (ro > 0x1000) {
+            uint32_t ivarList = 0;
+            if (SafeRead32(ro + 28, &ivarList) && ivarList > 0x1000) {
+                uint32_t entsize = 0, count = 0;
+                if (SafeRead32(ivarList, &entsize) && SafeRead32(ivarList + 4, &count) &&
+                    entsize >= 8 && entsize <= 64 && count < 4096) {
+                    for (uint32_t i = 0; i < count; i++) {
+                        uint32_t iv = ivarList + 8 + i * entsize;
+                        uint32_t namePtr = 0;
+                        if (!SafeRead32(iv + 4, &namePtr) || namePtr <= 0x1000) continue;
+                        if (name == (const char*)namePtr) return (void*)(uintptr_t)iv;
+                    }
+                }
+            }
+        }
+        uint32_t super = 0;
+        if (!SafeRead32(cls + 4, &super) || super == cls) break;
+        cls = super;
+    }
+    return nullptr;
+}
+
+// Записать указатель в ивар объекта. true — получилось.
+bool HLE_SetIvarPointer(void* obj, const std::string& name, void* value) {
+    if (!obj || (uintptr_t)obj < 0x1000) return false;
+    uint32_t isa = 0;
+    if (!SafeRead32((uintptr_t)obj, &isa) || isa <= 0x1000 || isa == 0xDEADBEEF) return false;
+    void* iv = HLE_FindIvar(isa, name);
+    if (!iv && !name.empty() && name[0] != '_') iv = HLE_FindIvar(isa, "_" + name);
+    if (!iv) return false;
+    uint32_t offsetPtr = ((uint32_t*)iv)[0];
+    if (offsetPtr <= 0x1000) return false;
+    int32_t off = *(int32_t*)offsetPtr;
+    if (off < 0 || off > 100000) return false;
+    *(uint32_t*)((uint8_t*)obj + off) = (uint32_t)(uintptr_t)value;
+    return true;
+}
+
+// --------------------------- XML property list ------------------------------
+static std::string PlistDecodeEntities(const std::string& s) {
+    std::string r; r.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] != '&') { r += s[i]; continue; }
+        if (s.compare(i, 5, "&amp;") == 0)       { r += '&';  i += 4; }
+        else if (s.compare(i, 4, "&lt;") == 0)   { r += '<';  i += 3; }
+        else if (s.compare(i, 4, "&gt;") == 0)   { r += '>';  i += 3; }
+        else if (s.compare(i, 6, "&quot;") == 0) { r += '"';  i += 5; }
+        else if (s.compare(i, 6, "&apos;") == 0) { r += '\''; i += 5; }
+        else r += s[i];
+    }
+    return r;
+}
+
+struct XmlTag { std::string name; bool closing; bool selfClosing; };
+
+static bool XmlNextTag(const std::string& s, size_t& i, XmlTag& t) {
+    while (true) {
+        size_t lt = s.find('<', i);
+        if (lt == std::string::npos) return false;
+        if (s.compare(lt, 4, "<!--") == 0) {
+            size_t e = s.find("-->", lt);
+            if (e == std::string::npos) return false;
+            i = e + 3; continue;
+        }
+        if (s.compare(lt, 2, "<?") == 0 || s.compare(lt, 2, "<!") == 0) {
+            size_t e = s.find('>', lt);
+            if (e == std::string::npos) return false;
+            i = e + 1; continue;
+        }
+        size_t gt = s.find('>', lt);
+        if (gt == std::string::npos) return false;
+        std::string body = s.substr(lt + 1, gt - lt - 1);
+        t.closing = !body.empty() && body[0] == '/';
+        if (t.closing) body.erase(0, 1);
+        t.selfClosing = !body.empty() && body.back() == '/';
+        if (t.selfClosing) body.pop_back();
+        size_t sp = body.find_first_of(" \t\r\n");
+        t.name = (sp == std::string::npos) ? body : body.substr(0, sp);
+        i = gt + 1;
+        return true;
+    }
+}
+
+// Текст до закрывающего тега; закрывающий тег съедается.
+static std::string XmlTakeText(const std::string& s, size_t& i) {
+    size_t lt = s.find('<', i);
+    if (lt == std::string::npos) { i = s.size(); return ""; }
+    std::string raw = s.substr(i, lt - i);
+    i = lt;
+    XmlTag t; XmlNextTag(s, i, t);
+    return PlistDecodeEntities(raw);
+}
+
+static void* PlistParseValue(const std::string& s, size_t& i, const XmlTag& open);
+
+static void* PlistParseDict(const std::string& s, size_t& i) {
+    void* dict = HLE_NewInstanceOf("NSDictionary");
+    XmlTag t;
+    std::string pendingKey;
+    while (XmlNextTag(s, i, t)) {
+        if (t.closing) { if (t.name == "dict") break; continue; }
+        if (t.name == "key") { pendingKey = XmlTakeText(s, i); continue; }
+        void* v = PlistParseValue(s, i, t);
+        if (!pendingKey.empty()) g_dictionariesHLE[dict][pendingKey] = v;
+        pendingKey.clear();
+    }
+    return dict;
+}
+
+static void* PlistParseArray(const std::string& s, size_t& i) {
+    void* arr = HLE_NewInstanceOf("NSArray");
+    XmlTag t;
+    while (XmlNextTag(s, i, t)) {
+        if (t.closing) { if (t.name == "array") break; continue; }
+        g_arrays[arr].push_back(PlistParseValue(s, i, t));
+    }
+    return arr;
+}
+
+static void* PlistParseValue(const std::string& s, size_t& i, const XmlTag& open) {
+    if (open.name == "dict")  return open.selfClosing ? HLE_NewInstanceOf("NSDictionary") : PlistParseDict(s, i);
+    if (open.name == "array") return open.selfClosing ? HLE_NewInstanceOf("NSArray") : PlistParseArray(s, i);
+    if (open.name == "true")  return HLE_NewNumberInt(1);
+    if (open.name == "false") return HLE_NewNumberInt(0);
+    if (open.selfClosing)     return CreateNSString("");
+    std::string text = XmlTakeText(s, i);
+    if (open.name == "integer") return HLE_NewNumberInt(atoi(text.c_str()));
+    if (open.name == "real")    return HLE_NewNumberFloat((float)atof(text.c_str()));
+    return CreateNSString(text);
+}
+
+// Корневой словарь plist-файла, либо nullptr.
+void* LoadPlistFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return nullptr;
+    std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (src.compare(0, 6, "bplist") == 0) {
+        LogToJava("HLE-PLIST: бинарный plist не поддерживается: " + path);
+        return nullptr;
+    }
+    size_t i = 0; XmlTag t;
+    while (XmlNextTag(src, i, t)) {
+        if (t.closing || t.name == "plist") continue;
+        return PlistParseValue(src, i, t);
+    }
+    return nullptr;
+}
+
+// ------------------------------- NIBArchive ---------------------------------
+struct NibValueRec { uint32_t keyIdx; uint8_t type; int64_t ival; double dval; std::string data; int32_t objRef; };
+struct NibObjRec   { uint32_t clsIdx, valIdx, valCount; };
+
+struct NibArchive {
+    std::vector<std::string> keys, classNames;
+    std::vector<NibValueRec> values;
+    std::vector<NibObjRec> objects;
+    std::vector<void*> instances;
+    std::vector<char> state;      // 0 — не трогали, 1 — в работе, 2 — готово
+    void* owner = nullptr;
+};
+
+static uint32_t NibVarint(const std::vector<uint8_t>& d, size_t& p) {
+    uint32_t v = 0; int shift = 0;
+    while (p < d.size()) {
+        uint8_t b = d[p++];
+        v |= (uint32_t)(b & 0x7F) << shift;
+        shift += 7;
+        if (b & 0x80) break;
+    }
+    return v;
+}
+
+static bool NibParse(const std::vector<uint8_t>& d, NibArchive& a) {
+    if (d.size() < 50 || memcmp(d.data(), "NIBArchive", 10) != 0) return false;
+    auto rd32 = [&](size_t p) { int32_t v; memcpy(&v, &d[p], 4); return v; };
+    int32_t objCount = rd32(18), objOff = rd32(22);
+    int32_t keyCount = rd32(26), keyOff = rd32(30);
+    int32_t valCount = rd32(34), valOff = rd32(38);
+    int32_t clsCount = rd32(42), clsOff = rd32(46);
+    if (objCount < 0 || keyCount < 0 || valCount < 0 || clsCount < 0) return false;
+
+    size_t p = keyOff;
+    for (int i = 0; i < keyCount && p < d.size(); i++) {
+        uint32_t len = NibVarint(d, p);
+        if (p + len > d.size()) return false;
+        a.keys.emplace_back((const char*)&d[p], len);
+        p += len;
+    }
+    p = clsOff;
+    for (int i = 0; i < clsCount && p < d.size(); i++) {
+        uint32_t len = NibVarint(d, p);
+        uint32_t extra = NibVarint(d, p);
+        p += extra * 4;
+        if (p + len > d.size()) return false;
+        a.classNames.emplace_back((const char*)&d[p]);  // внутри len лежит NUL
+        p += len;
+    }
+    p = valOff;
+    for (int i = 0; i < valCount && p < d.size(); i++) {
+        NibValueRec v{}; v.keyIdx = NibVarint(d, p);
+        if (p >= d.size()) return false;
+        v.type = d[p++];
+        switch (v.type) {
+            case 0: v.ival = (int8_t)d[p]; p += 1; break;
+            case 1: { int16_t t; memcpy(&t, &d[p], 2); v.ival = t; p += 2; } break;
+            case 2: { int32_t t; memcpy(&t, &d[p], 4); v.ival = t; p += 4; } break;
+            case 3: { int64_t t; memcpy(&t, &d[p], 8); v.ival = t; p += 8; } break;
+            case 4: v.ival = 1; break;
+            case 5: v.ival = 0; break;
+            case 6: { float t;  memcpy(&t, &d[p], 4); v.dval = t; p += 4; } break;
+            case 7: { double t; memcpy(&t, &d[p], 8); v.dval = t; p += 8; } break;
+            case 8: { uint32_t len = NibVarint(d, p); if (p + len > d.size()) return false;
+                      v.data.assign((const char*)&d[p], len); p += len; } break;
+            case 9: break;
+            case 10: memcpy(&v.objRef, &d[p], 4); p += 4; break;
+            default: return false;
+        }
+        a.values.push_back(v);
+    }
+    p = objOff;
+    for (int i = 0; i < objCount && p < d.size(); i++) {
+        NibObjRec o{}; o.clsIdx = NibVarint(d, p); o.valIdx = NibVarint(d, p); o.valCount = NibVarint(d, p);
+        a.objects.push_back(o);
+    }
+    a.instances.assign(a.objects.size(), nullptr);
+    a.state.assign(a.objects.size(), 0);
+    return a.objects.size() == (size_t)objCount;
+}
+
+static const NibValueRec* NibGet(NibArchive& a, int obj, const char* key) {
+    if (obj < 0 || obj >= (int)a.objects.size()) return nullptr;
+    const NibObjRec& o = a.objects[obj];
+    for (uint32_t i = 0; i < o.valCount; i++) {
+        size_t vi = o.valIdx + i;
+        if (vi >= a.values.size()) break;
+        const NibValueRec& v = a.values[vi];
+        if (v.keyIdx < a.keys.size() && a.keys[v.keyIdx] == key) return &v;
+    }
+    return nullptr;
+}
+
+static float NibGetFloat(NibArchive& a, int obj, const char* key, float def) {
+    const NibValueRec* v = NibGet(a, obj, key);
+    if (!v) return def;
+    if (v->type == 6 || v->type == 7) return (float)v->dval;
+    if (v->type <= 5) return (float)v->ival;
+    return def;
+}
+
+// «06» + подряд идущие float — так NIB хранит CGRect/CGPoint/CGSize.
+static bool NibUnpackFloats(const std::string& blob, float* out, int want) {
+    if (blob.empty() || (size_t)(1 + want * 4) != blob.size()) return false;
+    for (int i = 0; i < want; i++) memcpy(&out[i], blob.data() + 1 + i * 4, 4);
+    return true;
+}
+
+static void* NibMaterialize(NibArchive& a, int idx);
+
+static std::string NibStringOf(NibArchive& a, int idx) {
+    if (idx < 0 || idx >= (int)a.objects.size()) return "";
+    const NibValueRec* b = NibGet(a, idx, "NS.bytes");
+    if (b && b->type == 8) return b->data;
+    return "";
+}
+
+// Свойства UIView и наследников из nib -> теневое состояние компоновщика.
+static void NibApplyViewProps(NibArchive& a, int idx, void* obj) {
+    if (!obj) return;
+    const NibValueRec* bounds = NibGet(a, idx, "UIBounds");
+    const NibValueRec* center = NibGet(a, idx, "UICenter");
+    float b[4] = {0, 0, 0, 0}, c[2] = {0, 0};
+    bool haveB = bounds && NibUnpackFloats(bounds->data, b, 4);
+    bool haveC = center && NibUnpackFloats(center->data, c, 2);
+    if (haveB) {
+        auto& v = g_views[obj];
+        v.frame[2] = b[2]; v.frame[3] = b[3];
+        if (haveC) { v.frame[0] = c[0] - b[2] / 2.0f; v.frame[1] = c[1] - b[3] / 2.0f; }
+    }
+
+    const NibValueRec* bg = NibGet(a, idx, "UIBackgroundColor");
+    if (bg && bg->type == 10) {
+        void* col = NibMaterialize(a, bg->objRef);
+        if (col && g_uiColors.count(col)) {
+            g_views[obj].bgColor = g_uiColors[col];
+            g_views[obj].hasBg = true;
+            g_views[obj].uiColorObj = col;
+        }
+    }
+    const NibValueRec* tc = NibGet(a, idx, "UITextColor");
+    if (tc && tc->type == 10) {
+        void* col = NibMaterialize(a, tc->objRef);
+        if (col && g_uiColors.count(col)) {
+            g_views[obj].textColor = g_uiColors[col];
+            g_views[obj].hasTextCol = true;
+        }
+    }
+    const NibValueRec* txt = NibGet(a, idx, "UIText");
+    if (txt && txt->type == 10) g_views[obj].text = NibStringOf(a, txt->objRef);
+
+    const NibValueRec* hidden = NibGet(a, idx, "UIHidden");
+    if (hidden) g_views[obj].hidden = (hidden->ival != 0);
+    const NibValueRec* alpha = NibGet(a, idx, "UIAlpha");
+    if (alpha && (alpha->type == 6 || alpha->type == 7)) g_views[obj].alpha = (float)alpha->dval;
+    const NibValueRec* noTouch = NibGet(a, idx, "UIUserInteractionDisabled");
+    if (noTouch) g_views[obj].userInteraction = (noTouch->ival == 0);
+
+    // Заголовок кнопки лежит в словаре состояний; берём обычное состояние.
+    const NibValueRec* stateful = NibGet(a, idx, "UIButtonStatefulContent");
+    if (stateful && stateful->type == 10) {
+        int dictIdx = stateful->objRef;
+        if (dictIdx >= 0 && dictIdx < (int)a.objects.size()) {
+            const NibObjRec& dobj = a.objects[dictIdx];
+            int32_t prevKey = -1;
+            for (uint32_t i = 0; i < dobj.valCount; i++) {
+                size_t vi = dobj.valIdx + i;
+                if (vi >= a.values.size()) break;
+                const NibValueRec& v = a.values[vi];
+                if (v.type != 10) continue;
+                if (prevKey < 0) { prevKey = v.objRef; continue; }
+                const NibValueRec* num = NibGet(a, prevKey, "NS.intval");
+                bool normalState = (!num || num->ival == 0);
+                if (normalState) {
+                    const NibValueRec* title = NibGet(a, v.objRef, "UITitle");
+                    if (title && title->type == 10) g_views[obj].text = NibStringOf(a, title->objRef);
+                }
+                prevKey = -1;
+            }
+        }
+    }
+
+    const NibValueRec* subs = NibGet(a, idx, "UISubviews");
+    if (subs && subs->type == 10) {
+        int arrIdx = subs->objRef;
+        if (arrIdx >= 0 && arrIdx < (int)a.objects.size()) {
+            const NibObjRec& arr = a.objects[arrIdx];
+            for (uint32_t i = 0; i < arr.valCount; i++) {
+                size_t vi = arr.valIdx + i;
+                if (vi >= a.values.size()) break;
+                const NibValueRec& v = a.values[vi];
+                if (v.type != 10) continue;
+                void* child = NibMaterialize(a, v.objRef);
+                if (child) Stub_objc_msgSend(obj, "addSubview:", child, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            }
+        }
+    }
+}
+
+static void* NibMaterialize(NibArchive& a, int idx) {
+    if (idx < 0 || idx >= (int)a.objects.size()) return nullptr;
+    if (a.state[idx] == 2) return a.instances[idx];
+    if (a.state[idx] == 1) return a.instances[idx];   // цикл — отдаём что есть
+    a.state[idx] = 1;
+
+    const NibObjRec& o = a.objects[idx];
+    std::string cls = o.clsIdx < a.classNames.size() ? a.classNames[o.clsIdx] : "NSObject";
+    void* inst = nullptr;
+
+    if (cls == "UIProxyObject") {
+        const NibValueRec* pid = NibGet(a, idx, "UIProxiedObjectIdentifier");
+        std::string ident = (pid && pid->type == 10) ? NibStringOf(a, pid->objRef) : "";
+        inst = (ident == "IBFilesOwner") ? a.owner : nullptr;
+    } else if (cls == "NSString" || cls == "NSMutableString") {
+        inst = CreateNSString(NibStringOf(a, idx));
+    } else if (cls == "NSNumber") {
+        const NibValueRec* iv = NibGet(a, idx, "NS.intval");
+        const NibValueRec* dv = NibGet(a, idx, "NS.dblval");
+        if (dv) inst = HLE_NewNumberFloat((float)dv->dval);
+        else    inst = HLE_NewNumberInt(iv ? (int32_t)iv->ival : 0);
+    } else if (cls == "NSArray" || cls == "NSMutableArray") {
+        inst = HLE_NewInstanceOf("NSArray");
+        a.instances[idx] = inst;
+        for (uint32_t i = 0; i < o.valCount; i++) {
+            size_t vi = o.valIdx + i;
+            if (vi >= a.values.size()) break;
+            const NibValueRec& v = a.values[vi];
+            if (v.type == 10) g_arrays[inst].push_back(NibMaterialize(a, v.objRef));
+        }
+    } else if (cls == "UIColor") {
+        inst = HLE_NewInstanceOf("UIColor");
+        int comps = 4;
+        const NibValueRec* cc = NibGet(a, idx, "UIColorComponentCount");
+        if (cc) comps = (int)cc->ival;
+        float alpha = NibGetFloat(a, idx, "UIAlpha", 1.0f);
+        if (comps == 2) {
+            float w = NibGetFloat(a, idx, "UIWhite", 0.0f);
+            g_uiColors[inst] = {w, w, w, alpha};
+        } else {
+            g_uiColors[inst] = {NibGetFloat(a, idx, "UIRed",   0.0f),
+                                NibGetFloat(a, idx, "UIGreen", 0.0f),
+                                NibGetFloat(a, idx, "UIBlue",  0.0f), alpha};
+        }
+    } else if (cls == "UIRuntimeOutletConnection" || cls == "UIRuntimeEventConnection" ||
+               cls == "UIRuntimeConnection" || cls == "UIButtonContent" ||
+               cls == "UIImageNibPlaceholder" || cls == "NSObject") {
+        inst = HLE_NewInstanceOf("NSObject");        // разбираются отдельно
+    } else if (cls == "UIClassSwapper") {
+        const NibValueRec* cn = NibGet(a, idx, "UIClassName");
+        const NibValueRec* on = NibGet(a, idx, "UIOriginalClassName");
+        std::string want = (cn && cn->type == 10) ? NibStringOf(a, cn->objRef) : "";
+        std::string base = (on && on->type == 10) ? NibStringOf(a, on->objRef) : "UIView";
+        void* real = want.empty() ? nullptr : ResolveSymbol("OBJC_CLASS_$_" + want);
+        if (real) {
+            inst = (void*)(uintptr_t)Stub_objc_msgSend(real, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        } else {
+            inst = HLE_NewInstanceOf(base);
+            g_views[inst].type = (base.find("UI") == 0) ? base : "UIView";
+        }
+        if (inst && g_views[inst].type.empty()) g_views[inst].type = (base.find("UI") == 0) ? base : "UIView";
+    } else {
+        void* real = ResolveSymbol("OBJC_CLASS_$_" + cls);
+        bool realFromGame = real && ((uint32_t*)real)[0] != 0xDEADBEEF;
+        if (realFromGame) {
+            inst = (void*)(uintptr_t)Stub_objc_msgSend(real, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        } else {
+            inst = HLE_NewInstanceOf(cls);
+        }
+        if (inst && g_views[inst].type.empty() && cls.find("UI") == 0) g_views[inst].type = cls;
+    }
+
+    a.instances[idx] = inst;
+    a.state[idx] = 2;
+    if (inst && g_views.count(inst)) NibApplyViewProps(a, idx, inst);
+    return inst;
+}
+
+static void NibApplyConnections(NibArchive& a, int connArrayIdx) {
+    if (connArrayIdx < 0 || connArrayIdx >= (int)a.objects.size()) return;
+    const NibObjRec& arr = a.objects[connArrayIdx];
+    for (uint32_t i = 0; i < arr.valCount; i++) {
+        size_t vi = arr.valIdx + i;
+        if (vi >= a.values.size()) break;
+        const NibValueRec& ref = a.values[vi];
+        if (ref.type != 10) continue;
+        int ci = ref.objRef;
+        if (ci < 0 || ci >= (int)a.objects.size()) continue;
+        std::string kind = a.objects[ci].clsIdx < a.classNames.size() ? a.classNames[a.objects[ci].clsIdx] : "";
+
+        const NibValueRec* lab = NibGet(a, ci, "UILabel");
+        const NibValueRec* src = NibGet(a, ci, "UISource");
+        const NibValueRec* dst = NibGet(a, ci, "UIDestination");
+        std::string label = (lab && lab->type == 10) ? NibStringOf(a, lab->objRef) : "";
+        void* source = (src && src->type == 10) ? NibMaterialize(a, src->objRef) : nullptr;
+        void* dest   = (dst && dst->type == 10) ? NibMaterialize(a, dst->objRef) : nullptr;
+        if (label.empty() || !source) continue;
+
+        if (kind == "UIRuntimeEventConnection") {
+            Stub_objc_msgSend(source, "addTarget:action:forControlEvents:", dest,
+                              (void*)strdup(label.c_str()), (void*)64, nullptr, nullptr, nullptr, nullptr, nullptr);
+            LogToJava("HLE-NIB: действие [" + label + "] привязано к элементу");
+        } else {
+            if (!HLE_SetIvarPointer(source, label, dest)) {
+                std::string setter = "set";
+                size_t st = (label[0] == '_') ? 1 : 0;
+                setter += (char)toupper(label[st]);
+                setter += label.substr(st + 1);
+                setter += ":";
+                Stub_objc_msgSend(source, setter.c_str(), dest, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            }
+            LogToJava("HLE-NIB: аутлет [" + label + "] подключён");
+        }
+    }
+}
+
+// Разворачивает .nib и возвращает объекты верхнего уровня.
+std::vector<void*> LoadNibArchive(const std::string& path, void* owner) {
+    std::vector<void*> topLevel;
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        LogToJava("HLE-NIB: файл не найден: " + path);
+        return topLevel;
+    }
+    std::vector<uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    NibArchive a; a.owner = owner;
+    if (!NibParse(d, a)) {
+        LogToJava("HLE-NIB: не разобрался формат: " + path);
+        return topLevel;
+    }
+    LogToJava("HLE-NIB: " + path + " — объектов " + std::to_string(a.objects.size()));
+
+    const NibValueRec* objsKey = NibGet(a, 0, "UINibObjectsKey");
+    if (objsKey && objsKey->type == 10) NibMaterialize(a, objsKey->objRef);
+
+    const NibValueRec* connKey = NibGet(a, 0, "UINibConnectionsKey");
+    if (connKey && connKey->type == 10) NibApplyConnections(a, connKey->objRef);
+
+    // Верхний уровень в архиве начинается с UIProxyObject (IBFilesOwner,
+    // IBFirstResponder). UIKit их наружу не отдаёт, а игра берёт objectAtIndex:0.
+    const NibValueRec* topKey = NibGet(a, 0, "UINibTopLevelObjectsKey");
+    if (topKey && topKey->type == 10) {
+        int arrIdx = topKey->objRef;
+        if (arrIdx >= 0 && arrIdx < (int)a.objects.size()) {
+            const NibObjRec& arr = a.objects[arrIdx];
+            for (uint32_t i = 0; i < arr.valCount; i++) {
+                size_t vi = arr.valIdx + i;
+                if (vi >= a.values.size()) break;
+                const NibValueRec& v = a.values[vi];
+                if (v.type != 10 || v.objRef < 0 || v.objRef >= (int)a.objects.size()) continue;
+                uint32_t ci = a.objects[v.objRef].clsIdx;
+                if (ci < a.classNames.size() && a.classNames[ci] == "UIProxyObject") continue;
+                void* o = NibMaterialize(a, v.objRef);
+                if (o) topLevel.push_back(o);
+            }
+        }
+    }
+    // awakeFromNib получают только объекты самого архива: владелец и прочие
+    // прокси приходят снаружи, и UIKit их не будит.
+    for (size_t i = 0; i < a.instances.size(); i++) {
+        void* inst = a.instances[i];
+        if (!inst || (uintptr_t)inst < 0x1000 || inst == a.owner) continue;
+        uint32_t ci = a.objects[i].clsIdx;
+        if (ci < a.classNames.size() && a.classNames[ci] == "UIProxyObject") continue;
+        uint32_t isa = 0;
+        if (!SafeRead32((uintptr_t)inst, &isa) || isa <= 0x1000 || isa == 0xDEADBEEF) continue;
+        if (FindMethodIMP(isa, "awakeFromNib"))
+            Stub_objc_msgSend(inst, "awakeFromNib", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    }
+    return topLevel;
+}
+
+// Найти .nib в основном бандле (учитывая суффиксы устройства).
+std::string ResolveNibPath(const std::string& name) {
+    std::string base = name;
+    if (base.size() > 4 && base.compare(base.size() - 4, 4, ".nib") == 0) base.resize(base.size() - 4);
+    const char* suffixes[] = {"", "_iphone", "~iphone", "_ipad", "~ipad"};
+    for (const char* sfx : suffixes) {
+        std::string p = g_appBundlePath + "/" + base + sfx + ".nib";
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) return p;
+    }
+    LogToJava("HLE-NIB: не нашёл .nib с именем " + base);
+    return "";
+}
+
+void* HLE_NavigationItemFor(void* vc) {
+    if (!vc) return nullptr;
+    void*& item = g_dictionaries[vc][(void*)0x1013];
+    if (!item) {
+        uint32_t* n = (uint32_t*)calloc(1, 32);
+        n[0] = g_hleClasses.count("UINavigationItem") ? (uint32_t)g_hleClasses["UINavigationItem"] : 0xDEADBEEF;
+        item = n;
+    }
+    return item;
+}
+
+static void HLE_AddNavButton(void* navBar, void* barItem, bool right) {
+    if (!barItem || !g_hleClasses.count("UIButton")) return;
+    float bw = 70.0f, bh = 30.0f;
+    float bx = right ? (float)g_surfaceWidth - bw - 8.0f : 8.0f;
+    void* btn = (void*)Stub_objc_msgSend((void*)g_hleClasses["UIButton"], "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    HLE_MsgSendRect(btn, "initWithFrame:", bx, 7.0f, bw, bh);
+    std::string title = g_barItemTitles.count(barItem) ? g_barItemTitles[barItem] : "OK";
+    Stub_objc_msgSend(btn, "setTitle:forState:", CreateNSString(title), (void*)0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_uiColors[btn] = {0.2f, 0.4f, 0.8f, 1.0f};
+    g_views[btn].bgColor = g_uiColors[btn]; g_views[btn].hasBg = true;
+    g_views[btn].cornerRadius = 5.0f;
+    void* target = g_dictionaries[barItem][(void*)0x2003];
+    void* action = g_dictionaries[barItem][(void*)0x2004];
+    if (target && action)
+        Stub_objc_msgSend(btn, "addTarget:action:forControlEvents:", target, action, (void*)1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    Stub_objc_msgSend(navBar, "addSubview:", btn, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+void HLE_BuildNavBar(void* navBar, void* topVC) {
+    if (!navBar || !topVC) return;
+    void* item = HLE_NavigationItemFor(topVC);
+    std::string title = g_barItemTitles.count(item) ? g_barItemTitles[item] : "";
+    if (!title.empty() && g_hleClasses.count("UILabel")) {
+        void* lbl = (void*)Stub_objc_msgSend((void*)g_hleClasses["UILabel"], "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        HLE_MsgSendRect(lbl, "initWithFrame:", (float)g_surfaceWidth / 2.0f - 110.0f, 10.0f, 220.0f, 24.0f);
+        Stub_objc_msgSend(lbl, "setText:", CreateNSString(title), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        Stub_objc_msgSend(navBar, "addSubview:", lbl, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    }
+    HLE_AddNavButton(navBar, g_dictionaries[item][(void*)0x2001], true);
+    HLE_AddNavButton(navBar, g_dictionaries[item][(void*)0x2002], false);
+}
 
 float g_fpu_args[4] = {0};
 float g_fpu_ret[4] = {0};
@@ -3805,6 +4737,17 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     float saved_s[4] = {g_fpu_args[0], g_fpu_args[1], g_fpu_args[2], g_fpu_args[3]};
     static void* s_lazyGlView = nullptr;
     static void* s_lastMoviePlayer = nullptr;
+    // Диспетчер showDialog в игре после CreateWorld/MainMenuOptions безусловно
+    // зовёт ещё и showDialog_RenameMPWorld — тот сам себя гасит проверкой
+    // «диалог уже есть», но Options строится на UINavigationController и ivar
+    // _dialog не заполняет. На iOS второй диалог не появлялся, потому что UIKit
+    // отказывал во второй модалке; здесь гасим вызов целиком, иначе Rename
+    // оставляет _dialog навсегда и Options больше не открывается.
+    if (op && strncmp(op, "showDialog_", 11) == 0 &&
+        g_presentedByVC.count(self) && g_presentedByVC[self]) {
+        LogToJava("HLE: " + std::string(op) + " пропущен — контроллер уже показывает модалку");
+        return 0;
+    }
     if (!self) {
         static int nil_count = 0;
         if (nil_count++ < 30 && op) LogToJava("OBJC-CALL: [nil " + std::string(op) + "] -> Silent 0");
@@ -3837,9 +4780,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                     if (FindMethodIMP(((uint32_t*)s_lazyGlView)[0], "initWithCoder:")) {
                         s_lazyGlView = (void*)Stub_objc_msgSend(s_lazyGlView, "initWithCoder:", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                         g_views[s_lazyGlView].frame = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
-                        Stub_objc_msgSend(s_lazyGlView, "setFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                        HLE_MsgSendRectBits(s_lazyGlView, "setFrame:", px, py, pw, ph);
                     } else {
-                        s_lazyGlView = (void*)Stub_objc_msgSend(s_lazyGlView, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                        s_lazyGlView = (void*)HLE_MsgSendRectBits(s_lazyGlView, "initWithFrame:", px, py, pw, ph);
                     }
                     g_mainView = s_lazyGlView;
                     LogToJava("HLE_CRITICAL: EAGLView воссоздан успешно!");
@@ -3914,6 +4857,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             strcmp(targetSel, "performSelectorOnMainThread:withObject:waitUntilDone:") == 0 ||
             strcmp(targetSel, "performSelector:withObject:afterDelay:") == 0 ||
             strcmp(targetSel, "scale") == 0 ||
+            strcmp(targetSel, "setContentScaleFactor:") == 0 ||
+            strcmp(targetSel, "contentScaleFactor") == 0 ||
+            strcmp(targetSel, "setContentsScale:") == 0 ||
             strcmp(targetSel, "displayLinkWithTarget:selector:") == 0) {
             LogToJava(std::string(">>>>>>>> [RESPONDS-TRACE] [") + cName + " respondsToSelector:@" + targetSel + "] -> 1 (HLE Base)");
             return 1;
@@ -4370,9 +5316,16 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "NSURLRequest" && strcmp(op, "requestWithURL:") == 0) {
             uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; inst[1] = (uint32_t)a1; return (uint64_t)(uintptr_t)inst;
         }
-        if (clsName == "NSDictionary" && strcmp(op, "dictionaryWithContentsOfFile:") == 0) {
-            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSDictionary");
-            return (uint64_t)(uintptr_t)inst;
+        if ((clsName == "NSDictionary" || clsName == "NSMutableDictionary") &&
+            (strcmp(op, "dictionaryWithContentsOfFile:") == 0 || strcmp(op, "dictionaryWithContentsOfURL:") == 0)) {
+            std::string path = GetNSString(a1);
+            void* d = LoadPlistFile(path);
+            if (!d) { LogToJava("HLE-PLIST: не прочитался " + path); d = HLE_NewInstanceOf("NSDictionary"); }
+            return (uint64_t)(uintptr_t)d;
+        }
+        if ((clsName == "NSArray" || clsName == "NSMutableArray") && strcmp(op, "arrayWithContentsOfFile:") == 0) {
+            void* d = LoadPlistFile(GetNSString(a1));
+            return (uint64_t)(uintptr_t)(d ? d : HLE_NewInstanceOf("NSArray"));
         }
         if (clsName == "NSDate") {
             if (strcmp(op, "date") == 0) {
@@ -4439,13 +5392,27 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 // --- AVFoundation & NSBundle HLE Class Methods ---
         if (clsName == "UINib" && strcmp(op, "nibWithNibName:bundle:") == 0) {
-            std::string nibName = GetNSString(a1);
-            LogToJava("HLE: Запрошено создание UINib для: " + nibName);
-            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
+            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self;
+            g_nibNames[inst] = GetNSString(a1);
+            return (uint64_t)(uintptr_t)inst;
         }
         if (clsName == "NSBundle" && strcmp(op, "mainBundle") == 0) {
             LogToJava("HLE-TRACE: Выделение нового NSBundle mainBundle");
-            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
+            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self;
+            g_bundlePaths[inst] = g_appBundlePath;
+            return (uint64_t)(uintptr_t)inst;
+        }
+        if (clsName == "NSBundle" && (strcmp(op, "bundleWithPath:") == 0 || strcmp(op, "bundleWithURL:") == 0)) {
+            std::string path = GetNSString(a1);
+            struct stat st;
+            if (path.empty() || stat(path.c_str(), &st) != 0) {
+                LogToJava("HLE: [NSBundle bundleWithPath:] нет такого бандла: " + path);
+                return 0;
+            }
+            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self;
+            g_bundlePaths[inst] = path;
+            LogToJava("HLE: [NSBundle bundleWithPath:] " + path);
+            return (uint64_t)(uintptr_t)inst;
         }
         if (clsName == "NSURL" && strcmp(op, "fileURLWithPath:") == 0) {
             uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; inst[1] = (uint32_t)a1; // Сохраняем указатель на NSString
@@ -4744,17 +5711,11 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
         }
         if (clsName == "UINib" && strcmp(op, "instantiateWithOwner:options:") == 0) {
-            LogToJava("HLE: Запрос на инстанциацию UINib (заглушка). Возвращаем пустой NSArray.");
-            uint32_t* arrInst = (uint32_t*)calloc(1, 32);
-            arrInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSArray");
-            return (uint64_t)(uintptr_t)arrInst;
+            std::string nibName = g_nibNames.count(self) ? g_nibNames[self] : "";
+            return (uint64_t)(uintptr_t)HLE_NewArray(LoadNibArchive(ResolveNibPath(nibName), a1));
         }
         if (clsName == "NSBundle" && strcmp(op, "loadNibNamed:owner:options:") == 0) {
-            std::string nibName = GetNSString(a1);
-            LogToJava("HLE: Игра пытается загрузить NIB файл напрямую: " + nibName + ". Возвращаем пустой NSArray.");
-            uint32_t* arrInst = (uint32_t*)calloc(1, 32);
-            arrInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSArray");
-            return (uint64_t)(uintptr_t)arrInst;
+            return (uint64_t)(uintptr_t)HLE_NewArray(LoadNibArchive(ResolveNibPath(GetNSString(a1)), a2));
         }
 
         // --- AVFoundation & NSBundle HLE Instance Methods ---
@@ -4794,7 +5755,50 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return (uint64_t)(uintptr_t)CreateNSString(g_execPath);
         }
         if (clsName == "NSBundle" && (strcmp(op, "bundlePath") == 0 || strcmp(op, "resourcePath") == 0)) {
-            return (uint64_t)(uintptr_t)CreateNSString(g_appBundlePath);
+            auto it = g_bundlePaths.find(self);
+            return (uint64_t)(uintptr_t)CreateNSString(it != g_bundlePaths.end() ? it->second : g_appBundlePath);
+        }
+        if (clsName == "NSBundle" && strcmp(op, "localizedStringForKey:value:table:") == 0) {
+            auto it = g_bundlePaths.find(self);
+            std::string root = (it != g_bundlePaths.end()) ? it->second : g_appBundlePath;
+            std::string key = GetNSString(a1);
+            std::string table = a3 ? GetNSString(a3) : "Localizable";
+            if (table.empty()) table = "Localizable";
+            // .strings — это строки вида "ключ" = "значение";
+            // Xcode пишет их в UTF-16 с BOM, поэтому сначала приводим к UTF-8.
+            std::ifstream in(root + "/en.lproj/" + table + ".strings", std::ios::binary);
+            if (in.is_open()) {
+                std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                bool be = raw.size() >= 2 && (uint8_t)raw[0] == 0xFE && (uint8_t)raw[1] == 0xFF;
+                bool le = raw.size() >= 2 && (uint8_t)raw[0] == 0xFF && (uint8_t)raw[1] == 0xFE;
+                if (be || le) {
+                    std::string utf8;
+                    for (size_t i = 2; i + 1 < raw.size(); i += 2) {
+                        uint32_t c = be ? (((uint8_t)raw[i] << 8) | (uint8_t)raw[i + 1])
+                                        : (((uint8_t)raw[i + 1] << 8) | (uint8_t)raw[i]);
+                        if (c < 0x80) utf8 += (char)c;
+                        else if (c < 0x800) { utf8 += (char)(0xC0 | (c >> 6)); utf8 += (char)(0x80 | (c & 0x3F)); }
+                        else { utf8 += (char)(0xE0 | (c >> 12)); utf8 += (char)(0x80 | ((c >> 6) & 0x3F)); utf8 += (char)(0x80 | (c & 0x3F)); }
+                    }
+                    raw.swap(utf8);
+                }
+                std::istringstream ss(raw);
+                std::string line;
+                while (std::getline(ss, line)) {
+                    size_t k1 = line.find('"');
+                    if (k1 == std::string::npos) continue;
+                    size_t k2 = line.find('"', k1 + 1);
+                    if (k2 == std::string::npos) continue;
+                    if (line.substr(k1 + 1, k2 - k1 - 1) != key) continue;
+                    size_t v1 = line.find('"', k2 + 1);
+                    if (v1 == std::string::npos) continue;
+                    size_t v2 = line.find('"', v1 + 1);
+                    if (v2 == std::string::npos) continue;
+                    return (uint64_t)(uintptr_t)CreateNSString(line.substr(v1 + 1, v2 - v1 - 1));
+                }
+            }
+            std::string fallback = a2 ? GetNSString(a2) : "";
+            return (uint64_t)(uintptr_t)CreateNSString(fallback.empty() ? key : fallback);
         }
         if (clsName == "NSBundle" && strcmp(op, "infoDictionary") == 0) {
             uint32_t* dictInst = (uint32_t*)calloc(1, 32); dictInst[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_NSDictionary"); return (uint64_t)(uintptr_t)dictInst;
@@ -4804,10 +5808,17 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (key == "CFBundleVersion" || key == "CFBundleShortVersionString") return (uint64_t)(uintptr_t)CreateNSString("1.0");
             return (uint64_t)(uintptr_t)CreateNSString("1");
         }
-        if (clsName == "NSBundle" && strcmp(op, "pathForResource:ofType:") == 0) {
+        if (clsName == "NSBundle" && (strcmp(op, "pathForResource:ofType:") == 0 ||
+                                      strcmp(op, "pathForResource:ofType:inDirectory:") == 0)) {
             std::string name = GetNSString(a1);
             std::string ext = GetNSString(a2);
-            std::string fullPath = g_appBundlePath + "/" + name + (ext.empty() ? "" : "." + ext);
+            auto bit = g_bundlePaths.find(self);
+            std::string root = (bit != g_bundlePaths.end()) ? bit->second : g_appBundlePath;
+            // У двухаргументного варианта a3 — мусор из регистра, читать его нельзя.
+            bool hasDir = strcmp(op, "pathForResource:ofType:inDirectory:") == 0;
+            std::string dir = (hasDir && a3) ? GetNSString(a3) : "";
+            if (!dir.empty()) root += "/" + dir;
+            std::string fullPath = root + "/" + name + (ext.empty() ? "" : "." + ext);
             struct stat buffer;
             if (stat(fullPath.c_str(), &buffer) == 0) {
                 LogToJava("HLE_DEBUG: [NSBundle pathForResource] НАЙДЕН: " + fullPath);
@@ -5011,7 +6022,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                     void* view = (void*)Stub_objc_msgSend(uiview_cls, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                     float x = 0, y = 0, w = (float)g_surfaceWidth, h = (float)g_surfaceHeight;
                     uint32_t px, py, pw, ph; memcpy(&px, &x, 4); memcpy(&py, &y, 4); memcpy(&pw, &w, 4); memcpy(&ph, &h, 4);
-                    view = (void*)Stub_objc_msgSend(view, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                    view = (void*)HLE_MsgSendRectBits(view, "initWithFrame:", px, py, pw, ph);
                     g_views[view].type = "UIView";
                     g_viewControllersViews[self] = view;
                 }
@@ -5160,30 +6171,49 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "setDelegate:") == 0) { g_dictionaries[self][(void*)0x1007] = a1; return 0; }
             if (strcmp(op, "setDataSource:") == 0) { g_dictionaries[self][(void*)0x1008] = a1; return 0; }
             if (strcmp(op, "reloadData") == 0) {
+                std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
                 void* ds = g_dictionaries[self][(void*)0x1008];
+                g_dbgReloadCount++; g_dbgReloadSelf = self; g_dbgReloadDs = ds;   // ВРЕМЕННЫЕ
                 if (ds) {
-                    uint32_t rows = Stub_objc_msgSend(ds, "tableView:numberOfRowsInSection:", self, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                    uint32_t sections = 1;
+                    {
+                        uint32_t dsIsa = 0;
+                        bool hasIMP = SafeRead32((uint32_t)(uintptr_t)ds, &dsIsa) && dsIsa != 0xDEADBEEF &&
+                                      FindMethodIMP(dsIsa, "numberOfSectionsInTableView:");
+                        g_dbgHasSecIMP = hasIMP ? 1 : 0;   // ВРЕМЕННЫЙ
+                        if (hasIMP)
+                            sections = Stub_objc_msgSend(ds, "numberOfSectionsInTableView:", self, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                        g_dbgRawSections = (int)sections;   // ВРЕМЕННЫЙ
+                        if (sections == 0 || sections > 64) sections = 1;
+                        g_dbgSections = (int)sections;   // ВРЕМЕННЫЙ
+                    }
                     float curY = 0;
+                    for (uint32_t s = 0; s < sections; s++) {
+                    uint32_t rows = Stub_objc_msgSend(ds, "tableView:numberOfRowsInSection:", self, (void*)(uintptr_t)s, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                     for (uint32_t i = 0; i < rows; i++) {
                         uint32_t* indexPath = (uint32_t*)calloc(1, 32);
                         indexPath[0] = (uint32_t)g_hleClasses["NSIndexPath"];
                         indexPath[1] = i; // Store row
-                        
+                        indexPath[2] = s; // Store section
+
                         void* cell = (void*)Stub_objc_msgSend(ds, "tableView:cellForRowAtIndexPath:", self, indexPath, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                        g_dbgRows = (int)rows; g_dbgLastCell = cell;   // ВРЕМЕННЫЕ
                         if (cell) {
+                            g_dbgCellsAdded++;   // ВРЕМЕННЫЙ
                             Stub_objc_msgSend(self, "addSubview:", cell, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                             float x = 0, y = curY, w = (float)g_surfaceWidth, h = 50;
                             uint32_t px, py, pw, ph; memcpy(&px, &x, 4); memcpy(&py, &y, 4); memcpy(&pw, &w, 4); memcpy(&ph, &h, 4);
-                            Stub_objc_msgSend(cell, "setFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                            HLE_MsgSendRectBits(cell, "setFrame:", px, py, pw, ph);
                             curY += 50;
                             
                             uint32_t* btn = (uint32_t*)Stub_objc_msgSend((void*)g_hleClasses["UIButton"], "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                            Stub_objc_msgSend((void*)btn, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                            HLE_MsgSendRectBits((void*)btn, "initWithFrame:", px, py, pw, ph);
                             Stub_objc_msgSend((void*)btn, "addTarget:action:forControlEvents:", self, (void*)"didSelectFakeBtn:", (void*)1, nullptr, nullptr, nullptr, nullptr, nullptr);
                             g_dictionaries[(void*)btn][(void*)0x1009] = indexPath;
                             g_views[btn].alpha = 0.0f;
                             Stub_objc_msgSend(self, "addSubview:", btn, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                         }
+                    }
                     }
                 }
                 return 0;
@@ -5212,7 +6242,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                     label = (void*)Stub_objc_msgSend((void*)g_hleClasses["UILabel"], "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                     float x = 15, y = 10, w = (float)g_surfaceWidth - 30, h = 30;
                     uint32_t px, py, pw, ph; memcpy(&px, &x, 4); memcpy(&py, &y, 4); memcpy(&pw, &w, 4); memcpy(&ph, &h, 4);
-                    Stub_objc_msgSend(label, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                    HLE_MsgSendRectBits(label, "initWithFrame:", px, py, pw, ph);
                     g_uiColors[label] = {0.0f, 0.0f, 0.0f, 1.0f}; // Black text
                     g_views[label].textColor = g_uiColors[label]; g_views[label].hasTextCol = true;
                     Stub_objc_msgSend(self, "addSubview:", label, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -5222,6 +6252,41 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
             if (strcmp(op, "contentView") == 0) return (uint64_t)(uintptr_t)self;
             if (strcmp(op, "setAccessoryType:") == 0) return 0;
+        }
+
+        if (clsName == "UINavigationItem") {
+            if (strcmp(op, "setTitle:") == 0) { g_barItemTitles[self] = GetNSString(a1); return 0; }
+            if (strcmp(op, "title") == 0) return (uint64_t)(uintptr_t)CreateNSString(g_barItemTitles[self]);
+            if (strcmp(op, "setRightBarButtonItem:") == 0 || strcmp(op, "setRightBarButtonItem:animated:") == 0) {
+                g_dictionaries[self][(void*)0x2001] = a1; return 0;
+            }
+            if (strcmp(op, "setLeftBarButtonItem:") == 0 || strcmp(op, "setLeftBarButtonItem:animated:") == 0) {
+                g_dictionaries[self][(void*)0x2002] = a1; return 0;
+            }
+            if (strcmp(op, "rightBarButtonItem") == 0) return (uint64_t)(uintptr_t)g_dictionaries[self][(void*)0x2001];
+            if (strcmp(op, "leftBarButtonItem") == 0) return (uint64_t)(uintptr_t)g_dictionaries[self][(void*)0x2002];
+            if (strcmp(op, "setHidesBackButton:") == 0) return 0;
+        }
+
+        if (clsName == "UIBarButtonItem") {
+            if (strcmp(op, "initWithBarButtonSystemItem:target:action:") == 0) {
+                static const char* sysNames[] = {"Done", "Cancel", "Edit", "Save", "Add"};
+                uint32_t sysItem = (uint32_t)(uintptr_t)a1;
+                g_barItemTitles[self] = sysItem < 5 ? sysNames[sysItem] : "OK";
+                g_dictionaries[self][(void*)0x2003] = a2;
+                g_dictionaries[self][(void*)0x2004] = a3;
+                return (uint64_t)(uintptr_t)self;
+            }
+            if (strcmp(op, "initWithTitle:style:target:action:") == 0) {
+                g_barItemTitles[self] = GetNSString(a1);
+                g_dictionaries[self][(void*)0x2003] = a3;
+                g_dictionaries[self][(void*)0x2004] = a4;
+                return (uint64_t)(uintptr_t)self;
+            }
+            if (strcmp(op, "setTarget:") == 0) { g_dictionaries[self][(void*)0x2003] = a1; return 0; }
+            if (strcmp(op, "setAction:") == 0) { g_dictionaries[self][(void*)0x2004] = a1; return 0; }
+            if (strcmp(op, "setTitle:") == 0) { g_barItemTitles[self] = GetNSString(a1); return 0; }
+            if (strcmp(op, "setStyle:") == 0 || strcmp(op, "setEnabled:") == 0) return 0;
         }
 
         if (clsName == "UINavigationController") {
@@ -5242,7 +6307,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                     containerView = (void*)Stub_objc_msgSend(uiview_cls, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                     float cx = 0, cy = 0, cw = (float)g_surfaceWidth, ch = (float)g_surfaceHeight;
                     uint32_t pcx, pcy, pcw, pch; memcpy(&pcx, &cx, 4); memcpy(&pcy, &cy, 4); memcpy(&pcw, &cw, 4); memcpy(&pch, &ch, 4);
-                    Stub_objc_msgSend(containerView, "initWithFrame:", (void*)(uintptr_t)pcx, (void*)(uintptr_t)pcy, (void*)(uintptr_t)pcw, (void*)(uintptr_t)pch, nullptr, nullptr, nullptr, nullptr);
+                    HLE_MsgSendRectBits(containerView, "initWithFrame:", pcx, pcy, pcw, pch);
                     g_views[containerView].type = "UIView";
                     g_uiColors[containerView] = {1.0f, 1.0f, 1.0f, 1.0f};
                     g_views[containerView].bgColor = g_uiColors[containerView]; g_views[containerView].hasBg = true;
@@ -5250,7 +6315,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                     uint32_t* navBar = (uint32_t*)Stub_objc_msgSend(self, "navigationBar", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                     float nx = 0, ny = 0, nw = (float)g_surfaceWidth, nh = 44;
                     uint32_t pnx, pny, pnw, pnh; memcpy(&pnx, &nx, 4); memcpy(&pny, &ny, 4); memcpy(&pnw, &nw, 4); memcpy(&pnh, &nh, 4);
-                    Stub_objc_msgSend(navBar, "initWithFrame:", (void*)(uintptr_t)pnx, (void*)(uintptr_t)pny, (void*)(uintptr_t)pnw, (void*)(uintptr_t)pnh, nullptr, nullptr, nullptr, nullptr);
+                    HLE_MsgSendRectBits(navBar, "initWithFrame:", pnx, pny, pnw, pnh);
                     g_views[navBar].type = "UINavigationBar";
                     g_uiColors[navBar] = {0.85f, 0.85f, 0.85f, 1.0f};
                     g_views[navBar].bgColor = g_uiColors[navBar]; g_views[navBar].hasBg = true;
@@ -5262,9 +6327,21 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         if (rootVCView) {
                             float rx = 0, ry = 44, rw = (float)g_surfaceWidth, rh = (float)g_surfaceHeight - 44;
                             uint32_t prx, pry, prw, prh; memcpy(&prx, &rx, 4); memcpy(&pry, &ry, 4); memcpy(&prw, &rw, 4); memcpy(&prh, &rh, 4);
-                            Stub_objc_msgSend(rootVCView, "setFrame:", (void*)(uintptr_t)prx, (void*)(uintptr_t)pry, (void*)(uintptr_t)prw, (void*)(uintptr_t)prh, nullptr, nullptr, nullptr, nullptr);
+                            HLE_MsgSendRectBits(rootVCView, "setFrame:", prx, pry, prw, prh);
                             Stub_objc_msgSend(containerView, "addSubview:", rootVCView, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                         }
+                        // Кнопку Done контроллер вешает в viewWillAppear:, так что
+                        // навбар собираем только после этого вызова.
+                        uint32_t rootIsa = 0;
+                        if (SafeRead32((uint32_t)(uintptr_t)rootVC, &rootIsa) && rootIsa > 0x1000 &&
+                            ((uint32_t*)rootIsa)[0] != 0xDEADBEEF) {
+                            void* impVWA = FindMethodIMP(rootIsa, "viewWillAppear:");
+                            if (impVWA) {
+                                typedef void (*VWAFunc)(void*, const char*, uint32_t);
+                                ((VWAFunc)impVWA)(rootVC, "viewWillAppear:", 1);
+                            }
+                        }
+                        HLE_BuildNavBar(navBar, rootVC);
                     }
                     g_dictionaries[self][(void*)0x1011] = containerView;
                 }
@@ -5300,7 +6377,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         
                         float rx = 0, ry = 44, rw = (float)g_surfaceWidth, rh = (float)g_surfaceHeight - 44;
                         uint32_t prx, pry, prw, prh; memcpy(&prx, &rx, 4); memcpy(&pry, &ry, 4); memcpy(&prw, &rw, 4); memcpy(&prh, &rh, 4);
-                        Stub_objc_msgSend(newView, "setFrame:", (void*)(uintptr_t)prx, (void*)(uintptr_t)pry, (void*)(uintptr_t)prw, (void*)(uintptr_t)prh, nullptr, nullptr, nullptr, nullptr);
+                        HLE_MsgSendRectBits(newView, "setFrame:", prx, pry, prw, prh);
                         Stub_objc_msgSend(newView, "setHidden:", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                         Stub_objc_msgSend(containerView, "addSubview:", newView, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                         
@@ -5309,7 +6386,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                             uint32_t* backBtn = (uint32_t*)Stub_objc_msgSend((void*)g_hleClasses["UIButton"], "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                             float bx = 5, by = 7, bw = 60, bh = 30;
                             uint32_t pbx, pby, pbw, pbh; memcpy(&pbx, &bx, 4); memcpy(&pby, &by, 4); memcpy(&pbw, &bw, 4); memcpy(&pbh, &bh, 4);
-                            Stub_objc_msgSend(backBtn, "initWithFrame:", (void*)(uintptr_t)pbx, (void*)(uintptr_t)pby, (void*)(uintptr_t)pbw, (void*)(uintptr_t)pbh, nullptr, nullptr, nullptr, nullptr);
+                            HLE_MsgSendRectBits(backBtn, "initWithFrame:", pbx, pby, pbw, pbh);
                             Stub_objc_msgSend(backBtn, "setTitle:forState:", CreateNSString("< Back"), (void*)0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                             g_uiColors[backBtn] = {0.2f, 0.4f, 0.8f, 1.0f};
                             g_views[backBtn].bgColor = g_uiColors[backBtn]; g_views[backBtn].hasBg = true;
@@ -5714,6 +6791,38 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 if (idx < s.length()) s = s.substr(0, idx);
                 return (uint64_t)(uintptr_t)CreateNSString(s);
             }
+            if (strcmp(op, "lastPathComponent") == 0) {
+                std::string s = GetNSString(self);
+                while (s.size() > 1 && s.back() == '/') s.pop_back();
+                size_t sl = s.rfind('/');
+                return (uint64_t)(uintptr_t)CreateNSString(sl == std::string::npos ? s : s.substr(sl + 1));
+            }
+            if (strcmp(op, "stringByDeletingLastPathComponent") == 0) {
+                std::string s = GetNSString(self);
+                while (s.size() > 1 && s.back() == '/') s.pop_back();
+                size_t sl = s.rfind('/');
+                if (sl == std::string::npos) return (uint64_t)(uintptr_t)CreateNSString("");
+                if (sl == 0) return (uint64_t)(uintptr_t)CreateNSString("/");
+                return (uint64_t)(uintptr_t)CreateNSString(s.substr(0, sl));
+            }
+            if (strcmp(op, "pathExtension") == 0) {
+                std::string s = GetNSString(self);
+                size_t sl = s.rfind('/'), dot = s.rfind('.');
+                if (dot == std::string::npos || (sl != std::string::npos && dot < sl) || dot + 1 >= s.size())
+                    return (uint64_t)(uintptr_t)CreateNSString("");
+                return (uint64_t)(uintptr_t)CreateNSString(s.substr(dot + 1));
+            }
+            if (strcmp(op, "stringByDeletingPathExtension") == 0) {
+                std::string s = GetNSString(self);
+                size_t sl = s.rfind('/'), dot = s.rfind('.');
+                if (dot == std::string::npos || (sl != std::string::npos && dot < sl))
+                    return (uint64_t)(uintptr_t)CreateNSString(s);
+                return (uint64_t)(uintptr_t)CreateNSString(s.substr(0, dot));
+            }
+            if (strcmp(op, "stringByAppendingPathExtension:") == 0) {
+                std::string ext = GetNSString(a1);
+                return (uint64_t)(uintptr_t)CreateNSString(GetNSString(self) + (ext.empty() ? "" : "." + ext));
+            }
             if (strcmp(op, "sizeWithFont:") == 0 || strcmp(op, "sizeWithFont:constrainedToSize:") == 0 || strcmp(op, "sizeWithFont:constrainedToSize:lineBreakMode:") == 0) {
                 float w = 300.0f, h = 30.0f;
                 uint32_t iw, ih; memcpy(&iw, &w, 4); memcpy(&ih, &h, 4);
@@ -5918,13 +7027,38 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 return (uint64_t)(uintptr_t)arrInst;
             }
         }
+        if (clsName == "UIColor") {
+            // CGColorRef у нас — тот же объект: компоненты лежат в g_uiColors.
+            if (strcmp(op, "CGColor") == 0) return (uint64_t)(uintptr_t)self;
+            if (strcmp(op, "set") == 0 || strcmp(op, "setFill") == 0 || strcmp(op, "setStroke") == 0) return 0;
+        }
         if (clsName == "NSNumber") {
-            if (strcmp(op, "intValue") == 0 || strcmp(op, "integerValue") == 0) {
+            double num = 0;
+            {
                 uint32_t type = self_ptr[2];
-                if (type == 9 || type == 3) return self_ptr[1];
-                if (type == 12) { float f; memcpy(&f, &self_ptr[1], 4); return (int)f; }
-                if (type == 13) { double d; memcpy(&d, &self_ptr[1], 8); return (int)d; }
-                return self_ptr[1];
+                if (type == 12) { float f; memcpy(&f, &self_ptr[1], 4); num = f; }
+                else if (type == 13) { memcpy(&num, &self_ptr[1], 8); }
+                else num = (double)(int32_t)self_ptr[1];
+            }
+            if (strcmp(op, "intValue") == 0 || strcmp(op, "integerValue") == 0 ||
+                strcmp(op, "unsignedIntValue") == 0 || strcmp(op, "longValue") == 0)
+                return (uint64_t)(int32_t)num;
+            if (strcmp(op, "boolValue") == 0 || strcmp(op, "charValue") == 0)
+                return num != 0 ? 1 : 0;
+            if (strcmp(op, "floatValue") == 0) {
+                float f = (float)num;
+                g_fpu_ret[0] = f; g_fpu_ret_flag = 1;
+                uint32_t ret; memcpy(&ret, &f, 4); return ret;
+            }
+            if (strcmp(op, "doubleValue") == 0) {
+                memcpy(g_fpu_ret, &num, 8); g_fpu_ret_flag = 1;
+                uint64_t ret; memcpy(&ret, &num, 8); return ret;
+            }
+            if (strcmp(op, "stringValue") == 0 || strcmp(op, "description") == 0) {
+                char buf[32];
+                if (num == (double)(int32_t)num) snprintf(buf, sizeof(buf), "%d", (int32_t)num);
+                else snprintf(buf, sizeof(buf), "%g", num);
+                return (uint64_t)(uintptr_t)CreateNSString(buf);
             }
         }
             if (clsName == "NSFileManager") {
@@ -6121,13 +7255,42 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             uint64_t ret; memcpy(&ret, &t, 8); return ret;
         }
 
-        if (strncmp(op, "init", 4) == 0) return (uint64_t)(uintptr_t)self; 
+        if (strncmp(op, "init", 4) == 0) return (uint64_t)(uintptr_t)self;
         if (strcmp(op, "drain") == 0) return 0;
         if (strcmp(op, "touchesBegan:withEvent:") == 0 || strcmp(op, "touchesMoved:withEvent:") == 0 ||
             strcmp(op, "touchesEnded:withEvent:") == 0 || strcmp(op, "touchesCancelled:withEvent:") == 0) {
             return 0;
         }
-        
+
+        if (strcmp(op, "isKindOfClass:") == 0 || strcmp(op, "isMemberOfClass:") == 0) {
+            std::string want = GetObjCClassName(a1);
+            if (want == clsName) return 1;
+            if (strcmp(op, "isMemberOfClass:") == 0) return 0;
+            if (want == "NSObject") return 1;
+            // NSMutableFoo — это тоже NSFoo.
+            auto strip = [](std::string s) {
+                if (s.compare(0, 9, "NSMutable") == 0) return "NS" + s.substr(9);
+                return s;
+            };
+            return strip(want) == strip(clsName) ? 1 : 0;
+        }
+        if (strcmp(op, "navigationItem") == 0) return (uint64_t)(uintptr_t)HLE_NavigationItemFor(self);
+        if (clsName == "NSString" && strcmp(op, "boolValue") == 0) {
+            std::string s = GetNSString(self);
+            return (s == "1" || s == "YES" || s == "yes" || s == "true" || s == "TRUE") ? 1 : 0;
+        }
+        if (strcmp(op, "isEqual:") == 0 || strcmp(op, "isEqualToString:") == 0) {
+            if (self == a1) return 1;
+            if (!a1) return 0;
+            if (clsName == "NSString") return GetNSString(self) == GetNSString(a1) ? 1 : 0;
+            return 0;
+        }
+        if (strcmp(op, "setValue:forKey:") == 0 &&
+            (clsName == "NSMutableDictionary" || clsName == "NSDictionary")) {
+            g_dictionariesHLE[self][GetNSString(a2)] = a1;
+            return 0;
+        }
+
         char ptrStr[32]; snprintf(ptrStr, sizeof(ptrStr), "0x%lx", (unsigned long)(uintptr_t)self);
         LogToJava(std::string("OBJC-TODO: Unimplemented HLE Instance Method -[(") + clsName + "*) " + ptrStr + " " + std::string(op) + "]");
         return (uint64_t)(uintptr_t)self;
@@ -6167,7 +7330,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         uint32_t* tv_cls = (uint32_t*)g_hleClasses["UITableView"];
                         if (tv_cls) {
                             view = (void*)Stub_objc_msgSend(tv_cls, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                            view = (void*)Stub_objc_msgSend(view, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                            view = (void*)HLE_MsgSendRectBits(view, "initWithFrame:", px, py, pw, ph);
                             Stub_objc_msgSend(view, "setDelegate:", self, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                             Stub_objc_msgSend(view, "setDataSource:", self, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                             Stub_objc_msgSend(view, "reloadData", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -6176,12 +7339,34 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                             g_views[view].bgColor = g_uiColors[view]; g_views[view].hasBg = true;
                         }
                     }
+                    // Контроллер без loadView обычно приезжает из .nib — грузим его.
+                    if (!view) {
+                        std::string nibName = g_nibNames.count(self) ? g_nibNames[self] : "";
+                        std::string nibPath = nibName.empty() ? "" : ResolveNibPath(nibName);
+                        if (nibPath.empty()) nibPath = ResolveNibPath(cName);
+                        if (nibPath.empty() && cName.size() > 14 &&
+                            cName.compare(cName.size() - 14, 14, "ViewController") == 0)
+                            nibPath = ResolveNibPath(cName.substr(0, cName.size() - 14));
+                        if (!nibPath.empty()) {
+                            std::vector<void*> top = LoadNibArchive(nibPath, self);
+                            if (g_viewControllersViews.count(self)) view = g_viewControllersViews[self];
+                            if (!view) for (void* o : top) if (o && g_views.count(o)) { view = o; break; }
+                            if (view) LogToJava("HLE: view для " + cName + " взят из " + nibPath);
+                        }
+                    }
+
+                    // EAGLView вслепую подсовываем только корневому контроллеру:
+                    // для модалок это плодит второй GL-вью и вешает игру.
                     if (!view) {
                         uint32_t viewClassAddr = 0;
-                        for (auto const& pair : g_appSymbols) {
-                            if (pair.first.find("_OBJC_CLASS_$_EAGLView") == 0) {
-                                viewClassAddr = pair.second; break;
+                        if (!g_mainView) {
+                            for (auto const& pair : g_appSymbols) {
+                                if (pair.first.find("_OBJC_CLASS_$_EAGLView") == 0) {
+                                    viewClassAddr = pair.second; break;
+                                }
                             }
+                        } else {
+                            LogToJava("HLE: " + cName + " без loadView и без nib — пустой UIView (EAGLView не дублируем)");
                         }
                         if (viewClassAddr) {
                             view = (void*)Stub_objc_msgSend((void*)viewClassAddr, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -6190,9 +7375,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                                 dummyCoder[0] = g_hleClasses.count("NSCoder") ? (uint32_t)g_hleClasses["NSCoder"] : 0xDEADBEEF;
                                 view = (void*)Stub_objc_msgSend(view, "initWithCoder:", dummyCoder, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                                 g_views[view].frame = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
-                                Stub_objc_msgSend(view, "setFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                                HLE_MsgSendRectBits(view, "setFrame:", px, py, pw, ph);
                             } else {
-                                view = (void*)Stub_objc_msgSend(view, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                                view = (void*)HLE_MsgSendRectBits(view, "initWithFrame:", px, py, pw, ph);
                             }
                             if (FindMethodIMP(viewClassAddr, "awakeFromNib")) {
                                 LogToJava("HLE: Calling awakeFromNib for EAGLView");
@@ -6201,7 +7386,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         } else {
                             uint32_t* uiview_cls = (uint32_t*)ResolveSymbol("OBJC_CLASS_$_UIView");
                             view = (void*)Stub_objc_msgSend(uiview_cls, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                            view = (void*)Stub_objc_msgSend(view, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
+                            view = (void*)HLE_MsgSendRectBits(view, "initWithFrame:", px, py, pw, ph);
                         }
                         g_views[view].type = "UIView";
                         g_uiColors[view] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -6223,10 +7408,22 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             g_viewControllersViews[self] = a1; if (cName == "MainViewController") g_mainView = a1; return 0;
         }
                 if (strcmp(op, "presentModalViewController:animated:") == 0) {
+            std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
             void* modalVC = a1;
-            g_presentedView = (void*)Stub_objc_msgSend(modalVC, "view", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-            LogToJava("HLE: Modal Controller Presented!");
-            
+            // UIKit не даёт контроллеру показать вторую модалку поверх своей же:
+            // повторный вызов молча игнорируется. Minecraft на этом и держится —
+            // showDialog(3) шлёт showDialog_MainMenuOptions и следом
+            // showDialog_RenameMPWorld, и второй диалог на iOS не появляется.
+            if (g_presentedByVC.count(self) && g_presentedByVC[self]) {
+                LogToJava("HLE: " + cName + " уже показывает модалку — "
+                          + GetObjCClassName(modalVC) + " пропущен");
+                return 0;
+            }
+            void* modalView = (void*)Stub_objc_msgSend(modalVC, "view", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            if (modalView) { g_modalStack.push_back(modalView); g_presentedView = modalView; }
+            g_presentedByVC[self] = modalVC;
+            g_modalPresenters.push_back(self);
+
             uint32_t modalIsa = ((uint32_t*)modalVC)[0];
             void* impVDA = FindMethodIMP(modalIsa, "viewDidAppear:");
             if (impVDA) {
@@ -6238,12 +7435,27 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 
         if (strcmp(op, "dismissModalViewControllerAnimated:") == 0) {
-            g_presentedView = nullptr; 
+            std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
+            if (!g_modalStack.empty()) g_modalStack.pop_back();
+            if (!g_modalPresenters.empty()) {
+                g_presentedByVC.erase(g_modalPresenters.back());
+                g_modalPresenters.pop_back();
+            }
+            g_presentedByVC.erase(self);
+            g_presentedView = g_modalStack.empty() ? nullptr : g_modalStack.back();
             g_pointerToUI.clear(); // Очищаем старые привязки кнопок модалки
-            LogToJava("HLE: Modal Controller Dismissed!"); return 0;
+            LogToJava("HLE: Modal Controller Dismissed, в стеке осталось " +
+                      std::to_string(g_modalStack.size()));
+            return 0;
         }
 
         if (strcmp(op, "class") == 0) return (uint64_t)isa;
+
+        if (strcmp(op, "initWithNibName:bundle:") == 0) {
+            std::string nibName = GetNSString(a1);
+            if (!nibName.empty()) g_nibNames[self] = nibName;
+            if (!FindMethodIMP(isa, op)) return (uint64_t)(uintptr_t)self;
+        }
 
         void* imp = FindMethodIMP(isa, op);
         if (imp) {
@@ -6268,6 +7480,11 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return 0;
         }
         
+        if (strcmp(op, "navigationItem") == 0) return (uint64_t)(uintptr_t)HLE_NavigationItemFor(self);
+        if (strcmp(op, "setTitle:") == 0 && cName.find("ViewController") != std::string::npos) {
+            g_barItemTitles[HLE_NavigationItemFor(self)] = GetNSString(a1);
+            return 0;
+        }
         if (strcmp(op, "setMetricsId:") == 0) return 0;
         if (strcmp(op, "setClearsContextBeforeDrawing:") == 0) return 0;
         if (strcmp(op, "viewDidAppear:") == 0) return 0;
@@ -6285,6 +7502,44 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 
         std::string baseSysClass = GetBaseSystemClassName(isa);
+
+        // Наследники системных контролов (IASKSwitch, IASKSlider, IASKTextField)
+        // своих реализаций не имеют — обслуживаем их как базовый класс.
+        if (baseSysClass == "UISwitch") {
+            if (strcmp(op, "setOn:") == 0 || strcmp(op, "setOn:animated:") == 0) {
+                g_views[self].type = "UISwitch";
+                g_views[self].switchState = (a1 != nullptr);
+                return 0;
+            }
+            if (strcmp(op, "isOn") == 0 || strcmp(op, "on") == 0)
+                return g_views.count(self) && g_views[self].switchState ? 1 : 0;
+        }
+        if (baseSysClass == "UISlider") {
+            auto& sl = g_sliders[self];
+            if (strcmp(op, "setMinimumValue:") == 0) { sl.minValue = saved_s[0]; return 0; }
+            if (strcmp(op, "setMaximumValue:") == 0) { sl.maxValue = saved_s[0]; return 0; }
+            if (strcmp(op, "setValue:") == 0 || strcmp(op, "setValue:animated:") == 0) {
+                sl.value = saved_s[0];
+                g_views[self].type = "UISlider";
+                return 0;
+            }
+            if (strcmp(op, "value") == 0) { g_fpu_ret[0] = sl.value; g_fpu_ret_flag = 1; return 0; }
+            if (strcmp(op, "minimumValue") == 0) { g_fpu_ret[0] = sl.minValue; g_fpu_ret_flag = 1; return 0; }
+            if (strcmp(op, "maximumValue") == 0) { g_fpu_ret[0] = sl.maxValue; g_fpu_ret_flag = 1; return 0; }
+        }
+        if (baseSysClass == "UITextField") {
+            if (strcmp(op, "setDelegate:") == 0 || strcmp(op, "setReturnKeyType:") == 0 ||
+                strcmp(op, "setSecureTextEntry:") == 0 || strcmp(op, "setKeyboardType:") == 0 ||
+                strcmp(op, "setAutocapitalizationType:") == 0 || strcmp(op, "setAutocorrectionType:") == 0 ||
+                strcmp(op, "setClearButtonMode:") == 0 || strcmp(op, "setTextAlignment:") == 0)
+                return 0;
+        }
+        if (baseSysClass == "UITableViewCell") {
+            if (strcmp(op, "setAccessoryType:") == 0 || strcmp(op, "setNeedsLayout") == 0 ||
+                strcmp(op, "setSelectionStyle:") == 0 || strcmp(op, "layoutIfNeeded") == 0)
+                return 0;
+        }
+
         char ptrStr[32]; snprintf(ptrStr, sizeof(ptrStr), "0x%lx", (unsigned long)(uintptr_t)self);
         LogToJava(std::string("OBJC-TODO: Unimplemented Message [") + std::string(op) + "] sent to instance of (" + cName + "*) " + ptrStr + " <- base system class (" + baseSysClass + ")");
         return 0; 
@@ -6388,9 +7643,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         LogToJava("  Writing (Float): x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
 
         if (ret_addr) {
-            LogToJava("  [STRET-MEM] До записи:    " + DumpHexToString((const char*)ret_addr, 16));
             memcpy(ret_addr, rectData, 16);
-            LogToJava("  [STRET-MEM] После записи: " + DumpHexToString((const char*)ret_addr, 16));
         } else {
             LogToJava("  [STRET-MEM] ВНИМАНИЕ: ret_addr == NULL!");
         }
@@ -7583,7 +8836,7 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         void* window = (void*)Stub_objc_msgSend((void*)ResolveSymbol("OBJC_CLASS_$_UIWindow"), "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         float wx = 0, wy = 0, ww = (float)g_surfaceWidth, wh = (float)g_surfaceHeight;
         uint32_t pwx, pwy, pww, pwh; memcpy(&pwx, &wx, 4); memcpy(&pwy, &wy, 4); memcpy(&pww, &ww, 4); memcpy(&pwh, &wh, 4);
-        window = (void*)Stub_objc_msgSend(window, "initWithFrame:", (void*)(uintptr_t)pwx, (void*)(uintptr_t)pwy, (void*)(uintptr_t)pww, (void*)(uintptr_t)pwh, nullptr, nullptr, nullptr, nullptr);
+        window = (void*)HLE_MsgSendRectBits(window, "initWithFrame:", pwx, pwy, pww, pwh);
         if (FindMethodIMP(appDelIsa, "setWindow:")) {
             Stub_objc_msgSend(appDel, "setWindow:", window, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         }
@@ -7783,6 +9036,10 @@ void* hle_kCFPreferencesCurrentUser = nullptr;
 void* hle_kCFStreamPropertyHTTPResponseHeader = nullptr;
 void* hle_kCFStreamPropertyHTTPShouldAutoredirect = nullptr;
 void* hle_kSecAttrAccessGroup = nullptr;
+void* hle_kSecAttrAccessible = nullptr;
+void* hle_kSecAttrAccessibleWhenUnlocked = nullptr;
+void* hle_kSecAttrDescription = nullptr;
+void* hle_kSecAttrLabel = nullptr;
 void* hle_kSecAttrAccount = nullptr;
 void* hle_kSecAttrGeneric = nullptr;
 void* hle_kSecAttrService = nullptr;
@@ -8853,32 +10110,53 @@ extern "C" int wrap_aio_read(void *aiocbp) {
 }
 extern "C" int wrap_aio_error(void *aiocbp) { return -1; }
 extern "C" ssize_t wrap_aio_return(void *aiocbp) { return -1; }
+// --- РЕАЛЬНЫЕ СОКЕТЫ (BSD/iOS <-> Linux) ---
+// MCPE 0.1.x даже в одиночной игре поднимает локальный RakNet-сервер и ходит к нему
+// по UDP через 127.0.0.1, поэтому заглушки сокетов рвут игровую сессию.
+//
+// iOS-раскладка sockaddr начинается с {uint8 sa_len, uint8 sa_family}, Linux — с
+// uint16 sa_family; в обоих случаях полезная нагрузка начинается со смещения 2.
+uint8_t g_isWrapSock[65536] = {0};
+static inline bool IsWrapSock(int fd) { return fd >= 0 && fd < 65536 && g_isWrapSock[fd]; }
+
+#define IOS_AF_INET6      30
+#define IOS_SOL_SOCKET    0xFFFF
+#define IOS_O_NONBLOCK    0x0004
+#define IOS_FIONBIO       0x8004667EUL
+#define IOS_FIONREAD      0x4004667FUL
+#define LNX_FIONBIO       0x5421UL
+#define LNX_FIONREAD      0x541BUL
+
 extern "C" int wrap_ioctl(int fd, unsigned long request, ...) {
-    if (fd == 100) return 0; // Имитация успеха для RakNet
     va_list args; va_start(args, request); void* argp = va_arg(args, void*); va_end(args);
+    if (IsWrapSock(fd)) {
+        if (request == IOS_FIONBIO) request = LNX_FIONBIO;
+        else if (request == IOS_FIONREAD) request = LNX_FIONREAD;
+    }
     return ioctl(fd, request, argp);
 }
 extern "C" int wrap_fcntl(int fd, int cmd, ...) {
-    if (fd == 100) return 0; // Защита от O_NONBLOCK на фейковом сокете
     va_list args; va_start(args, cmd); void* argp = va_arg(args, void*); va_end(args);
+    // У iOS O_NONBLOCK = 0x0004, у Linux = 0x0800 — без трансляции сокет остаётся блокирующим.
+    if (IsWrapSock(fd)) {
+        if (cmd == F_GETFL) {
+            int fl = fcntl(fd, F_GETFL, 0);
+            if (fl < 0) return -1;
+            return (fl & O_NONBLOCK) ? ((fl & ~O_NONBLOCK) | IOS_O_NONBLOCK) : fl;
+        }
+        if (cmd == F_SETFL) {
+            int ios = (int)(intptr_t)argp;
+            int fl = fcntl(fd, F_GETFL, 0);
+            if (fl < 0) fl = 0;
+            if (ios & IOS_O_NONBLOCK) fl |= O_NONBLOCK; else fl &= ~O_NONBLOCK;
+            return fcntl(fd, F_SETFL, fl);
+        }
+    }
     return fcntl(fd, cmd, argp);
 }
 extern "C" int wrap_select(int nfds, void *readfds, void *writefds, void *exceptfds, void *timeout) {
-    // Безопасная имитация таймаута без реального вызова select (чтобы не крашилось на фейковых FD)
-    if (timeout) {
-        struct timeval* tv = (struct timeval*)timeout;
-        long usec = tv->tv_sec * 1000000L + tv->tv_usec;
-        if (usec > 0) usleep(usec);
-    } else {
-        usleep(5000); // 5ms sleep, если таймаут не передан
-    }
-    
-    // Очищаем множества сокетов (сообщаем, что нет новых данных)
-    if (readfds) FD_ZERO((fd_set*)readfds);
-    if (writefds) FD_ZERO((fd_set*)writefds);
-    if (exceptfds) FD_ZERO((fd_set*)exceptfds);
-    
-    return 0; // Всегда возвращаем 0 (таймаут)
+    // На 32-битном ARM fd_set и timeval у iOS и Linux совпадают побайтно.
+    return select(nfds, (fd_set*)readfds, (fd_set*)writefds, (fd_set*)exceptfds, (struct timeval*)timeout);
 }
 extern "C" int wrap_statfs(const char *path, struct statfs *buf) {
     return statfs(path, buf);
@@ -8886,11 +10164,14 @@ extern "C" int wrap_statfs(const char *path, struct statfs *buf) {
 extern "C" int wrap_getifaddrs(struct ifaddrs_dummy **ifap) {
     static struct ifaddrs_dummy dummy_ifa;
     static char ifa_name[] = "lo0";
+    // Гость — iOS-бинарник, поэтому раскладка BSD: {sa_len, sa_family, port, addr}.
     static struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
+    uint8_t* sab = (uint8_t*)&sa;
+    sab[0] = sizeof(struct sockaddr_in);
+    sab[1] = AF_INET;
     sa.sin_addr.s_addr = 0x0100007F; // 127.0.0.1
-    
+
     dummy_ifa.ifa_next = nullptr;
     dummy_ifa.ifa_name = ifa_name;
     dummy_ifa.ifa_flags = 0x9; // IFF_UP | IFF_LOOPBACK
@@ -8943,6 +10224,10 @@ extern "C" int wrap_SecItemCopyMatching(void* query, void** result) {
 }
 extern "C" int wrap_SecItemUpdate(void* query, void* attributesToUpdate) {
     LogToJava("HLE: SecItemUpdate called (returning errSecSuccess)");
+    return 0;
+}
+extern "C" int wrap_SecItemDelete(void* query) {
+    LogToJava("HLE: SecItemDelete called (returning errSecSuccess)");
     return 0;
 }
 
@@ -9099,36 +10384,133 @@ extern "C" int wrap_mach_timebase_info(uint32_t* info) {
     if (info) { info[0] = 1; info[1] = 1; } // numer=1, denom=1 (наносекунды)
     return 0;
 }
+static bool SockaddrIOSToLinux(const struct sockaddr* src, socklen_t srcLen,
+                               struct sockaddr_storage* dst, socklen_t* dstLen) {
+    if (!src || srcLen < 2 || !dst || !dstLen) return false;
+    const uint8_t* b = (const uint8_t*)src;
+    uint16_t flat; memcpy(&flat, b, 2);
+    unsigned fam;
+    if (b[1] == AF_INET || b[1] == IOS_AF_INET6) fam = b[1];              // BSD {sa_len, sa_family}
+    else if (flat == AF_INET || flat == AF_INET6) fam = flat;             // уже Linux-раскладка
+    else return false;
+    if (fam == IOS_AF_INET6) fam = AF_INET6;
+
+    memset(dst, 0, sizeof(*dst));
+    dst->ss_family = (sa_family_t)fam;
+    size_t copy = (size_t)srcLen - 2;
+    if (copy > sizeof(*dst) - 2) copy = sizeof(*dst) - 2;
+    memcpy((uint8_t*)dst + 2, b + 2, copy);
+    *dstLen = (fam == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+    return true;
+}
+
+static void SockaddrLinuxToIOS(const struct sockaddr_storage* src, socklen_t srcLen,
+                               struct sockaddr* dst, socklen_t* dstLen) {
+    if (!dst || !dstLen || *dstLen < 2) return;
+    uint8_t tmp[sizeof(struct sockaddr_storage)];
+    memset(tmp, 0, sizeof(tmp));
+    unsigned fam = src->ss_family;
+    socklen_t iosLen = (fam == AF_INET6) ? 28 : 16;
+    tmp[0] = (uint8_t)iosLen;
+    tmp[1] = (uint8_t)((fam == AF_INET6) ? IOS_AF_INET6 : fam);
+    size_t copy = (srcLen > 2) ? (size_t)srcLen - 2 : 0;
+    if (copy > sizeof(tmp) - 2) copy = sizeof(tmp) - 2;
+    memcpy(tmp + 2, (const uint8_t*)src + 2, copy);
+    socklen_t out = (iosLen < *dstLen) ? iosLen : *dstLen;
+    memcpy(dst, tmp, out);
+    *dstLen = iosLen;
+}
+
+static int SockoptIOSToLinux(int* level, int* optname) {
+    if (*level != (int)IOS_SOL_SOCKET) return 0; // IPPROTO_* и их опции совпадают
+    *level = SOL_SOCKET;
+    switch (*optname) {
+        case 0x0001: *optname = SO_DEBUG;      return 0;
+        case 0x0002: *optname = SO_ACCEPTCONN; return 0;
+        case 0x0004: *optname = SO_REUSEADDR;  return 0;
+        case 0x0008: *optname = SO_KEEPALIVE;  return 0;
+        case 0x0010: *optname = SO_DONTROUTE;  return 0;
+        case 0x0020: *optname = SO_BROADCAST;  return 0;
+        case 0x0080: *optname = SO_LINGER;     return 0;
+        case 0x0100: *optname = SO_OOBINLINE;  return 0;
+        case 0x0200: *optname = SO_REUSEPORT;  return 0;
+        case 0x1001: *optname = SO_SNDBUF;     return 0;
+        case 0x1002: *optname = SO_RCVBUF;     return 0;
+        case 0x1003: *optname = SO_SNDLOWAT;   return 0;
+        case 0x1004: *optname = SO_RCVLOWAT;   return 0;
+        case 0x1005: *optname = SO_SNDTIMEO;   return 0;
+        case 0x1006: *optname = SO_RCVTIMEO;   return 0;
+        case 0x1007: *optname = SO_ERROR;      return 0;
+        case 0x1008: *optname = SO_TYPE;       return 0;
+        default: return -1; // например SO_NOSIGPIPE — у Linux аналога нет
+    }
+}
+
 extern "C" int wrap_socket(int domain, int type, int protocol) {
-    LogToJava("C-API-TRACE: socket() ИМИТАЦИЯ УСПЕХА");
-    return 100; // Фейковый file descriptor
+    int ldom = (domain == IOS_AF_INET6) ? AF_INET6 : domain;
+    int fd = socket(ldom, type, protocol);
+    if (fd >= 0) {
+        if (fd < 65536) g_isWrapSock[fd] = 1;
+        int on = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    }
+    LogToJava("C-API-TRACE: socket(dom=" + std::to_string(domain) + " type=" + std::to_string(type) +
+              ") -> fd=" + std::to_string(fd));
+    return fd;
 }
 extern "C" int wrap_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    LogToJava("C-API-TRACE: bind() ИМИТАЦИЯ УСПЕХА");
-    return 0;
+    struct sockaddr_storage ss; socklen_t sl;
+    if (!SockaddrIOSToLinux(addr, addrlen, &ss, &sl)) { errno = EAFNOSUPPORT; return -1; }
+    int r = bind(sockfd, (struct sockaddr*)&ss, sl);
+    unsigned port = ntohs(((struct sockaddr_in*)&ss)->sin_port);
+    LogToJava("C-API-TRACE: bind(fd=" + std::to_string(sockfd) + " port=" + std::to_string(port) +
+              ") -> " + std::to_string(r));
+    return r;
 }
-extern "C" int wrap_listen(int sockfd, int backlog) { return 0; }
+extern "C" int wrap_listen(int sockfd, int backlog) { return listen(sockfd, backlog); }
 extern "C" int wrap_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-    if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
-        struct sockaddr_in* sin = (struct sockaddr_in*)addr;
-        sin->sin_family = AF_INET;
-        sin->sin_port = htons(19132);
-        sin->sin_addr.s_addr = htonl(0x7F000001); // 127.0.0.1
-        *addrlen = sizeof(struct sockaddr_in);
-    }
+    struct sockaddr_storage ss; socklen_t sl = sizeof(ss);
+    if (getsockname(sockfd, (struct sockaddr*)&ss, &sl) != 0) return -1;
+    SockaddrLinuxToIOS(&ss, sl, addr, addrlen);
     return 0;
 }
-extern "C" int wrap_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) { return 0; }
-extern "C" int wrap_getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen) { return 0; }
-extern "C" ssize_t wrap_send(int sockfd, const void *buf, size_t len, int flags) { return len; }
-extern "C" ssize_t wrap_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) { return len; }
-extern "C" ssize_t wrap_recv(int sockfd, void *buf, size_t len, int flags) { 
-    usleep(1000); // 1ms sleep для защиты от жесткого цикла
-    errno = EAGAIN; return -1; 
+extern "C" int wrap_getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    struct sockaddr_storage ss; socklen_t sl = sizeof(ss);
+    if (getpeername(sockfd, (struct sockaddr*)&ss, &sl) != 0) return -1;
+    SockaddrLinuxToIOS(&ss, sl, addr, addrlen);
+    return 0;
 }
-extern "C" ssize_t wrap_recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) { 
-    usleep(1000); 
-    errno = EAGAIN; return -1; 
+extern "C" int wrap_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+    int l = level, o = optname;
+    if (SockoptIOSToLinux(&l, &o) != 0) return 0; // опции без аналога молча принимаем
+    return setsockopt(sockfd, l, o, optval, optlen);
+}
+extern "C" int wrap_getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
+    int l = level, o = optname;
+    if (SockoptIOSToLinux(&l, &o) != 0) {
+        if (optval && optlen && *optlen >= sizeof(int)) { *(int*)optval = 0; *optlen = sizeof(int); }
+        return 0;
+    }
+    return getsockopt(sockfd, l, o, optval, optlen);
+}
+extern "C" ssize_t wrap_send(int sockfd, const void *buf, size_t len, int flags) {
+    return send(sockfd, buf, len, flags);
+}
+extern "C" ssize_t wrap_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
+    if (!dest_addr) return send(sockfd, buf, len, flags);
+    struct sockaddr_storage ss; socklen_t sl;
+    if (!SockaddrIOSToLinux(dest_addr, addrlen, &ss, &sl)) { errno = EAFNOSUPPORT; return -1; }
+    return sendto(sockfd, buf, len, flags, (struct sockaddr*)&ss, sl);
+}
+extern "C" ssize_t wrap_recv(int sockfd, void *buf, size_t len, int flags) {
+    return recv(sockfd, buf, len, flags);
+}
+extern "C" ssize_t wrap_recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
+    struct sockaddr_storage ss; socklen_t sl = sizeof(ss);
+    ssize_t n = recvfrom(sockfd, buf, len, flags, src_addr ? (struct sockaddr*)&ss : nullptr,
+                         src_addr ? &sl : nullptr);
+    if (n >= 0 && src_addr && addrlen) SockaddrLinuxToIOS(&ss, sl, src_addr, addrlen);
+    return n;
 }
 extern "C" int wrap_gethostname(char *name, size_t len) {
     if (name && len > 0) {
@@ -10195,6 +11577,10 @@ extern "C" void* wrap_cxx_ostream_insert_double(void*, double);
 extern "C" void* wrap_cxx_ostream_insert_longlong(void*, long long);
 extern "C" void* wrap_cxx_string_Rep_S_create(size_t, size_t, void*);
 extern "C" void* wrap_cxx_string_clear(void*);
+extern "C" char* wrap_cxx_string_M_ibegin(void*);
+extern "C" char* wrap_cxx_string_M_iend(void*);
+extern "C" void* wrap_cxx_string_erase_pos_len(void*, size_t, size_t);
+extern "C" void* wrap_cxx_string_replace_iter_range(void*, char*, char*, char*, char*);
 extern "C" void* wrap_cxx_string_append_ptr(void*, const char*);
 extern "C" void* wrap_cxx_string_append_len_char(void*, size_t, char);
 extern "C" void* wrap_cxx_string_resize_char(void*, size_t, char);
@@ -10214,7 +11600,7 @@ extern "C" void* wrap_cxx_ios_base_dtor(void*);
 extern "C" void wrap_cxx_basic_ios_init(void*, void*);
 extern "C" void wrap_cxx_basic_ios_clear(void*, int);
 extern "C" void* wrap_cxx_ostream_insert_char_ptr(void*, const char*, int);
-extern "C" void wrap_Rb_tree_rebalance_for_erase(void*, void*);
+extern "C" void* wrap_Rb_tree_rebalance_for_erase(void*, void*);
 extern "C" void* wrap_cxx_use_facet_ctype_char(void*);
 extern "C" void* wrap_cxx_use_facet_ctype_wchar(void*);
 extern "C" char* wrap_cxx_string_begin(void*);
@@ -10237,7 +11623,12 @@ extern "C" void wrap_List_node_base_swap(void*, void*);
 extern "C" void* wrap_new_array_nothrow(size_t, void*);
 extern "C" void* wrap_cxx_basic_ios_operator_void_ptr(void*);
 extern "C" void* wrap_cxx_getline(void*, void*);
+extern "C" void* wrap_cxx_getline_delim(void*, void*, char);
 extern "C" void* wrap_cxx_stringstream_ctor(void*, void*, int);
+extern "C" void* wrap_cxx_stringstream_ctor_mode(void*, int);
+extern "C" void* wrap_cxx_stringstream_dtor(void*);
+extern "C" void* wrap_cxx_ostream_insert_float(void*, float);
+extern "C" void* wrap_cxx_ostream_insert_short(void*, short);
 extern "C" void* wrap_cxx_ios_init(void*, void*);
 extern char wrap_ZSt7nothrow;
 
@@ -10304,6 +11695,20 @@ extern "C" int wrap_inflateInit_(z_streamp strm, const char *version, int stream
     return inflateInit_(strm, version, stream_size);
 }
 extern "C" int wrap_inflateReset(z_streamp strm) { return inflateReset(strm); }
+
+// Игра закрывает дескрипторы, которых не открывала. На Android такой fd уже занят
+// unique_fd самой системы, и fdsan убивает процесс. Чужие закрытия глушим.
+extern "C" int wrap_close(int fd) {
+    typedef uint64_t (*FdsanGetTag)(int);
+    static FdsanGetTag getTag = (FdsanGetTag)dlsym(RTLD_DEFAULT, "android_fdsan_get_owner_tag");
+    if (fd < 0) { errno = EBADF; return -1; }
+    if (getTag && getTag(fd) != 0) {
+        LogToJava("C-API-IO: close(" + std::to_string(fd) + ") — дескриптор системный, закрытие отклонено");
+        return 0;
+    }
+    if (fd < 65536) g_isWrapSock[fd] = 0;
+    return close(fd);
+}
 
 #define STB_S(n) {"_" #n, (void*)Stub_##n}
 #define STB_W(n) {"_" #n, (void*)wrap_##n}
@@ -10375,9 +11780,9 @@ std::map<std::string, void*> g_hleStubs = {
     
     STB_D(acosf), STB_D(asinf), STB_D(strlcpy), STB_D(strtok), STB_D(strerror_r), STB_D(wcscmp), STB_D(wcscpy), STB_D(wcslen), {"_wcschr", (void*)(wchar_t*(*)(wchar_t*, wchar_t))wcschr}, STB_D(wcsncpy), STB_D(wcstombs), STB_D(wcstol), STB_W(memset_pattern16),
     {"_wmemchr", (void*)(wchar_t*(*)(wchar_t*, wchar_t, size_t))wmemchr}, STB_D(wmemcmp), STB_D(wmemcpy), STB_D(wmemmove), STB_D(swprintf), STB_W(vswprintf), STB_W(swscanf), STB_W(wcsncmp), STB_W(wcstof),
-    STB_D(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_D(open), STB_D(read), STB_D(write), STB_D(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
-    {"_div", (void*)(div_t(*)(int, int))div}, STB_D(gethostbyaddr), STB_W(gethostbyname), STB_W(gethostname), STB_D(getnameinfo), STB_D(getpeername), STB_W(getsockname), STB_W(getsockopt), STB_D(if_nametoindex), STB_D(inet_addr),
-    STB_W(SecItemAdd), STB_W(SecItemCopyMatching), STB_W(SecItemUpdate), STB_D(inet_aton), STB_D(inet_ntoa), STB_W(longjmp), STB_D(perror), STB_D(sigaction), STB_W(sigprocmask), STB_D(utimes), STB_D(vprintf), STB_W(fcntl), STB_D(system), STB_D(uname), STB_D(dladdr), STB_D(dlsym), STB_D(arc4random), STB_D(localtime), STB_D(localtime_r),
+    STB_W(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_D(open), STB_D(read), STB_D(write), STB_D(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
+    {"_div", (void*)(div_t(*)(int, int))div}, STB_D(gethostbyaddr), STB_W(gethostbyname), STB_W(gethostname), STB_D(getnameinfo), STB_W(getpeername), STB_W(getsockname), STB_W(getsockopt), STB_D(if_nametoindex), STB_D(inet_addr),
+    STB_W(SecItemAdd), STB_W(SecItemCopyMatching), STB_W(SecItemUpdate), STB_W(SecItemDelete), STB_D(getpid), STB_D(inet_aton), STB_D(inet_ntoa), STB_W(longjmp), STB_D(perror), STB_D(sigaction), STB_W(sigprocmask), STB_D(utimes), STB_D(vprintf), STB_W(fcntl), STB_D(system), STB_D(uname), STB_D(dladdr), STB_D(dlsym), STB_D(arc4random), STB_D(localtime), STB_D(localtime_r),
     STB_W(sysctl), STB_W(sysctlbyname), STB_W(sysconf), STB_W(asprintf), STB_W(dlopen), STB_W(dlclose), STB_W(hash_create), STB_W(hash_search),
     
     STB_D(pthread_exit), STB_D(pthread_detach), STB_D(pthread_kill), STB_W(pthread_mutex_trylock), STB_W(pthread_cond_timedwait), STB_D(pthread_getschedparam), STB_D(pthread_setschedparam), STB_D(pthread_mutexattr_init), STB_D(pthread_mutexattr_destroy), STB_D(pthread_mutexattr_settype), STB_D(sched_get_priority_max), STB_D(sched_get_priority_min),
@@ -10391,7 +11796,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(CFRetain), STB_W(CFRelease), STB_W(CFStringCreateWithCString), STB_W(CFStringGetLength),
  STB_W(CFStringGetCStringPtr), STB_W(CFStringGetCString), STB_W(CFBooleanGetTypeID), STB_W(CFBooleanGetValue), STB_W(CFDataCreate), STB_W(CFDataGetBytePtr), STB_W(CFDataGetBytes), STB_W(CFDataGetLength), STB_W(CFErrorCopyDescription), STB_W(CFGetTypeID), STB_W(CFHTTPMessageCopyHeaderFieldValue), STB_W(CFHTTPMessageCopyResponseStatusLine), STB_W(CFHTTPMessageCopySerializedMessage), STB_W(CFHTTPMessageCreateRequest), STB_W(CFHTTPMessageGetResponseStatusCode), STB_W(CFHTTPMessageSetBody), STB_W(CFHTTPMessageSetHeaderFieldValue), STB_W(CFNumberCreate), STB_W(CFNumberFormatterCreate), STB_W(CFNumberFormatterGetValueFromString), STB_W(CFNumberGetType), STB_W(CFNumberGetTypeID), STB_W(CFNumberGetValue), STB_W(CFPreferencesCopyAppValue), STB_W(CFPreferencesCopyKeyList), STB_W(CFPreferencesSetValue), STB_W(CFPreferencesSynchronize), STB_W(CFReadStreamClose), STB_W(CFReadStreamCreateForHTTPRequest), STB_W(CFReadStreamOpen), STB_W(CFReadStreamScheduleWithRunLoop), STB_W(CFReadStreamSetClient), STB_W(CFReadStreamSetProperty), STB_W(CFRunLoopAddTimer), STB_W(CFRunLoopRunInMode), STB_W(CFRunLoopTimerCreate), STB_W(CFRunLoopTimerInvalidate), STB_W(CFAllocatorGetDefault), STB_W(CFBundleGetVersionNumber), STB_W(CFDictionaryGetValueIfPresent), STB_W(CFNotificationCenterGetLocalCenter), STB_W(CFStringAppend), STB_W(CFStringAppendFormat), STB_W(CFStringAppendCharacters), STB_W(CFStringCompare), STB_W(CFStringConvertEncodingToIANACharSetName), STB_W(CFStringConvertEncodingToNSStringEncoding), STB_W(CFStringConvertIANACharSetNameToEncoding), STB_W(CFStringConvertNSStringEncodingToEncoding), STB_W(CFStringCreateArrayBySeparatingStrings), STB_W(CFStringCreateCopy), STB_W(CFStringCreateMutable), STB_W(CFStringCreateMutableCopy), STB_W(CFStringCreateWithFormat), STB_W(CFStringCreateWithSubstring), STB_W(CFStringFind), STB_W(CFStringHasPrefix), STB_W(CFStringHasSuffix), STB_W(CFURLCreateStringByReplacingPercentEscapesUsingEncoding),
  STB_W(CFStringCreateExternalRepresentation), STB_W(CFStringCreateFromExternalRepresentation), STB_W(CFStringCreateWithCStringNoCopy), STB_W(CFStringCreateWithCharacters), STB_W(CFStringGetCharacters), STB_W(CFStringGetMaximumSizeForEncoding), STB_W(CFStringGetTypeID), STB_W(CFURLCreateFromFileSystemRepresentation), STB_W(CFURLCreateStringByAddingPercentEscapes), STB_W(CFURLCreateStringByReplacingPercentEscapes), STB_W(CFURLCreateWithString), STB_W(CFArrayCreate), STB_W(CFArrayCreateMutable), STB_W(CFArrayGetCount), STB_W(CFArrayGetValueAtIndex), STB_W(CFArrayAppendValue), STB_W(CFArrayRemoveAllValues), STB_W(CFDictionaryCreateMutable), STB_W(CFDictionaryGetValue), STB_W(CFDictionarySetValue), STB_W(CFDictionaryRemoveValue), STB_W(CFBundleGetInfoDictionary), STB_W(CFBundleGetMainBundle), STB_W(CFBundleGetIdentifier), STB_W(CFBundleGetValueForInfoDictionaryKey), STB_W(CFBundleCopyResourcesDirectoryURL), STB_W(CFURLCopyFileSystemPath), STB_W(CFURLGetFileSystemRepresentation), STB_W(CFRunLoopGetCurrent), STB_W(CFRunLoopGetMain), STB_W(CFUUIDCreate), STB_W(CFUUIDCreateString), STB_W(CFTimeZoneCopySystem), STB_W(CFTimeZoneCopyDefault), STB_W(CFTimeZoneGetName), STB_W(CFTimeZoneGetSecondsFromGMT), STB_W(CFAbsoluteTimeGetGregorianDate), STB_W(CFAbsoluteTimeGetDayOfWeek), STB_W(CC_MD5), STB_W(CC_SHA1), STB_W(CC_SHA256), STB_W(CCCrypt), STB_W(CCCryptorCreate), STB_W(CCCryptorUpdate), STB_W(CCCryptorFinal), STB_W(CCCryptorRelease), STB_W(CCCryptorGetOutputLength), STB_W(AudioComponentFindNext), STB_W(AudioComponentInstanceNew), STB_W(UIGraphicsGetCurrentContext), STB_W(UIGraphicsPushContext), STB_W(UIGraphicsPopContext), STB_W(UIGraphicsBeginImageContext), STB_W(UIGraphicsEndImageContext), STB_W(UIGraphicsGetImageFromCurrentImageContext), STB_W(UIRectFill), STB_W(UIImagePNGRepresentation), STB_W(NSAllocateObject), STB_W(NSStringFromClass), STB_W(NSStringFromSelector), STB_W(CFBitVectorCreate), STB_W(CFBitVectorCreateMutableCopy), STB_W(CFBitVectorGetBitAtIndex), STB_W(CFBitVectorSetBitAtIndex),
-    STB_V(kCFAllocatorDefault), STB_V(kCFAllocatorNull), STB_V(kCFBooleanFalse), STB_V(kCFBooleanTrue), STB_V(kCFErrorDescriptionKey), STB_V(kCFHTTPVersion1_1), STB_V(kCFPreferencesAnyHost), STB_V(kCFPreferencesCurrentUser), STB_V(kCFStreamPropertyHTTPResponseHeader), STB_V(kCFStreamPropertyHTTPShouldAutoredirect), STB_V(kSecAttrAccessGroup), STB_V(kSecAttrAccount), STB_V(kSecAttrGeneric), STB_V(kSecAttrService), STB_V(kSecClass), STB_V(kSecClassGenericPassword), STB_V(kSecMatchLimit), STB_V(kSecMatchLimitOne), STB_V(kSecReturnAttributes), STB_V(kSecReturnData), STB_V(kSecValueData), STB_V(kCFRunLoopDefaultMode), STB_V(kCFRunLoopCommonModes), STB_V(kCFTypeArrayCallBacks), STB_V(kCFTypeDictionaryKeyCallBacks), STB_V(kCFTypeDictionaryValueCallBacks), STB_V(kCFBundleIdentifierKey), STB_V(kCFNumberNaN), STB_V(kCFNumberNegativeInfinity), STB_V(kCFNumberPositiveInfinity), {"_ADBannerContentSizeIdentifierLandscape", (void*)&hle_ADBannerContentSizeIdentifierLandscape_ptr}, {"_ADBannerContentSizeIdentifierPortrait", (void*)&hle_ADBannerContentSizeIdentifierPortrait_ptr},
+    STB_V(kCFAllocatorDefault), STB_V(kCFAllocatorNull), STB_V(kCFBooleanFalse), STB_V(kCFBooleanTrue), STB_V(kCFErrorDescriptionKey), STB_V(kCFHTTPVersion1_1), STB_V(kCFPreferencesAnyHost), STB_V(kCFPreferencesCurrentUser), STB_V(kCFStreamPropertyHTTPResponseHeader), STB_V(kCFStreamPropertyHTTPShouldAutoredirect), STB_V(kSecAttrAccessGroup), STB_V(kSecAttrAccessible), STB_V(kSecAttrAccessibleWhenUnlocked), STB_V(kSecAttrDescription), STB_V(kSecAttrLabel), STB_V(kSecAttrAccount), STB_V(kSecAttrGeneric), STB_V(kSecAttrService), STB_V(kSecClass), STB_V(kSecClassGenericPassword), STB_V(kSecMatchLimit), STB_V(kSecMatchLimitOne), STB_V(kSecReturnAttributes), STB_V(kSecReturnData), STB_V(kSecValueData), STB_V(kCFRunLoopDefaultMode), STB_V(kCFRunLoopCommonModes), STB_V(kCFTypeArrayCallBacks), STB_V(kCFTypeDictionaryKeyCallBacks), STB_V(kCFTypeDictionaryValueCallBacks), STB_V(kCFBundleIdentifierKey), STB_V(kCFNumberNaN), STB_V(kCFNumberNegativeInfinity), STB_V(kCFNumberPositiveInfinity), {"_ADBannerContentSizeIdentifierLandscape", (void*)&hle_ADBannerContentSizeIdentifierLandscape_ptr}, {"_ADBannerContentSizeIdentifierPortrait", (void*)&hle_ADBannerContentSizeIdentifierPortrait_ptr},
     
     STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
     {"_SCNetworkReachabilityScheduleWithRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }}, {"_SCNetworkReachabilitySetCallback", (void*)+[](void* target, void* callout, void* context) -> bool { return true; }}, {"_SCNetworkReachabilityUnscheduleFromRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }},
@@ -10418,7 +11823,7 @@ std::map<std::string, void*> g_hleStubs = {
 
     {"__ZNSbIwSt11char_traitsIwESaIwEEC1Ev", (void*)wrap_cxx_wstring_default_ctor}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1EPKwRKSaIwE", (void*)wrap_cxx_wstring_ctor}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1EPKwRKS1_", (void*)wrap_cxx_wstring_ctor}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1ERKS2_", (void*)wrap_cxx_wstring_copy_ctor}, {"__ZNSbIwSt11char_traitsIwESaIwEED1Ev", (void*)wrap_cxx_string_dtor}, {"__ZNSbIwSt11char_traitsIwESaIwEED2Ev", (void*)wrap_cxx_string_dtor}, {"__ZNSbIwSt11char_traitsIwESaIwEE7reserveEm", (void*)wrap_cxx_wstring_reserve}, {"__ZNSbIwSt11char_traitsIwESaIwEE6assignEPKwm", (void*)wrap_cxx_wstring_assign_ptr_len}, {"__ZNSbIwSt11char_traitsIwESaIwEE6assignERKS2_", (void*)wrap_cxx_string_assign_string}, {"__ZNSbIwSt11char_traitsIwESaIwEE4_Rep10_M_disposeERKSaIwE", (void*)wrap_cxx_string_dispose}, {"__ZNKSbIwSt11char_traitsIwESaIwEE5c_strEv", (void*)wrap_cxx_wstring_c_str}, {"__ZNSbIwSt11char_traitsIwESaIwEEaSEPKw", (void*)wrap_cxx_wstring_assign_c_str}, {"__ZNSbIwSt11char_traitsIwESaIwEEaSERKS2_", (void*)wrap_cxx_wstring_assign_string}, {"__ZNSbIwSt11char_traitsIwESaIwEE4_Rep10_M_destroyERKS1_", (void*)wrap_cxx_string_M_destroy},
 
-    {"__ZNKSbIwSt11char_traitsIwESaIwEE4findEPKwm", (void*)wrap_cxx_wstring_find_ptr_len}, {"__ZNKSbIwSt11char_traitsIwESaIwEE4findEwm", (void*)wrap_cxx_wstring_find_char}, {"__ZNKSbIwSt11char_traitsIwESaIwEE4sizeEv", (void*)wrap_cxx_wstring_size}, {"__ZNKSbIwSt11char_traitsIwESaIwEE5emptyEv", (void*)wrap_cxx_wstring_empty}, {"__ZNKSbIwSt11char_traitsIwESaIwEE5rfindEwm", (void*)wrap_cxx_wstring_rfind_char}, {"__ZNKSbIwSt11char_traitsIwESaIwEE6lengthEv", (void*)wrap_cxx_wstring_size}, {"__ZNKSbIwSt11char_traitsIwESaIwEE6substrEmm", (void*)(void*(*)(void*, void*, size_t, size_t))wrap_cxx_wstring_substr}, {"__ZNKSbIwSt11char_traitsIwESaIwEE7compareEPKw", (void*)wrap_cxx_wstring_compare_ptr}, {"__ZNKSbIwSt11char_traitsIwESaIwEE7compareERKS2_", (void*)wrap_cxx_wstring_compare_str}, {"__ZNKSbIwSt11char_traitsIwESaIwEEixEm", (void*)wrap_cxx_wstring_operator_index}, {"__ZNKSs13find_first_ofEPKcmm", (void*)wrap_cxx_string_find_first_of_ptr_len}, {"__ZNKSs4findEPKcm", (void*)wrap_cxx_string_find_ptr}, {"__ZNKSs4findEPKcmm", (void*)wrap_cxx_string_find_ptr_len}, {"__ZNKSs4sizeEv", (void*)wrap_cxx_string_size}, {"__ZNKSs5c_strEv", (void*)wrap_cxx_string_c_str}, {"__ZNKSs5emptyEv", (void*)wrap_cxx_string_empty}, {"__ZNKSs5rfindEPKcm", (void*)wrap_cxx_string_rfind_ptr}, {"__ZNKSs5rfindEPKcmm", (void*)wrap_cxx_string_rfind_ptr_len}, {"__ZNKSs7compareEmmPKc", (void*)wrap_cxx_string_compare_pos_len_ptr}, {"__ZNKSt15basic_stringbufIcSt11char_traitsIcESaIcEE3strEv", (void*)wrap_cxx_basic_stringbuf_str}, {"__ZNKSt9basic_iosIcSt11char_traitsIcEE5widenEc", (void*)wrap_cxx_basic_ios_widen}, {"__ZNSaIcEC1ERKS_", (void*)wrap_allocator_ctor}, {"__ZNSaIcEC2ERKS_", (void*)wrap_allocator_ctor}, {"__ZNSaIcED2Ev", (void*)wrap_allocator_dtor}, {"__ZNSaIwEC1Ev", (void*)wrap_allocator_ctor}, {"__ZNSaIwED1Ev", (void*)wrap_allocator_dtor}, {"__ZNSbIwSt11char_traitsIwESaIwEE12_M_leak_hardEv", (void*)wrap_cxx_wstring_M_leak_hard}, {"__ZNSbIwSt11char_traitsIwESaIwEE4_Rep11_S_terminalE", (void*)&hle_empty_string_rep}, {"__ZNSbIwSt11char_traitsIwESaIwEE5beginEv", (void*)wrap_cxx_wstring_begin}, {"__ZNSbIwSt11char_traitsIwESaIwEE5clearEv", (void*)wrap_cxx_wstring_clear}, {"__ZNSbIwSt11char_traitsIwESaIwEE5eraseEN9__gnu_cxx17__normal_iteratorIPwS2_EE", (void*)wrap_cxx_wstring_erase_iter}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendEPKw", (void*)wrap_cxx_wstring_append_ptr}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendEPKwm", (void*)wrap_cxx_wstring_append_ptr_len}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendERKS2_", (void*)wrap_cxx_wstring_append_str}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendEmw", (void*)wrap_cxx_wstring_append_len_char}, {"__ZNSbIwSt11char_traitsIwESaIwEE9_M_mutateEmmm", (void*)wrap_cxx_wstring_M_mutate}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1EPKwmRKS1_", (void*)wrap_cxx_wstring_ctor_ptr_len_alloc}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1ERKS2_mm", (void*)wrap_cxx_wstring_ctor_str_pos_len}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1EmwRKS1_", (void*)wrap_cxx_wstring_ctor_len_char_alloc}, {"__ZNSbIwSt11char_traitsIwESaIwEEixEm", (void*)wrap_cxx_wstring_operator_index}, {"__ZNSbIwSt11char_traitsIwESaIwEEpLEPKw", (void*)wrap_cxx_wstring_operator_plus_assign_ptr}, {"__ZNSbIwSt11char_traitsIwESaIwEEpLERKS2_", (void*)wrap_cxx_wstring_operator_plus_assign_str}, {"__ZNSbIwSt11char_traitsIwESaIwEEpLEw", (void*)wrap_cxx_wstring_operator_plus_assign_char}, {"__ZNSo3putEc", (void*)wrap_cxx_ostream_put}, {"__ZNSo5flushEv", (void*)wrap_cxx_ostream_flush}, {"__ZNSo9_M_insertIdEERSoT_", (void*)wrap_cxx_ostream_insert_double}, {"__ZNSo9_M_insertIxEERSoT_", (void*)wrap_cxx_ostream_insert_longlong}, {"__ZNSs4_Rep11_S_terminalE", (void*)&hle_empty_string_rep}, {"__ZNSs4_Rep9_S_createEmmRKSaIcE", (void*)wrap_cxx_string_Rep_S_create}, {"__ZNSs5clearEv", (void*)wrap_cxx_string_clear}, {"__ZNSs6appendEPKc", (void*)wrap_cxx_string_append_ptr}, {"__ZNSs6appendEmc", (void*)wrap_cxx_string_append_len_char}, {"__ZNSs6resizeEmc", (void*)wrap_cxx_string_resize_char}, {"__ZNSsaSERKSs", (void*)wrap_cxx_string_operator_assign}, {"__ZNSsixEm", (void*)wrap_cxx_string_operator_index}, {"__ZNSspLERKSs", (void*)wrap_cxx_string_operator_plus_assign}, {"__ZNSt15_List_node_base4hookEPS_", (void*)wrap_List_node_base_hook}, {"__ZNSt15_List_node_base6unhookEv", (void*)wrap_List_node_base_unhook}, {"__ZNSt15_List_node_base8transferEPS_S0_", (void*)wrap_List_node_base_transfer}, {"__ZNSt6localeC1EPKc", (void*)wrap_cxx_locale_ctor_str}, {"__ZNSt6localeC1Ev", (void*)wrap_cxx_locale_ctor}, {"__ZNSt6localeD1Ev", (void*)wrap_cxx_locale_dtor}, {"__ZNSt8ios_base4InitC1Ev", (void*)wrap_cxx_ios_base_init_ctor}, {"__ZNSt8ios_base4InitD1Ev", (void*)wrap_cxx_ios_base_init_dtor}, {"__ZNSt8ios_baseC2Ev", (void*)wrap_cxx_ios_base_ctor}, {"__ZNSt8ios_baseD2Ev", (void*)wrap_cxx_ios_base_dtor}, {"__ZSt16__ostream_insertIcSt11char_traitsIcEERSt13basic_ostreamIT_T0_ES6_PKS3_i", (void*)wrap_cxx_ostream_insert_char_ptr}, {"__ZSt16__throw_bad_castv", (void*)wrap_ZSt16__throw_bad_castv}, {"__ZSt17__throw_bad_allocv", (void*)wrap_ZSt17__throw_bad_allocv}, {"__ZSt19__throw_logic_errorPKc", (void*)wrap_ZSt19__throw_logic_errorPKc}, {"__ZSt20__throw_length_errorPKc", (void*)wrap_ZSt20__throw_length_errorPKc}, {"__ZSt20__throw_out_of_rangePKc", (void*)wrap_ZSt20__throw_out_of_rangePKc}, {"__ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_", (void*)wrap_Rb_tree_rebalance_for_erase},
+    {"__ZNKSbIwSt11char_traitsIwESaIwEE4findEPKwm", (void*)wrap_cxx_wstring_find_ptr_len}, {"__ZNKSbIwSt11char_traitsIwESaIwEE4findEwm", (void*)wrap_cxx_wstring_find_char}, {"__ZNKSbIwSt11char_traitsIwESaIwEE4sizeEv", (void*)wrap_cxx_wstring_size}, {"__ZNKSbIwSt11char_traitsIwESaIwEE5emptyEv", (void*)wrap_cxx_wstring_empty}, {"__ZNKSbIwSt11char_traitsIwESaIwEE5rfindEwm", (void*)wrap_cxx_wstring_rfind_char}, {"__ZNKSbIwSt11char_traitsIwESaIwEE6lengthEv", (void*)wrap_cxx_wstring_size}, {"__ZNKSbIwSt11char_traitsIwESaIwEE6substrEmm", (void*)(void*(*)(void*, void*, size_t, size_t))wrap_cxx_wstring_substr}, {"__ZNKSbIwSt11char_traitsIwESaIwEE7compareEPKw", (void*)wrap_cxx_wstring_compare_ptr}, {"__ZNKSbIwSt11char_traitsIwESaIwEE7compareERKS2_", (void*)wrap_cxx_wstring_compare_str}, {"__ZNKSbIwSt11char_traitsIwESaIwEEixEm", (void*)wrap_cxx_wstring_operator_index}, {"__ZNKSs13find_first_ofEPKcmm", (void*)wrap_cxx_string_find_first_of_ptr_len}, {"__ZNKSs4findEPKcm", (void*)wrap_cxx_string_find_ptr}, {"__ZNKSs4findEPKcmm", (void*)wrap_cxx_string_find_ptr_len}, {"__ZNKSs4sizeEv", (void*)wrap_cxx_string_size}, {"__ZNKSs5c_strEv", (void*)wrap_cxx_string_c_str}, {"__ZNKSs5emptyEv", (void*)wrap_cxx_string_empty}, {"__ZNKSs5rfindEPKcm", (void*)wrap_cxx_string_rfind_ptr}, {"__ZNKSs5rfindEPKcmm", (void*)wrap_cxx_string_rfind_ptr_len}, {"__ZNKSs7compareEmmPKc", (void*)wrap_cxx_string_compare_pos_len_ptr}, {"__ZNKSt15basic_stringbufIcSt11char_traitsIcESaIcEE3strEv", (void*)wrap_cxx_basic_stringbuf_str}, {"__ZNKSt9basic_iosIcSt11char_traitsIcEE5widenEc", (void*)wrap_cxx_basic_ios_widen}, {"__ZNSaIcEC1ERKS_", (void*)wrap_allocator_ctor}, {"__ZNSaIcEC2ERKS_", (void*)wrap_allocator_ctor}, {"__ZNSaIcED2Ev", (void*)wrap_allocator_dtor}, {"__ZNSaIwEC1Ev", (void*)wrap_allocator_ctor}, {"__ZNSaIwED1Ev", (void*)wrap_allocator_dtor}, {"__ZNSbIwSt11char_traitsIwESaIwEE12_M_leak_hardEv", (void*)wrap_cxx_wstring_M_leak_hard}, {"__ZNSbIwSt11char_traitsIwESaIwEE4_Rep11_S_terminalE", (void*)&hle_empty_string_rep}, {"__ZNSbIwSt11char_traitsIwESaIwEE5beginEv", (void*)wrap_cxx_wstring_begin}, {"__ZNSbIwSt11char_traitsIwESaIwEE5clearEv", (void*)wrap_cxx_wstring_clear}, {"__ZNSbIwSt11char_traitsIwESaIwEE5eraseEN9__gnu_cxx17__normal_iteratorIPwS2_EE", (void*)wrap_cxx_wstring_erase_iter}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendEPKw", (void*)wrap_cxx_wstring_append_ptr}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendEPKwm", (void*)wrap_cxx_wstring_append_ptr_len}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendERKS2_", (void*)wrap_cxx_wstring_append_str}, {"__ZNSbIwSt11char_traitsIwESaIwEE6appendEmw", (void*)wrap_cxx_wstring_append_len_char}, {"__ZNSbIwSt11char_traitsIwESaIwEE9_M_mutateEmmm", (void*)wrap_cxx_wstring_M_mutate}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1EPKwmRKS1_", (void*)wrap_cxx_wstring_ctor_ptr_len_alloc}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1ERKS2_mm", (void*)wrap_cxx_wstring_ctor_str_pos_len}, {"__ZNSbIwSt11char_traitsIwESaIwEEC1EmwRKS1_", (void*)wrap_cxx_wstring_ctor_len_char_alloc}, {"__ZNSbIwSt11char_traitsIwESaIwEEixEm", (void*)wrap_cxx_wstring_operator_index}, {"__ZNSbIwSt11char_traitsIwESaIwEEpLEPKw", (void*)wrap_cxx_wstring_operator_plus_assign_ptr}, {"__ZNSbIwSt11char_traitsIwESaIwEEpLERKS2_", (void*)wrap_cxx_wstring_operator_plus_assign_str}, {"__ZNSbIwSt11char_traitsIwESaIwEEpLEw", (void*)wrap_cxx_wstring_operator_plus_assign_char}, {"__ZNSo3putEc", (void*)wrap_cxx_ostream_put}, {"__ZNSo5flushEv", (void*)wrap_cxx_ostream_flush}, {"__ZNSo9_M_insertIdEERSoT_", (void*)wrap_cxx_ostream_insert_double}, {"__ZNSo9_M_insertIxEERSoT_", (void*)wrap_cxx_ostream_insert_longlong}, {"__ZNSs4_Rep11_S_terminalE", (void*)&hle_empty_string_rep}, {"__ZNSs4_Rep9_S_createEmmRKSaIcE", (void*)wrap_cxx_string_Rep_S_create}, {"__ZNSs5clearEv", (void*)wrap_cxx_string_clear}, {"__ZNKSs9_M_ibeginEv", (void*)wrap_cxx_string_M_ibegin}, {"__ZNKSs7_M_iendEv", (void*)wrap_cxx_string_M_iend}, {"__ZNSs5eraseEmm", (void*)wrap_cxx_string_erase_pos_len}, {"__ZNSs7replaceEN9__gnu_cxx17__normal_iteratorIPcSsEES2_S1_S1_", (void*)wrap_cxx_string_replace_iter_range}, {"__ZNSs6appendEPKc", (void*)wrap_cxx_string_append_ptr}, {"__ZNSs6appendEmc", (void*)wrap_cxx_string_append_len_char}, {"__ZNSs6resizeEmc", (void*)wrap_cxx_string_resize_char}, {"__ZNSsaSERKSs", (void*)wrap_cxx_string_operator_assign}, {"__ZNSsixEm", (void*)wrap_cxx_string_operator_index}, {"__ZNSspLERKSs", (void*)wrap_cxx_string_operator_plus_assign}, {"__ZNSt15_List_node_base4hookEPS_", (void*)wrap_List_node_base_hook}, {"__ZNSt15_List_node_base6unhookEv", (void*)wrap_List_node_base_unhook}, {"__ZNSt15_List_node_base8transferEPS_S0_", (void*)wrap_List_node_base_transfer}, {"__ZNSt6localeC1EPKc", (void*)wrap_cxx_locale_ctor_str}, {"__ZNSt6localeC1Ev", (void*)wrap_cxx_locale_ctor}, {"__ZNSt6localeD1Ev", (void*)wrap_cxx_locale_dtor}, {"__ZNSt8ios_base4InitC1Ev", (void*)wrap_cxx_ios_base_init_ctor}, {"__ZNSt8ios_base4InitD1Ev", (void*)wrap_cxx_ios_base_init_dtor}, {"__ZNSt8ios_baseC2Ev", (void*)wrap_cxx_ios_base_ctor}, {"__ZNSt8ios_baseD2Ev", (void*)wrap_cxx_ios_base_dtor}, {"__ZSt16__ostream_insertIcSt11char_traitsIcEERSt13basic_ostreamIT_T0_ES6_PKS3_i", (void*)wrap_cxx_ostream_insert_char_ptr}, {"__ZSt16__throw_bad_castv", (void*)wrap_ZSt16__throw_bad_castv}, {"__ZSt17__throw_bad_allocv", (void*)wrap_ZSt17__throw_bad_allocv}, {"__ZSt19__throw_logic_errorPKc", (void*)wrap_ZSt19__throw_logic_errorPKc}, {"__ZSt20__throw_length_errorPKc", (void*)wrap_ZSt20__throw_length_errorPKc}, {"__ZSt20__throw_out_of_rangePKc", (void*)wrap_ZSt20__throw_out_of_rangePKc}, {"__ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_", (void*)wrap_Rb_tree_rebalance_for_erase},
 
     {"__ZSt4cerr", (void*)&wrap_ZSt4cerr}, {"__ZSt4cout", (void*)&wrap_ZSt4cout}, {"__ZSt9terminatev", (void*)wrap_abort}, {"__ZTTSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE", (void*)&wrap_ZTTSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE}, {"__ZTVN10__cxxabiv117__class_type_infoE", (void*)&wrap_ZTVN10__cxxabiv117__class_type_infoE}, {"__ZTVN10__cxxabiv120__si_class_type_infoE", (void*)&wrap_ZTVN10__cxxabiv120__si_class_type_infoE}, {"__ZTVN10__cxxabiv121__vmi_class_type_infoE", (void*)&wrap_ZTVN10__cxxabiv121__vmi_class_type_infoE}, {"__ZTVSt15basic_streambufIcSt11char_traitsIcEE", (void*)&wrap_ZTVSt15basic_streambufIcSt11char_traitsIcEE}, {"__ZTVSt15basic_stringbufIcSt11char_traitsIcESaIcEE", (void*)&wrap_ZTVSt15basic_stringbufIcSt11char_traitsIcESaIcEE}, {"__ZTVSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE", (void*)&wrap_ZTVSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE}, {"__ZTVSt9basic_iosIcSt11char_traitsIcEE", (void*)&wrap_ZTVSt9basic_iosIcSt11char_traitsIcEE}, {"__ZTISt9bad_alloc", (void*)&wrap_ZTISt9bad_alloc},
 
@@ -10432,7 +11837,14 @@ std::map<std::string, void*> g_hleStubs = {
     {"__ZNSs7replaceEmmRKSs", (void*)wrap_cxx_string_replace_pos_len_str},
     {"__ZNSsC1EmcRKSaIcE", (void*)wrap_cxx_string_ctor_len_char},
     {"__ZNSspLEPKc", (void*)wrap_cxx_string_append_ptr},
-    {"__ZNSt18basic_stringstreamIcSt11char_traitsIcESaIcEEC1ESt13_Ios_Openmode", (void*)wrap_cxx_ios_base_ctor},
+    {"__ZNSt18basic_stringstreamIcSt11char_traitsIcESaIcEEC1ESt13_Ios_Openmode", (void*)wrap_cxx_stringstream_ctor_mode},
+    {"__ZNSt18basic_stringstreamIcSt11char_traitsIcESaIcEED1Ev", (void*)wrap_cxx_stringstream_dtor},
+    {"__ZNSt19basic_ostringstreamIcSt11char_traitsIcESaIcEED1Ev", (void*)wrap_cxx_stringstream_dtor},
+    {"__ZSt7getlineIcSt11char_traitsIcESaIcEERSt13basic_istreamIT_T0_ES7_RSbIS4_S5_T1_E", (void*)wrap_cxx_getline},
+    {"__ZNSolsEd", (void*)wrap_cxx_ostream_insert_double},
+    {"__ZNSolsEf", (void*)wrap_cxx_ostream_insert_float},
+    {"__ZNSolsEs", (void*)wrap_cxx_ostream_insert_short},
+    {"__ZNSolsEx", (void*)wrap_cxx_ostream_insert_longlong},
     {"__ZNKSt18basic_stringstreamIcSt11char_traitsIcESaIcEE3strEv", (void*)wrap_cxx_basic_stringbuf_str},
     {"__ZNKSs3endEv", (void*)wrap_cxx_string_end},
     {"__ZNKSs5beginEv", (void*)wrap_cxx_string_begin},
@@ -10449,9 +11861,9 @@ std::map<std::string, void*> g_hleStubs = {
     {"__ZNSs7replaceEmmPKc", (void*)wrap_cxx_string_replace_pos_len_ptr},
     {"__ZNSt15_List_node_base4swapERS_S0_", (void*)wrap_List_node_base_swap},
     {"__ZNSt18basic_stringstreamIcSt11char_traitsIcESaIcEEC1ERKSsSt13_Ios_Openmode", (void*)wrap_cxx_stringstream_ctor},
-    {"__ZNSt19basic_ostringstreamIcSt11char_traitsIcESaIcEEC1ESt13_Ios_Openmode", (void*)wrap_cxx_ios_base_ctor},
+    {"__ZNSt19basic_ostringstreamIcSt11char_traitsIcESaIcEEC1ESt13_Ios_Openmode", (void*)wrap_cxx_stringstream_ctor_mode},
     {"__ZNSt9basic_iosIcSt11char_traitsIcEE4initEPSt15basic_streambufIcS1_E", (void*)wrap_cxx_ios_init},
-    {"__ZSt7getlineIcSt11char_traitsIcESaIcEERSt13basic_istreamIT_T0_ES7_RSbIS4_S5_T1_ES4_", (void*)wrap_cxx_getline},
+    {"__ZSt7getlineIcSt11char_traitsIcESaIcEERSt13basic_istreamIT_T0_ES7_RSbIS4_S5_T1_ES4_", (void*)wrap_cxx_getline_delim},
     {"__ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc", (void*)wrap_cxx_ostream_insert_char_ptr_simple},
     {"__ZStlsIcSt11char_traitsIcEERSt13basic_ostreamIT_T0_ES6_St5_Setw", (void*)wrap_cxx_ostream_iomanip},
     {"__ZStlsIcSt11char_traitsIcEERSt13basic_ostreamIT_T0_ES6_St8_SetfillIS3_E", (void*)wrap_cxx_ostream_iomanip},
@@ -10709,6 +12121,7 @@ void LoadMachO(const std::string& bundlePath) {
     g_hleClasses["UIScrollView"] = new HLEClass{0xDEADBEEF, "UIScrollView"};
     g_hleClasses["UIActivityIndicatorView"] = new HLEClass{0xDEADBEEF, "UIActivityIndicatorView"};
     g_hleClasses["UIBarButtonItem"] = new HLEClass{0xDEADBEEF, "UIBarButtonItem"};
+    g_hleClasses["UINavigationItem"] = new HLEClass{0xDEADBEEF, "UINavigationItem"};
     g_hleClasses["NSMutableDictionary"] = new HLEClass{0xDEADBEEF, "NSMutableDictionary"};
     g_hleClasses["NSRunLoop"] = new HLEClass{0xDEADBEEF, "NSRunLoop"};
     g_hleClasses["UIFont"] = new HLEClass{0xDEADBEEF, "UIFont"};
@@ -10721,6 +12134,8 @@ void LoadMachO(const std::string& bundlePath) {
     g_hleClasses["AVAudioSession"] = new HLEClass{0xDEADBEEF, "AVAudioSession"};
     g_hleClasses["AVAudioPlayer"] = new HLEClass{0xDEADBEEF, "AVAudioPlayer"};
     g_hleClasses["NSData"] = new HLEClass{0xDEADBEEF, "NSData"};
+    g_hleClasses["NSMutableData"] = new HLEClass{0xDEADBEEF, "NSMutableData"};
+    g_hleClasses["UIWebView"] = new HLEClass{0xDEADBEEF, "UIWebView"};
     g_hleClasses["NSURLRequest"] = new HLEClass{0xDEADBEEF, "NSURLRequest"};
     g_hleClasses["NSMutableURLRequest"] = new HLEClass{0xDEADBEEF, "NSMutableURLRequest"};
     g_hleClasses["MPMoviePlayerController"] = new HLEClass{0xDEADBEEF, "MPMoviePlayerController"};
@@ -10805,6 +12220,10 @@ void LoadMachO(const std::string& bundlePath) {
         hle_kCFStreamPropertyHTTPResponseHeader = CreateNSString("kCFStreamPropertyHTTPResponseHeader");
         hle_kCFStreamPropertyHTTPShouldAutoredirect = CreateNSString("kCFStreamPropertyHTTPShouldAutoredirect");
         hle_kSecAttrAccessGroup = CreateNSString("agrp");
+        hle_kSecAttrAccessible = CreateNSString("pdmn");
+        hle_kSecAttrAccessibleWhenUnlocked = CreateNSString("ak");
+        hle_kSecAttrDescription = CreateNSString("desc");
+        hle_kSecAttrLabel = CreateNSString("labl");
         hle_kSecAttrAccount = CreateNSString("acct");
         hle_kSecAttrGeneric = CreateNSString("gena");
         hle_kSecAttrService = CreateNSString("svce");
@@ -10976,10 +12395,10 @@ void LoadMachO(const std::string& bundlePath) {
         std::vector<char> strTable(symtab.strsize); lseek(fd, arch_offset + symtab.stroff, SEEK_SET); read(fd, strTable.data(), symtab.strsize);
         std::vector<nlist> symTable(symtab.nsyms); lseek(fd, arch_offset + symtab.symoff, SEEK_SET); read(fd, symTable.data(), symtab.nsyms * sizeof(nlist));
         bool isES1 = false; bool isES2 = false;
-        for (uint32_t i = 0; i < symtab.nsyms; i++) { 
-            if (symTable[i].n_un.n_strx > 0) { 
-                std::string symName = &strTable[symTable[i].n_un.n_strx]; 
-                if (symTable[i].n_sect > 0) g_appSymbols[symName] = symTable[i].n_value + g_appSlide; 
+        for (uint32_t i = 0; i < symtab.nsyms; i++) {
+            if (symTable[i].n_un.n_strx > 0) {
+                std::string symName = &strTable[symTable[i].n_un.n_strx];
+                if (symTable[i].n_sect > 0) g_appSymbols[symName] = symTable[i].n_value + g_appSlide;
                 if (symName == "_glCompileShader") isES2 = true;
                 if (symName == "_glEnableClientState" || symName == "_glVertexPointer") isES1 = true;
             } 
@@ -11166,6 +12585,11 @@ void LoadMachO(const std::string& bundlePath) {
                                 uint32_t count = sect.size / 4;
                                 int data_rebased_count = 0;
                                 
+                                // Секция целиком состоит из указателей на функции, гадать не о чем.
+                                // Эвристика по целевой секции отсеивала ARM-режимные (чётные) адреса как "Code: Even".
+                                bool isFuncPtrTable = (sectname.compare(0, 15, "__mod_init_func") == 0 ||
+                                                       sectname.compare(0, 15, "__mod_term_func") == 0);
+
                                 bool is_const_or_data = (sectname == "__const" || sectname == "__data");
                                 FILE* f_diag = nullptr;
                                 if (is_const_or_data) {
@@ -11195,8 +12619,10 @@ void LoadMachO(const std::string& bundlePath) {
                                             }
                                         }
 
-                                        if (target_section != "Unknown") {
-                                            bool is_code_target = (target_section.find("__text") != std::string::npos || 
+                                        if (isFuncPtrTable) {
+                                            // без эвристик
+                                        } else if (target_section != "Unknown") {
+                                            bool is_code_target = (target_section.find("__text") != std::string::npos ||
                                                                    target_section.find("__symbol_stub") != std::string::npos || 
                                                                    target_section.find("__stub_helper") != std::string::npos || 
                                                                    target_section.find("__picsymbolstub") != std::string::npos);
@@ -11225,7 +12651,13 @@ void LoadMachO(const std::string& bundlePath) {
                                                                      target_section.find("__mod_init_func") != std::string::npos);
 
                                             if (is_code_target) {
-                                                if ((val & 1) == 0) { safe_to_rebase = false; reason = "Code: Even"; }
+                                                // Чётный адрес — это ARM-режим, а не Thumb; такие указатели реальны
+                                                // (vtable ARM-собранных статических библиотек). Отличаем их от констант
+                                                // по признакам точки входа ARM: выравнивание на 4 и безусловный (cond=AL) первый опкод.
+                                                if ((val & 1) == 0) {
+                                                    uint32_t insn = ((val & 3) == 0) ? *(uint32_t*)shifted_val : 0;
+                                                    if ((insn >> 28) != 0xE) { safe_to_rebase = false; reason = "Code: Even"; }
+                                                }
                                                 else if (((val >> 16) & 0xFFFF) == (val & 0xFFFF)) { safe_to_rebase = false; reason = "Code: Symmetric"; }
                                             } else if (is_raw_string_target) {
                                                 if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "String: Invalid"; }
@@ -12055,6 +13487,41 @@ extern "C" void* wrap_cxx_string_M_replace_aux(void* this_ptr, size_t pos, size_
     return this_ptr;
 }
 
+extern "C" char* wrap_cxx_string_M_ibegin(void* this_ptr) {
+    char** dest = (char**)this_ptr;
+    return (dest && *dest) ? *dest : nullptr;
+}
+
+extern "C" char* wrap_cxx_string_M_iend(void* this_ptr) {
+    char** dest = (char**)this_ptr;
+    if (!dest || !*dest) return nullptr;
+    return *dest + ((LibStdStringRep*)(*dest) - 1)->length;
+}
+
+extern "C" void* wrap_cxx_string_erase_pos_len(void* this_ptr, size_t pos, size_t n) {
+    char** dest = (char**)this_ptr;
+    if (dest && *dest) {
+        size_t len = ((LibStdStringRep*)(*dest) - 1)->length;
+        if (pos > len) return this_ptr;
+        if (n > len - pos) n = len - pos;
+        if (n) wrap_cxx_string_M_mutate(this_ptr, pos, n, 0);
+    }
+    return this_ptr;
+}
+
+extern "C" void* wrap_cxx_string_replace_iter_range(void* this_ptr, char* i1, char* i2, char* k1, char* k2) {
+    char** dest = (char**)this_ptr;
+    if (!dest || !*dest || !i1 || !i2) return this_ptr;
+    size_t pos = (size_t)(i1 - *dest);
+    size_t n1 = (i2 > i1) ? (size_t)(i2 - i1) : 0;
+    size_t n2 = (k1 && k2 && k2 > k1) ? (size_t)(k2 - k1) : 0;
+    // источник может лежать внутри этой же строки, а _M_mutate её переселяет
+    std::string tmp(n2 ? k1 : "", n2);
+    wrap_cxx_string_M_mutate(this_ptr, pos, n1, n2);
+    if (n2 && *dest) memcpy((*dest) + pos, tmp.data(), n2);
+    return this_ptr;
+}
+
 extern "C" void wrap_cxx_string_M_destroy(void* rep_ptr, void* alloc_ptr) {
     wrap_cxx_string_dispose(rep_ptr, alloc_ptr);
 }
@@ -12094,7 +13561,8 @@ extern "C" void wrap_List_node_base_transfer(void* position_ptr, void* first_ptr
 }
 
 // --- STD::RB_TREE ERASE FIXUP ---
-extern "C" void wrap_Rb_tree_rebalance_for_erase(void* z_ptr, void* header_ptr) {
+// Возвращает удалённый узел: гость передаёт результат прямо в operator delete.
+extern "C" void* wrap_Rb_tree_rebalance_for_erase(void* z_ptr, void* header_ptr) {
     Rb_tree_node_base* z = (Rb_tree_node_base*)z_ptr;
     Rb_tree_node_base* header = (Rb_tree_node_base*)header_ptr;
     Rb_tree_node_base*& root = header->parent; Rb_tree_node_base*& leftmost = header->left; Rb_tree_node_base*& rightmost = header->right;
@@ -12107,8 +13575,14 @@ extern "C" void wrap_Rb_tree_rebalance_for_erase(void* z_ptr, void* header_ptr) 
         y->parent = z->parent; int tmp = y->color; y->color = z->color; z->color = tmp; y = z;
     } else { x_parent = y->parent; if (x) x->parent = y->parent;
         if (root == z) root = x; else if (z->parent->left == z) z->parent->left = x; else z->parent->right = x;
-        if (leftmost == z) leftmost = (z->right == nullptr) ? z->parent : (Rb_tree_node_base*)wrap_Rb_tree_decrement(z);
-        if (rightmost == z) rightmost = (z->left == nullptr) ? z->parent : (Rb_tree_node_base*)wrap_Rb_tree_increment(z);
+        if (leftmost == z) {
+            if (z->right == nullptr) leftmost = z->parent;
+            else { Rb_tree_node_base* m = x; while (m && m->left) m = m->left; leftmost = m; }
+        }
+        if (rightmost == z) {
+            if (z->left == nullptr) rightmost = z->parent;
+            else { Rb_tree_node_base* m = x; while (m && m->right) m = m->right; rightmost = m; }
+        }
     }
     if (y->color != 0) {
         while (x != root && (x == nullptr || x->color == 1)) {
@@ -12128,6 +13602,7 @@ extern "C" void wrap_Rb_tree_rebalance_for_erase(void* z_ptr, void* header_ptr) 
         }
         if (x) x->color = 1;
     }
+    return z_ptr;
 }
 
 // --- STD::STRING MISSING ---
@@ -12209,9 +13684,10 @@ extern "C" void* wrap_cxx_ostream_insert_char_ptr_simple(void* this_ptr, const c
     if (s) wrap_cxx_ostream_insert_char_ptr(this_ptr, s, strlen(s));
     return this_ptr;
 }
-extern "C" void* wrap_cxx_ostream_insert_int(void* this_ptr, int v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) LogToJava("GAME-COUT: " + std::to_string(v)); return this_ptr; }
-extern "C" void* wrap_cxx_ostream_insert_uint(void* this_ptr, unsigned int v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) LogToJava("GAME-COUT: " + std::to_string(v)); return this_ptr; }
-extern "C" void* wrap_cxx_ostream_insert_ulong(void* this_ptr, unsigned long v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) LogToJava("GAME-COUT: " + std::to_string(v)); return this_ptr; }
+static void* HleStreamAppend(void* this_ptr, const char* s, size_t n);
+extern "C" void* wrap_cxx_ostream_insert_int(void* this_ptr, int v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) LogToJava("GAME-COUT: " + std::to_string(v)); std::string s = std::to_string(v); return HleStreamAppend(this_ptr, s.data(), s.size()); }
+extern "C" void* wrap_cxx_ostream_insert_uint(void* this_ptr, unsigned int v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) LogToJava("GAME-COUT: " + std::to_string(v)); std::string s = std::to_string(v); return HleStreamAppend(this_ptr, s.data(), s.size()); }
+extern "C" void* wrap_cxx_ostream_insert_ulong(void* this_ptr, unsigned long v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) LogToJava("GAME-COUT: " + std::to_string(v)); std::string s = std::to_string(v); return HleStreamAppend(this_ptr, s.data(), s.size()); }
 extern "C" void* wrap_cxx_ostream_iomanip(void* this_ptr, int) { return this_ptr; }
 extern "C" void wrap_List_node_base_swap(void* x_ptr, void* y_ptr) {
     List_node_base* x = (List_node_base*)x_ptr;
@@ -12227,7 +13703,6 @@ extern "C" void wrap_List_node_base_swap(void* x_ptr, void* y_ptr) {
     } else if (y->next != y) { x->next = y->next; x->prev = y->prev; x->next->prev = x; x->prev->next = x; y->next = y; y->prev = y; }
 }
 extern "C" void* wrap_new_array_nothrow(size_t size, void*) { return malloc(size); }
-extern "C" void* wrap_cxx_basic_ios_operator_void_ptr(void* this_ptr) { return this_ptr; }
 
 extern "C" size_t wrap_cxx_locale_id_M_id(void* this_ptr) {
     size_t* id_ptr = (size_t*)this_ptr;
@@ -12341,7 +13816,10 @@ extern "C" void* wrap_hash_search(void* hashp, void* item, int action) {
 extern "C" uint8_t wrap_class_addMethod(void* cls, void* name, void* imp, const char* types) { return 1; }
 extern "C" uint8_t wrap_class_addProperty(void* cls, const char* name, const void* attributes, uint32_t attributeCount) { return 1; }
 extern "C" uint8_t wrap_class_addProtocol(void* cls, void* protocol) { return 1; }
-extern "C" void* wrap_class_getInstanceVariable(void* cls, const char* name) { return nullptr; }
+extern "C" void* wrap_class_getInstanceVariable(void* cls, const char* name) {
+    if (!cls || !name) return nullptr;
+    return HLE_FindIvar((uint32_t)(uintptr_t)cls, name);
+}
 extern "C" const uint8_t* wrap_class_getIvarLayout(void* cls) { return nullptr; }
 extern "C" uint8_t wrap_class_isMetaClass(void* cls) { return 0; }
 extern "C" uint8_t wrap_class_respondsToSelector(void* cls, void* sel) { return wrap_class_getInstanceMethod(cls, (const char*)sel) ? 1 : 0; }
@@ -12356,8 +13834,68 @@ extern "C" void wrap_object_setIvar(void* obj, void* ivar, void* value) {}
 extern "C" void* wrap_property_copyAttributeList(void* property, uint32_t* outCount) { if (outCount) *outCount = 0; return nullptr; }
 extern "C" void* wrap_sel_getUid(const char* str) { return wrap_sel_registerName(str); }
 
-extern "C" void* wrap_cxx_getline(void* is_ptr, void* str_ptr) { wrap_cxx_string_clear(str_ptr); return is_ptr; }
-extern "C" void* wrap_cxx_stringstream_ctor(void* this_ptr, void* str_ptr, int mode) { return this_ptr; }
+// --- HLE std::stringstream ---
+// В libstdc++ гостя istream-подобъект лежит по базе объекта, ostream-подобъект по базе+8,
+// а basic_ios гость находит сам: читает смещение виртуальной базы из [vptr-12]. Поэтому
+// конструктор подставляет свою таблицу, у которой там ноль — тогда basic_ios* == база.
+struct HleStringStream { std::string data; size_t pos = 0; bool fail = false; };
+static uint32_t g_hleStreamVTable[8] = {0};
+static std::map<void*, HleStringStream*> g_hleStreams;
+
+static HleStringStream* HleFindStream(void* p) {
+    if (!p) return nullptr;
+    auto it = g_hleStreams.find(p);
+    if (it == g_hleStreams.end()) it = g_hleStreams.find((void*)((char*)p - 8));
+    return it == g_hleStreams.end() ? nullptr : it->second;
+}
+static HleStringStream* HleStreamCreate(void* this_ptr) {
+    auto it = g_hleStreams.find(this_ptr);
+    if (it != g_hleStreams.end()) { delete it->second; g_hleStreams.erase(it); }
+    HleStringStream* st = new HleStringStream();
+    *(void**)this_ptr = (void*)&g_hleStreamVTable[4];
+    g_hleStreams[this_ptr] = st;
+    return st;
+}
+static void* HleStreamAppend(void* this_ptr, const char* s, size_t n) {
+    HleStringStream* st = HleFindStream(this_ptr);
+    if (st && s) st->data.append(s, n);
+    return this_ptr;
+}
+
+extern "C" void* wrap_cxx_getline_delim(void* is_ptr, void* str_ptr, char delim) {
+    HleStringStream* st = HleFindStream(is_ptr);
+    if (!st || st->pos >= st->data.size()) {
+        if (st) st->fail = true;
+        wrap_cxx_string_clear(str_ptr);
+        return is_ptr;
+    }
+    size_t e = st->data.find(delim, st->pos);
+    size_t n = (e == std::string::npos) ? st->data.size() - st->pos : e - st->pos;
+    wrap_cxx_string_assign_ptr_len(str_ptr, st->data.data() + st->pos, n);
+    st->pos = (e == std::string::npos) ? st->data.size() : e + 1;
+    return is_ptr;
+}
+extern "C" void* wrap_cxx_getline(void* is_ptr, void* str_ptr) { return wrap_cxx_getline_delim(is_ptr, str_ptr, '\n'); }
+extern "C" void* wrap_cxx_stringstream_ctor(void* this_ptr, void* str_ptr, int mode) {
+    if (!this_ptr) return this_ptr;
+    HleStringStream* st = HleStreamCreate(this_ptr);
+    char** s = (char**)str_ptr;
+    if (s && *s) st->data.assign(*s, ((LibStdStringRep*)(*s) - 1)->length);
+    return this_ptr;
+}
+extern "C" void* wrap_cxx_stringstream_ctor_mode(void* this_ptr, int mode) {
+    if (this_ptr) HleStreamCreate(this_ptr);
+    return this_ptr;
+}
+extern "C" void* wrap_cxx_stringstream_dtor(void* this_ptr) {
+    auto it = g_hleStreams.find(this_ptr);
+    if (it != g_hleStreams.end()) { delete it->second; g_hleStreams.erase(it); }
+    return this_ptr;
+}
+extern "C" void* wrap_cxx_basic_ios_operator_void_ptr(void* this_ptr) {
+    HleStringStream* st = HleFindStream(this_ptr);
+    return (st && st->fail) ? nullptr : this_ptr;
+}
 extern "C" void* wrap_cxx_ios_init(void* this_ptr, void* sb_ptr) { return this_ptr; }
 char wrap_ZSt7nothrow = 0;
 extern "C" bool wrap_cxx_string_empty(void* this_ptr) { return wrap_cxx_string_size(this_ptr) == 0; }
@@ -12442,12 +13980,19 @@ extern "C" void* wrap_cxx_ios_base_init_dtor(void* this_ptr) { return this_ptr; 
 extern "C" void* wrap_cxx_ios_base_ctor(void* this_ptr) { return this_ptr; }
 extern "C" void* wrap_cxx_ios_base_dtor(void* this_ptr) { return this_ptr; }
 extern "C" char wrap_cxx_basic_ios_widen(void* this_ptr, char c) { return c; }
-extern "C" void* wrap_cxx_ostream_put(void* this_ptr, char c) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { LogToJava(std::string("GAME-COUT: ") + c); } return this_ptr; }
+extern "C" void* wrap_cxx_ostream_put(void* this_ptr, char c) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { LogToJava(std::string("GAME-COUT: ") + c); } return HleStreamAppend(this_ptr, &c, 1); }
 extern "C" void* wrap_cxx_ostream_flush(void* this_ptr) { return this_ptr; }
-extern "C" void* wrap_cxx_ostream_insert_double(void* this_ptr, double d) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { LogToJava("GAME-COUT: " + std::to_string(d)); } return this_ptr; }
-extern "C" void* wrap_cxx_ostream_insert_longlong(void* this_ptr, long long v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { LogToJava("GAME-COUT: " + std::to_string(v)); } return this_ptr; }
-extern "C" void* wrap_cxx_ostream_insert_char_ptr(void* this_ptr, const char* s, int n) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { std::string str(s?s:"", n); LogToJava("GAME-COUT: " + str); } return this_ptr; }
-extern "C" void* wrap_cxx_basic_stringbuf_str(void* ret_ptr, void* this_ptr) { wrap_cxx_string_default_ctor(ret_ptr); return ret_ptr; }
+extern "C" void* wrap_cxx_ostream_insert_double(void* this_ptr, double d) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { LogToJava("GAME-COUT: " + std::to_string(d)); } std::string s = std::to_string(d); return HleStreamAppend(this_ptr, s.data(), s.size()); }
+extern "C" void* wrap_cxx_ostream_insert_float(void* this_ptr, float f) { std::string s = std::to_string(f); return HleStreamAppend(this_ptr, s.data(), s.size()); }
+extern "C" void* wrap_cxx_ostream_insert_short(void* this_ptr, short v) { std::string s = std::to_string((int)v); return HleStreamAppend(this_ptr, s.data(), s.size()); }
+extern "C" void* wrap_cxx_ostream_insert_longlong(void* this_ptr, long long v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { LogToJava("GAME-COUT: " + std::to_string(v)); } std::string s = std::to_string(v); return HleStreamAppend(this_ptr, s.data(), s.size()); }
+extern "C" void* wrap_cxx_ostream_insert_char_ptr(void* this_ptr, const char* s, int n) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { std::string str(s?s:"", n); LogToJava("GAME-COUT: " + str); } return HleStreamAppend(this_ptr, s, n < 0 ? 0 : (size_t)n); }
+extern "C" void* wrap_cxx_basic_stringbuf_str(void* ret_ptr, void* this_ptr) {
+    wrap_cxx_string_default_ctor(ret_ptr);
+    HleStringStream* st = HleFindStream(this_ptr);
+    if (st && !st->data.empty()) wrap_cxx_string_assign_ptr_len(ret_ptr, st->data.data(), st->data.size());
+    return ret_ptr;
+}
 extern "C" void* wrap_cxx_string_Rep_S_create(size_t cap, size_t old_cap, void* alloc) { LibStdStringRep* rep = (LibStdStringRep*)malloc(sizeof(LibStdStringRep) + cap + 1); rep->length=0; rep->capacity=cap; rep->refcount=1; ((char*)(rep+1))[0]=0; return (char*)(rep+1); }
 
 // --- ТРЕЙСИНГ C-API ФУНКЦИЙ (СЕТЬ И ВРЕМЯ) ---
@@ -12472,9 +14017,13 @@ extern "C" int wrap_munmap(void *addr, size_t length) {
     return munmap(addr, length);
 }
 
-extern "C" int wrap_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) { 
-    LogToJava("C-API-TRACE: connect() ИМИТАЦИЯ УСПЕХА"); 
-    return 0; // Имитируем успешное подключение
+extern "C" int wrap_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    struct sockaddr_storage ss; socklen_t sl;
+    if (!SockaddrIOSToLinux(addr, addrlen, &ss, &sl)) { errno = EAFNOSUPPORT; return -1; }
+    int r = connect(sockfd, (struct sockaddr*)&ss, sl);
+    LogToJava("C-API-TRACE: connect(fd=" + std::to_string(sockfd) + " port=" +
+              std::to_string(ntohs(((struct sockaddr_in*)&ss)->sin_port)) + ") -> " + std::to_string(r));
+    return r;
 }
 extern "C" void* wrap_gethostbyname(const char *name) { 
     std::string sName = name ? name : "null";
@@ -12549,7 +14098,12 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     struct sigaction sa; sa.sa_flags = SA_SIGINFO | SA_NODEFER; sa.sa_sigaction = CrashHandler; sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr); sigaction(SIGILL, &sa, nullptr); sigaction(SIGBUS, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr); sigaction(SIGTRAP, &sa, nullptr); sigaction(SIGFPE, &sa, nullptr); sigaction(SIGSYS, &sa, nullptr);
-    signal(SIGPIPE, SIG_IGN); 
+    signal(SIGPIPE, SIG_IGN);
+    // PNG в iOS-бандлах пропущены через pngcrush Apple (чанк CgBI): каналы там лежат
+    // как BGRA. stb_image это распознаёт, но переставляет их обратно только по флагу.
+    stbi_convert_iphone_png_to_rgb(1);
+    SymInit();
+    LOGI("Symbolizer: %s", SymStatus());
     return JNI_VERSION_1_6;
 }
 
@@ -12630,7 +14184,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
     g_nativeWindow = window;
     
-    ANativeWindow_setBuffersGeometry(g_nativeWindow, g_surfaceWidth, g_surfaceHeight, WINDOW_FORMAT_RGBA_8888);
+    // RGBX, а не RGBA: композитор учитывает альфу кадра, а игра пишет в неё что попало
+    // (у прозрачных мест текстур она 0), из-за чего кадр местами становится прозрачным.
+    ANativeWindow_setBuffersGeometry(g_nativeWindow, g_surfaceWidth, g_surfaceHeight, WINDOW_FORMAT_RGBX_8888);
     
     LogToJava("Render: Инициализация ANativeWindow для рендера! EGL переведен в режим PBuffer (Offscreen).");
     g_cpuColorBuffer.resize(g_surfaceWidth * g_surfaceHeight, 0xFF000000);
@@ -12641,7 +14197,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     const EGLint attribs[] = { 
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, 
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT, 
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, 
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 0,
         EGL_DEPTH_SIZE, 16, EGL_STENCIL_SIZE, 8, 
         EGL_NONE 
     };
@@ -12766,7 +14322,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     else if (isUp) method = "touchesEnded:withEvent:";
     else if (isMove) method = "touchesMoved:withEvent:";
     else if (isCancel) method = "touchesCancelled:withEvent:";
-    
+
     if (method) { 
         pthread_mutex_lock(&g_mainQueueMutex);
         // Отправляем тач во View
