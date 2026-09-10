@@ -491,6 +491,22 @@ void* g_accelerometerDelegate = nullptr;
 
 // File System & Foundation HLE State
 std::string g_sandboxDir;
+
+// system("mkdir -p") в процессе приложения не отрабатывает, поэтому каталоги создаём сами
+static bool MakeDirsRecursive(const std::string& path) {
+    if (path.empty()) return false;
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        if (path[i] != '/' || cur.size() <= 1) continue;
+        ::mkdir(cur.c_str(), 0777);
+    }
+    if (path[path.size() - 1] != '/') ::mkdir(path.c_str(), 0777);
+    struct stat st;
+    bool ok = stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    if (!ok) _LogToJava("ОШИБКА MKDIR: " + path + " errno=" + std::to_string(errno));
+    return ok;
+}
 std::string g_appBundlePath;
 std::string g_execPath;
 std::map<void*, std::string> g_bundlePaths;   // NSBundle -> корень бандла
@@ -697,6 +713,7 @@ void _LogToBlackBox(const std::string& msg) {
         g_blackBoxWrapped = true;
     }
     pthread_mutex_unlock(&g_blackBoxMutex);
+    _LogToJava(msg);
 }
 
 void _LogToJava(const std::string& msg) {
@@ -5310,6 +5327,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (a7) g_dictionariesHLE[inst][GetNSString(a8)] = a7; else return (uint64_t)(uintptr_t)inst;
             return (uint64_t)(uintptr_t)inst;
         }
+        if (strcmp(op, "dictionaryWithDictionary:") == 0) {
+            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self;
+            auto it = g_dictionariesHLE.find((void*)a1);
+            if (it != g_dictionariesHLE.end()) g_dictionariesHLE[inst] = it->second;
+            return (uint64_t)(uintptr_t)inst;
+        }
         if (clsName == "NSFileManager" && strcmp(op, "defaultManager") == 0) {
             uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
         }
@@ -7106,9 +7129,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
             if (strcmp(op, "createDirectoryAtPath:withIntermediateDirectories:attributes:error:") == 0) {
                 std::string path = GetNSString(a1);
-                std::string cmd = "mkdir -p '" + path + "'";
-                system(cmd.c_str());
-                return 1;
+                bool made = MakeDirsRecursive(path);
+                LogToBlackBox("C-API-IO: [createDirectoryAtPath] " + path + " -> " + std::to_string(made));
+                return made ? 1 : 0;
             }
             if (strcmp(op, "URLForUbiquityContainerIdentifier:") == 0) {
                 return 0; // Return nil for iCloud support
@@ -9755,13 +9778,20 @@ extern "C" uint32_t wrap___udivsi3(uint32_t a, uint32_t b) { return b != 0 ? (a 
 extern "C" uint32_t wrap___umodsi3(uint32_t a, uint32_t b) { return b != 0 ? (a % b) : 0; }
 extern "C" uint64_t wrap___udivdi3(uint64_t a, uint64_t b) { return b != 0 ? (a / b) : 0; }
 extern "C" uint64_t wrap___umoddi3(uint64_t a, uint64_t b) { return b != 0 ? (a % b) : 0; }
+extern "C" uint32_t wrap___udivmodsi4(uint32_t a, uint32_t b, uint32_t* rem) {
+    if (b == 0) { if (rem) *rem = 0; return 0; }
+    if (rem) *rem = a % b;
+    return a / b;
+}
+extern "C" void wrap_OSMemoryBarrier() { __sync_synchronize(); }
 
 extern "C" int64_t wrap___fixdfdi(double a) { return (int64_t)a; }
 extern "C" int64_t wrap___fixsfdi(float a) { return (int64_t)a; }
 extern "C" uint64_t wrap___fixunsdfdi(double a) { return (uint64_t)a; }
 extern "C" double wrap___floatdidf(int64_t a) { return (double)a; }
 extern "C" double wrap___floatundidf(uint64_t a) { return (double)a; }
-extern "C" float wrap___floatundisf(uint32_t a) { return (float)a; }
+extern "C" float wrap___floatundisf(uint64_t a) { return (float)a; }
+extern "C" float wrap___floatdisf(int64_t a) { return (float)a; }
 // -----------------------------------
 
 // --- OpenGL ES 1.1 ---
@@ -10034,19 +10064,170 @@ extern "C" char* wrap_strncat(char* dest, const char* src, size_t n) {
     }
     return res;
 }
-extern "C" int wrap___sprintf_chk(char* str, int flag, size_t slen, const char* format, ...) { 
-    va_list args; va_start(args, format); 
-    int ret = vsprintf(str, format, args); 
-    va_end(args); 
+// iOS ARM32 кладёт 64-битные варарги с выравниванием 4, а AAPCS/bionic ждёт 8, поэтому
+// формат игры разбираем сами и читаем аргументы упакованно словами.
+__attribute__((noinline))
+static int IOSFormatV(char* out, size_t outSize, const char* fmt, va_list apIn) {
+    va_list ap;
+    va_copy(ap, apIn);
+    size_t pos = 0;
+    if (!fmt) { if (out && outSize) out[0] = 0; va_end(ap); return 0; }
+    const char* fmt0 = fmt;
+
+    auto putc_out = [&](char c) { if (out && pos < outSize) out[pos] = c; pos++; };
+#define IOSFMT_EMIT(spec_, value_) do { \
+        char* dst_ = (out && pos < outSize) ? out + pos : nullptr; \
+        size_t cap_ = (out && pos < outSize) ? outSize - pos : 0; \
+        int n_ = ::snprintf(dst_, cap_, (spec_), (value_)); \
+        if (n_ > 0) pos += (size_t)n_; \
+    } while (0)
+    // по слову за раз: так 64-битные читаются без 8-байтового выравнивания, как их кладёт iOS.
+    // va_arg обязан стоять прямо в теле функции: обёрнутый в лямбду, он теряет младшее слово.
+#define IOSFMT_POP32() va_arg(ap, uint32_t)
+#define IOSFMT_POP64(dst_) do { \
+        uint32_t lo_ = va_arg(ap, uint32_t); \
+        uint32_t hi_ = va_arg(ap, uint32_t); \
+        (dst_) = ((unsigned long long)hi_ << 32) | (unsigned long long)lo_; \
+    } while (0)
+
+    while (*fmt) {
+        if (*fmt != '%') { putc_out(*fmt++); continue; }
+        if (fmt[1] == '%') { putc_out('%'); fmt += 2; continue; }
+        fmt++;
+
+        char spec[80]; size_t sp = 0;
+        spec[sp++] = '%';
+        auto addSpec = [&](char c) { if (sp < sizeof(spec) - 2) spec[sp++] = c; };
+        auto addNum = [&](int v) { char t[16]; int n = ::snprintf(t, sizeof(t), "%d", v); for (int i = 0; i < n; i++) addSpec(t[i]); };
+
+        bool fMinus = false, fZero = false, fPlus = false, fSpace = false, fHash = false;
+        int width = 0, prec = -1;
+        while (*fmt && strchr("-+ #0'", *fmt)) {
+            if (*fmt == '-') fMinus = true;
+            else if (*fmt == '0') fZero = true;
+            else if (*fmt == '+') fPlus = true;
+            else if (*fmt == ' ') fSpace = true;
+            else if (*fmt == '#') fHash = true;
+            addSpec(*fmt++);
+        }
+        if (*fmt == '*') { fmt++; int w = (int32_t)IOSFMT_POP32(); if (w < 0) { fMinus = true; addSpec('-'); w = -w; } width = w; addNum(w); }
+        else while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); addSpec(*fmt++); }
+        if (*fmt == '.') {
+            fmt++;
+            if (*fmt == '*') { fmt++; int p = (int32_t)IOSFMT_POP32(); if (p >= 0) { prec = p; addSpec('.'); addNum(p); } }
+            else { prec = 0; addSpec('.'); while (*fmt >= '0' && *fmt <= '9') { prec = prec * 10 + (*fmt - '0'); addSpec(*fmt++); } }
+        }
+
+        bool is64 = false;
+        for (;;) {
+            if (fmt[0] == 'l' && fmt[1] == 'l') { is64 = true; addSpec('l'); addSpec('l'); fmt += 2; }
+            else if (*fmt == 'j' || *fmt == 'q') { is64 = true; addSpec('l'); addSpec('l'); fmt++; }
+            else if (*fmt == 'L') { fmt++; }  // long double == double на обеих платформах
+            else if (*fmt == 'l' || *fmt == 'h' || *fmt == 'z' || *fmt == 't') { addSpec(*fmt++); }
+            else break;
+        }
+
+        char conv = *fmt ? *fmt++ : 0;
+        if (!conv) break;
+        addSpec(conv); spec[sp] = 0;
+
+        switch (conv) {
+            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X':
+                if (is64) {
+                    unsigned long long v64; IOSFMT_POP64(v64);
+                    char digits[32]; size_t nd = 0;
+                    char sign = 0;
+                    unsigned long long mag = v64;
+                    if (conv == 'd' || conv == 'i') {
+                        long long s = (long long)v64;
+                        if (s < 0) { sign = '-'; mag = (unsigned long long)(-(s + 1)) + 1ull; }
+                        else if (fPlus) sign = '+';
+                        else if (fSpace) sign = ' ';
+                    }
+                    unsigned base = (conv == 'x' || conv == 'X') ? 16u : (conv == 'o' ? 8u : 10u);
+                    const char* dig = (conv == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+                    if (mag == 0) digits[nd++] = '0';
+                    while (mag) { digits[nd++] = dig[mag % base]; mag /= base; }
+                    char pre[3]; size_t np = 0;
+                    if (fHash && base == 16 && v64) { pre[np++] = '0'; pre[np++] = (conv == 'X') ? 'X' : 'x'; }
+                    else if (fHash && base == 8 && digits[nd - 1] != '0') pre[np++] = '0';
+                    size_t zeros = (prec >= 0 && (size_t)prec > nd) ? (size_t)prec - nd : 0;
+                    if (prec < 0 && fZero && !fMinus) {
+                        size_t body = nd + np + (sign ? 1u : 0u);
+                        if ((size_t)width > body) zeros = (size_t)width - body;
+                    }
+                    size_t total = nd + np + zeros + (sign ? 1u : 0u);
+                    size_t pad = ((size_t)width > total) ? (size_t)width - total : 0;
+                    if (!fMinus) for (size_t i = 0; i < pad; i++) putc_out(' ');
+                    if (sign) putc_out(sign);
+                    for (size_t i = 0; i < np; i++) putc_out(pre[i]);
+                    for (size_t i = 0; i < zeros; i++) putc_out('0');
+                    while (nd) putc_out(digits[--nd]);
+                    if (fMinus) for (size_t i = 0; i < pad; i++) putc_out(' ');
+                }
+                else { IOSFMT_EMIT(spec, (uint32_t)IOSFMT_POP32()); }
+                break;
+            case 'c':
+                IOSFMT_EMIT(spec, (int)(int32_t)IOSFMT_POP32());
+                break;
+            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
+                unsigned long long bits; IOSFMT_POP64(bits);
+                double d; memcpy(&d, &bits, sizeof(d));
+                IOSFMT_EMIT(spec, d);
+                break;
+            }
+            case 's': case 'p':
+                IOSFMT_EMIT(spec, (void*)(uintptr_t)IOSFMT_POP32());
+                break;
+            case 'n':
+                (void)IOSFMT_POP32();
+                break;
+            default:
+                for (size_t i = 0; i < sp; i++) putc_out(spec[i]);
+                break;
+        }
+    }
+
+    if (out && outSize) out[pos < outSize ? pos : outSize - 1] = 0;
+    va_end(ap);
+    if (strstr(fmt0, "ll")) {
+        va_list dbgAp; va_copy(dbgAp, apIn);
+        uint32_t w[6];
+        for (int i = 0; i < 6; i++) w[i] = va_arg(dbgAp, uint32_t);
+        va_end(dbgAp);
+        char dbg[256];
+        ::snprintf(dbg, sizeof(dbg), "IOSFMT-SRC: fmt=[%s] w=%08x %08x %08x %08x %08x %08x out=[%s]",
+                   fmt0, w[0], w[1], w[2], w[3], w[4], w[5], out ? out : "(null)");
+        LogToJava(dbg);
+    }
+    return (int)pos;
+#undef IOSFMT_EMIT
+#undef IOSFMT_POP32
+#undef IOSFMT_POP64
+}
+
+static int IOSFormatAlloc(std::vector<char>& buf, const char* fmt, va_list ap) {
+    int need = IOSFormatV(nullptr, 0, fmt, ap);
+    buf.assign((size_t)need + 1, 0);
+    IOSFormatV(buf.data(), buf.size(), fmt, ap);
+    return need;
+}
+
+extern "C" int wrap___sprintf_chk(char* str, int flag, size_t slen, const char* format, ...) {
+    va_list args; va_start(args, format);
+    if (format && strstr(format, "ll")) LogToJava(std::string("IOSFMT-SRC: __sprintf_chk fmt=[") + format + "]");
+    int ret = IOSFormatV(nullptr, 0, format, args);
+    if (str) IOSFormatV(str, (size_t)ret + 1, format, args);
+    va_end(args);
     if (str && (strstr(str, "pngConf") || strstr(str, "jungle"))) {
         LogToJava(std::string("C-API-DEBUG: [__sprintf_chk] Собрана строка: [") + str + "]");
     }
     return ret; 
 }
 extern "C" int wrap___snprintf_chk(char *str, size_t maxlen, int flag, size_t bos, const char *format, ...) { 
-    va_list args; va_start(args, format); 
-    int ret = vsnprintf(str, maxlen, format, args); 
-    va_end(args); 
+    va_list args; va_start(args, format);
+    int ret = IOSFormatV(str, maxlen, format, args);
+    va_end(args);
     if (str && (strstr(str, "pngConf") || strstr(str, "jungle"))) {
         LogToJava(std::string("C-API-DEBUG: [__snprintf_chk] Собрана строка: [") + str + "]");
     }
@@ -10102,6 +10283,17 @@ extern "C" size_t wrap_mbstowcs(wchar_t* dest, const char* src, size_t n) {
 extern "C" int wrap_rmdir(const char* pathname) {
     return rmdir(pathname);
 }
+// Относительные пути обязаны ложиться туда же, куда их кладут fopen/open/stat,
+// иначе игра создаёт каталог в cwd, а файл ищет в Documents.
+extern "C" int wrap_mkdir(const char* pathname, mode_t mode) {
+    if (!pathname) return -1;
+    std::string sPath = pathname;
+    if (!sPath.empty() && sPath[0] != '/') sPath = g_sandboxDir + "Documents/" + sPath;
+    int res = ::mkdir(sPath.c_str(), mode ? mode : 0777);
+    LogToBlackBox("C-API-IO: [mkdir] " + sPath + " -> " + std::to_string(res) +
+                  (res < 0 ? " errno=" + std::to_string(errno) : ""));
+    return res;
+}
 extern "C" long long wrap_strtoll(const char* nptr, char** endptr, int base) {
     return strtoll(nptr, endptr, base);
 }
@@ -10146,8 +10338,50 @@ extern "C" int wrap_ioctl(int fd, unsigned long request, ...) {
     }
     return ioctl(fd, request, argp);
 }
+// Номера F_*LK и раскладка struct flock у Darwin и Linux не совпадают.
+#define IOS_F_GETLK  7
+#define IOS_F_SETLK  8
+#define IOS_F_SETLKW 9
+#define IOS_F_RDLCK  1
+#define IOS_F_UNLCK  2
+#define IOS_F_WRLCK  3
+struct IosFlock { int64_t l_start; int64_t l_len; int32_t l_pid; int16_t l_type; int16_t l_whence; };
+
+static short IosLockTypeToLinux(int16_t t) {
+    if (t == IOS_F_RDLCK) return F_RDLCK;
+    if (t == IOS_F_WRLCK) return F_WRLCK;
+    return F_UNLCK;
+}
+static int16_t LinuxLockTypeToIos(short t) {
+    if (t == F_RDLCK) return IOS_F_RDLCK;
+    if (t == F_WRLCK) return IOS_F_WRLCK;
+    return IOS_F_UNLCK;
+}
+
 extern "C" int wrap_fcntl(int fd, int cmd, ...) {
     va_list args; va_start(args, cmd); void* argp = va_arg(args, void*); va_end(args);
+    if (cmd == IOS_F_GETLK || cmd == IOS_F_SETLK || cmd == IOS_F_SETLKW) {
+        IosFlock* ios = (IosFlock*)argp;
+        if (!ios) { errno = EINVAL; return -1; }
+        struct flock lk;
+        memset(&lk, 0, sizeof(lk));
+        lk.l_type = IosLockTypeToLinux(ios->l_type);
+        lk.l_whence = ios->l_whence;
+        lk.l_start = (off_t)ios->l_start;
+        lk.l_len = (off_t)ios->l_len;
+        int lcmd = (cmd == IOS_F_GETLK) ? F_GETLK : (cmd == IOS_F_SETLK ? F_SETLK : F_SETLKW);
+        int r = fcntl(fd, lcmd, &lk);
+        LogToBlackBox("C-API-IO: [fcntl] блокировка cmd=" + std::to_string(cmd) +
+                      " type=" + std::to_string(ios->l_type) + " -> " + std::to_string(r));
+        if (r == 0 && cmd == IOS_F_GETLK) {
+            ios->l_type = LinuxLockTypeToIos(lk.l_type);
+            ios->l_whence = lk.l_whence;
+            ios->l_start = lk.l_start;
+            ios->l_len = lk.l_len;
+            ios->l_pid = lk.l_pid;
+        }
+        return r;
+    }
     // У iOS O_NONBLOCK = 0x0004, у Linux = 0x0800 — без трансляции сокет остаётся блокирующим.
     if (IsWrapSock(fd)) {
         if (cmd == F_GETFL) {
@@ -10165,6 +10399,21 @@ extern "C" int wrap_fcntl(int fd, int cmd, ...) {
     }
     return fcntl(fd, cmd, argp);
 }
+// off_t у Darwin всегда 64-битный, а у bionic на 32 битах — 32-битный. Принимаем
+// смещение явным int64_t (AAPCS кладёт его так же, как ждёт гость) и уходим в pread64.
+extern "C" ssize_t wrap_pread(int fd, void* buf, size_t nbyte, int64_t offset) {
+    ssize_t r = pread64(fd, buf, nbyte, (off64_t)offset);
+    LogToBlackBox("C-API-IO: [pread] fd=" + std::to_string(fd) + " len=" + std::to_string(nbyte) +
+                  " off=" + std::to_string(offset) + " -> " + std::to_string(r));
+    return r;
+}
+
+extern "C" int wrap_fsync(int fd) {
+    int r = fsync(fd);
+    LogToBlackBox("C-API-IO: [fsync] fd=" + std::to_string(fd) + " -> " + std::to_string(r));
+    return r;
+}
+
 extern "C" int wrap_select(int nfds, void *readfds, void *writefds, void *exceptfds, void *timeout) {
     // На 32-битном ARM fd_set и timeval у iOS и Linux совпадают побайтно.
     return select(nfds, (fd_set*)readfds, (fd_set*)writefds, (fd_set*)exceptfds, (struct timeval*)timeout);
@@ -10210,6 +10459,9 @@ extern "C" uint32_t wrap___maskrune(int c, uint32_t f) {
 }
 extern "C" int64_t wrap___divdi3(int64_t a, int64_t b) {
     return b != 0 ? (a / b) : 0;
+}
+extern "C" int64_t wrap___moddi3(int64_t a, int64_t b) {
+    return b != 0 ? (a % b) : 0;
 }
 extern "C" uint64_t wrap___fixunssfdi(float a) {
     return (uint64_t)a;
@@ -10705,18 +10957,65 @@ extern "C" int wrap_access(const char* path, int mode) {
     return access(sPath.c_str(), mode);
 }
 
-extern "C" DIR* wrap_opendir(const char* name) {
-    std::string sName = name ? name : "null";
-    LogToBlackBox("C-API-IO: [opendir] Чтение директории: " + sName);
-    return opendir(name);
+// Значения O_* у Darwin и Linux разъезжаются с 0x0004: у iOS O_CREAT = 0x200,
+// а на Linux 0x200 — это O_TRUNC, так что без трансляции файл молча не создаётся.
+extern "C" int wrap_open(const char* path, int ios_flags, ...) {
+    va_list ap; va_start(ap, ios_flags); mode_t mode = (mode_t)va_arg(ap, unsigned); va_end(ap);
+
+    int flags = ios_flags & 0x3;                        // O_RDONLY/O_WRONLY/O_RDWR совпадают
+    if (ios_flags & 0x0004) flags |= O_NONBLOCK;
+    if (ios_flags & 0x0008) flags |= O_APPEND;
+    if (ios_flags & 0x0080) flags |= O_SYNC;
+    if (ios_flags & 0x0100) flags |= O_NOFOLLOW;
+    if (ios_flags & 0x0200) flags |= O_CREAT;
+    if (ios_flags & 0x0400) flags |= O_TRUNC;
+    if (ios_flags & 0x0800) flags |= O_EXCL;
+    if (ios_flags & 0x100000) flags |= O_DIRECTORY;     // O_DIRECTORY у Darwin
+
+    std::string sPath = path ? path : "";
+    if (!sPath.empty() && sPath[0] != '/') sPath = g_sandboxDir + "Documents/" + sPath;
+
+    int fd = open(sPath.c_str(), flags, mode);
+    LogToBlackBox("C-API-IO: [open] " + sPath + " ios_flags=" + std::to_string(ios_flags) +
+                  " -> fd=" + std::to_string(fd) + (fd < 0 ? " errno=" + std::to_string(errno) : ""));
+    return fd;
 }
+
+extern "C" DIR* wrap_opendir(const char* name) {
+    std::string sName = name ? name : "";
+    if (!sName.empty() && sName[0] != '/') sName = g_sandboxDir + "Documents/" + sName;
+    LogToBlackBox("C-API-IO: [opendir] Чтение директории: " + sName);
+    return opendir(sName.c_str());
+}
+
+// У iOS d_name лежит по смещению 21 (после 64-битных d_ino/d_seekoff, d_reclen,
+// d_namlen, d_type), у bionic — по 19. Отдать гостю bionic-структуру значит отдать
+// ему сдвинутое имя, поэтому перекладываем поля в darwin-раскладку.
+struct DarwinDirent {
+    uint64_t d_ino;
+    uint64_t d_seekoff;
+    uint16_t d_reclen;
+    uint16_t d_namlen;
+    uint8_t  d_type;
+    char     d_name[1024];
+} __attribute__((packed));
 
 extern "C" struct dirent* wrap_readdir(DIR* dirp) {
     struct dirent* res = readdir(dirp);
-    if (res) {
-        LogToBlackBox("C-API-IO: [readdir] Найдено: " + std::string(res->d_name));
-    }
-    return res;
+    if (!res) return nullptr;
+
+    static __thread DarwinDirent out;
+    size_t nameLen = strnlen(res->d_name, sizeof(out.d_name) - 1);
+    out.d_ino = res->d_ino;
+    out.d_seekoff = (uint64_t)res->d_off;
+    out.d_namlen = (uint16_t)nameLen;
+    out.d_reclen = (uint16_t)(21 + nameLen + 1);
+    out.d_type = res->d_type;
+    memcpy(out.d_name, res->d_name, nameLen);
+    out.d_name[nameLen] = '\0';
+
+    LogToBlackBox("C-API-IO: [readdir] Найдено: " + std::string(out.d_name));
+    return (struct dirent*)&out;
 }
 
 extern "C" void* wrap_fopen(const char* path, const char* mode) {
@@ -10876,16 +11175,42 @@ extern "C" int wrap_fileno(void* fp) { FILE* f = unwrap_file(fp); return f ? fil
 extern "C" int wrap_fflush(void* fp) { FILE* f = unwrap_file(fp); return f ? fflush(f) : EOF; }
 
 // Глобальные перехваты логов игры
+extern "C" int wrap_snprintf(char* buf, size_t size, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int r = IOSFormatV(buf, size, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+extern "C" int wrap_vsnprintf(char* buf, size_t size, const char* fmt, va_list ap) {
+    return IOSFormatV(buf, size, fmt, ap);
+}
+
+extern "C" int wrap_vsprintf(char* buf, const char* fmt, va_list ap) {
+    if (fmt && strstr(fmt, "ll")) LogToJava(std::string("IOSFMT-SRC: vsprintf fmt=[") + fmt + "]");
+    int need = IOSFormatV(nullptr, 0, fmt, ap);
+    if (buf) IOSFormatV(buf, (size_t)need + 1, fmt, ap);
+    return need;
+}
+
+extern "C" int wrap_sprintf(char* buf, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    if (fmt && strstr(fmt, "ll")) LogToJava(std::string("IOSFMT-SRC: sprintf fmt=[") + fmt + "]");
+    int r = wrap_vsprintf(buf, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
 extern "C" int wrap_printf(const char* format, ...) {
     va_list args; va_start(args, format);
-    char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-    LogToJava(std::string("GAME-LOG: ") + buf);
-    va_end(args); return strlen(buf);
+    std::vector<char> buf; IOSFormatAlloc(buf, format, args);
+    LogToJava(std::string("GAME-LOG: ") + buf.data());
+    va_end(args); return (int)strlen(buf.data());
 }
 extern "C" int wrap_vprintf(const char* format, va_list args) {
-    char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-    LogToJava(std::string("GAME-LOG: ") + buf);
-    return strlen(buf);
+    std::vector<char> buf; IOSFormatAlloc(buf, format, args);
+    LogToJava(std::string("GAME-LOG: ") + buf.data());
+    return (int)strlen(buf.data());
 }
 extern "C" int wrap_puts(const char* str) {
     LogToJava(std::string("GAME-LOG: ") + (str ? str : ""));
@@ -10895,23 +11220,20 @@ extern "C" int wrap_fputs(const char* str, void* fp) {
     if (fp == stdout || fp == stderr) { LogToJava(std::string("GAME-LOG: ") + (str ? str : "")); return 0; }
     return fputs(str, unwrap_file(fp));
 }
+extern "C" int wrap_vfprintf(void* fp, const char* format, va_list args) {
+    std::vector<char> buf; int need = IOSFormatAlloc(buf, format, args);
+    if (fp == stdout || fp == stderr) {
+        LogToJava(std::string("GAME-LOG: ") + buf.data());
+        return need;
+    }
+    FILE* real_f = unwrap_file(fp);
+    if (!real_f) return -1;
+    return (int)fwrite(buf.data(), 1, (size_t)need, real_f);
+}
 extern "C" int wrap_fprintf(void* fp, const char* format, ...) {
     va_list args; va_start(args, format);
-    if (fp == stdout || fp == stderr) {
-        char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-        LogToJava(std::string("GAME-LOG: ") + buf);
-        va_end(args); return strlen(buf);
-    }
-    int ret = vfprintf(unwrap_file(fp), format, args);
+    int ret = wrap_vfprintf(fp, format, args);
     va_end(args); return ret;
-}
-extern "C" int wrap_vfprintf(void* fp, const char* format, va_list args) {
-    if (fp == stdout || fp == stderr) {
-        char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-        LogToJava(std::string("GAME-LOG: ") + buf);
-        return strlen(buf);
-    }
-    return vfprintf(unwrap_file(fp), format, args);
 }
 
 
@@ -11621,6 +11943,7 @@ extern "C" void* wrap_lcxx_str_dtor(void*);
 extern "C" size_t wrap_lcxx_str_find_char(const void*, char, size_t);
 extern "C" size_t wrap_lcxx_str_find_ptr_len(const void*, const char*, size_t, size_t);
 extern "C" size_t wrap_lcxx_str_rfind_ptr_len(const void*, const char*, size_t, size_t);
+extern "C" size_t wrap_lcxx_str_rfind_char(const void*, char, size_t);
 extern "C" size_t wrap_lcxx_str_find_last_not_of(const void*, const char*, size_t, size_t);
 extern "C" int wrap_lcxx_str_compare_ptr(const void*, const char*);
 extern "C" void wrap_lcxx_mutex_lock(void*);
@@ -11629,6 +11952,9 @@ extern "C" void* wrap_lcxx_mutex_dtor(void*);
 extern "C" void wrap_lcxx_cv_notify_one(void*);
 extern "C" void wrap_lcxx_cv_notify_all(void*);
 extern "C" void wrap_lcxx_cv_wait(void*, void*);
+extern "C" void wrap_lcxx_cv_do_timed_wait(void*, void*, long long);
+extern "C" void* wrap_lcxx_system_clock_now(void*);
+extern "C" void* wrap_lcxx_steady_clock_now(void*);
 extern "C" void* wrap_lcxx_cv_dtor(void*);
 extern "C" void wrap_lcxx_thread_join(void*);
 extern "C" void* wrap_lcxx_thread_dtor(void*);
@@ -11867,14 +12193,14 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(malloc), STB_W(free), STB_W(calloc), STB_W(realloc), STB_D(memcpy), STB_D(memmove), STB_D(memset), STB_D(memcmp), {"_memchr", (void*)(void*(*)(void*, int, size_t))memchr},
     STB_D(strcpy), STB_D(strncpy), STB_D(strcmp), STB_D(strncmp), STB_D(strlen), STB_W(strcat), STB_W(strncat), {"_strchr", (void*)(char*(*)(char*, int))strchr}, {"_strrchr", (void*)(char*(*)(char*, int))strrchr}, {"_strstr", (void*)(char*(*)(char*, const char*))strstr},
     STB_D(strdup), STB_D(strcasecmp), STB_D(strncasecmp), STB_D(strcspn), {"_strpbrk", (void*)(char*(*)(char*, const char*))strpbrk},
-    STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_D(sprintf), STB_D(snprintf), STB_D(vsprintf), STB_D(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
+    STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_W(sprintf), STB_W(snprintf), STB_W(vsprintf), STB_W(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
     STB_W(fopen), STB_W(fclose), STB_W(fread), STB_W(fwrite), STB_W(fseek), STB_W(ftell), STB_W(fgetpos), STB_W(fsetpos), STB_W(fputc), STB_W(fscanf), STB_W(fflush), STB_W(fputs), STB_W(fprintf), STB_W(fgetc), STB_W(fgets), STB_W(feof), STB_W(ferror), STB_W(fileno), {"___srget", (void*)wrap___srget},
     {"_sqrt", (void*)(double(*)(double))sqrt}, STB_D(sqrtf), {"_pow", (void*)(double(*)(double, double))pow}, STB_D(powf), {"_exp", (void*)(double(*)(double))exp}, STB_D(expf), {"_log", (void*)(double(*)(double))log}, STB_D(logf), {"_log10", (void*)(double(*)(double))log10}, STB_D(log10f), {"_log2", (void*)(double(*)(double))log2}, STB_D(log2f),
     {"_ceil", (void*)(double(*)(double))ceil}, STB_D(ceilf), {"_floor", (void*)(double(*)(double))floor}, STB_D(floorf), {"_round", (void*)(double(*)(double))round}, STB_D(roundf), {"_fmod", (void*)(double(*)(double, double))fmod}, STB_D(fmodf), {"_fmin", (void*)(double(*)(double, double))fmin}, STB_D(fminf), {"_fmax", (void*)(double(*)(double, double))fmax}, STB_D(fmaxf),
     {"_sin", (void*)(double(*)(double))sin}, {"_cos", (void*)(double(*)(double))cos}, {"_tan", (void*)(double(*)(double))tan}, {"_asin", (void*)(double(*)(double))asin}, {"_acos", (void*)(double(*)(double))acos}, {"_atan", (void*)(double(*)(double))atan}, {"_atan2", (void*)(double(*)(double, double))atan2}, STB_D(atan2f), STB_D(atanf),
     {"_sinh", (void*)(double(*)(double))sinh}, {"_cosh", (void*)(double(*)(double))cosh}, {"_tanh", (void*)(double(*)(double))tanh}, {"_abs", (void*)(int(*)(int))abs}, {"_fabs", (void*)(double(*)(double))fabs}, STB_D(fabsf),
     STB_D(srand), STB_D(srandom), STB_D(random), STB_D(rand), STB_D(gettimeofday), STB_D(clock), STB_D(time), STB_S(bzero),
-    STB_W(getenv), STB_D(getcwd), STB_D(chdir), STB_W(stat), STB_W(fstat), STB_W(lstat), STB_D(mkdir), STB_D(remove), STB_D(rename), STB_W(abort), STB_W(mmap), STB_W(munmap), STB_W(rmdir), STB_W(unlink), STB_W(ecvt), STB_W(fcvt), STB_W(fnmatch), STB_W(mbstowcs), STB_W(aio_read), STB_W(aio_error), STB_W(aio_return), STB_W(ioctl), STB_W(select), STB_W(statfs), STB_W(getifaddrs), STB_W(freeifaddrs),
+    STB_W(getenv), STB_D(getcwd), STB_D(chdir), STB_W(stat), STB_W(fstat), STB_W(lstat), STB_W(mkdir), STB_D(remove), STB_D(rename), STB_W(abort), STB_W(mmap), STB_W(munmap), STB_W(rmdir), STB_W(unlink), STB_W(ecvt), STB_W(fcvt), STB_W(fnmatch), STB_W(mbstowcs), STB_W(aio_read), STB_W(aio_error), STB_W(aio_return), STB_W(ioctl), STB_W(select), STB_W(statfs), STB_W(getifaddrs), STB_W(freeifaddrs),
     {"_ldexp", (void*)(double(*)(double, int))ldexp}, STB_D(ldexpf), {"_modf", (void*)(double(*)(double, double*))modf}, STB_D(modff),
     STB_W(pthread_create), STB_D(pthread_join), STB_W(pthread_mutex_init), STB_W(pthread_mutex_lock), STB_W(pthread_mutex_unlock), STB_W(pthread_mutex_destroy), STB_W(pthread_cond_init), STB_W(pthread_cond_wait), STB_W(pthread_cond_signal), STB_W(pthread_cond_broadcast), STB_W(pthread_cond_destroy), STB_D(pthread_self), STB_D(pthread_equal), STB_W(pthread_once), STB_D(pthread_attr_init), STB_D(pthread_attr_destroy), STB_D(pthread_attr_setdetachstate), STB_W(pthread_attr_setstacksize), STB_W(pthread_mach_thread_np), STB_W(thread_get_state), STB_W(thread_set_state), STB_D(pthread_key_create), STB_D(pthread_key_delete), STB_D(pthread_setspecific), STB_D(pthread_getspecific),
     STB_D(sqlite3_open), STB_D(sqlite3_close), STB_D(sqlite3_prepare_v2), STB_D(sqlite3_step), STB_D(sqlite3_finalize), STB_D(sqlite3_bind_int), STB_D(sqlite3_bind_text), STB_D(sqlite3_free_table), STB_D(sqlite3_get_table),
@@ -11883,7 +12209,7 @@ std::map<std::string, void*> g_hleStubs = {
     
     STB_D(acosf), STB_D(asinf), STB_D(strlcpy), STB_D(strtok), STB_D(strerror_r), STB_D(wcscmp), STB_D(wcscpy), STB_D(wcslen), {"_wcschr", (void*)(wchar_t*(*)(wchar_t*, wchar_t))wcschr}, STB_D(wcsncpy), STB_D(wcstombs), STB_D(wcstol), STB_W(memset_pattern16),
     {"_wmemchr", (void*)(wchar_t*(*)(wchar_t*, wchar_t, size_t))wmemchr}, STB_D(wmemcmp), STB_D(wmemcpy), STB_D(wmemmove), STB_D(swprintf), STB_W(vswprintf), STB_W(swscanf), STB_W(wcsncmp), STB_W(wcstof),
-    STB_W(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_D(open), STB_D(read), STB_D(write), STB_D(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
+    STB_W(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_W(open), STB_D(read), STB_D(write), STB_W(pread), STB_W(fsync), STB_D(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
     {"_div", (void*)(div_t(*)(int, int))div}, STB_D(gethostbyaddr), STB_W(gethostbyname), STB_W(gethostname), STB_D(getnameinfo), STB_W(getpeername), STB_W(getsockname), STB_W(getsockopt), STB_D(if_nametoindex), STB_D(inet_addr),
     STB_W(SecItemAdd), STB_W(SecItemCopyMatching), STB_W(SecItemUpdate), STB_W(SecItemDelete), STB_D(getpid), STB_D(inet_aton), STB_D(inet_ntoa), STB_W(longjmp), STB_D(perror), STB_D(sigaction), STB_W(sigprocmask), STB_D(utimes), STB_D(vprintf), STB_W(fcntl), STB_D(system), STB_D(uname), STB_D(dladdr), STB_D(dlsym), STB_D(arc4random), STB_D(localtime), STB_D(localtime_r),
     STB_W(sysctl), STB_W(sysctlbyname), STB_W(sysconf), STB_W(asprintf), STB_W(dlopen), STB_W(dlclose), STB_W(hash_create), STB_W(hash_search),
@@ -11891,7 +12217,8 @@ std::map<std::string, void*> g_hleStubs = {
     STB_D(pthread_exit), STB_D(pthread_detach), STB_D(pthread_kill), STB_W(pthread_mutex_trylock), STB_W(pthread_cond_timedwait), STB_D(pthread_getschedparam), STB_D(pthread_setschedparam), STB_D(pthread_mutexattr_init), STB_D(pthread_mutexattr_destroy), STB_D(pthread_mutexattr_settype), STB_D(sched_get_priority_max), STB_D(sched_get_priority_min),
     {"_class_copyMethodList", (void*)Stub_GenericUnimplemented}, STB_W(class_getName), STB_W(class_getInstanceSize), STB_W(class_getSuperclass), {"_class_getProperty", (void*)Stub_GenericUnimplemented}, STB_W(class_getInstanceMethod), STB_W(class_getClassMethod), STB_W(ivar_getName), STB_W(ivar_getOffset), STB_W(method_getImplementation), STB_W(method_getName), STB_W(objc_copyStruct), STB_W(objc_getClassList), STB_W(objc_getProperty), STB_W(objc_lookUpClass), STB_W(object_getClass), STB_W(protocol_getMethodDescription), STB_W(objc_getAssociatedObject), STB_W(objc_setAssociatedObject), STB_W(objc_retain),
     STB_W(class_addMethod), STB_W(class_addProperty), STB_W(class_addProtocol), STB_W(class_getInstanceVariable), STB_W(class_getIvarLayout), STB_W(class_isMetaClass), STB_W(class_respondsToSelector), STB_W(objc_getClass), STB_W(objc_getMetaClass), STB_W(objc_getProtocol), STB_W(objc_getRequiredClass), STB_W(objc_initializeClassPair), STB_W(objc_registerClassPair), STB_W(object_getIvar), STB_W(object_setIvar), STB_W(property_copyAttributeList), STB_W(sel_getUid),
-    STB_W(OSAtomicOr32Barrier), STB_W(OSAtomicTestAndClearBarrier), STB_W(OSSpinLockLock), STB_W(OSSpinLockTry), STB_W(OSSpinLockUnlock),
+    STB_W(OSAtomicOr32Barrier), STB_W(OSAtomicTestAndClearBarrier), STB_W(OSSpinLockLock), STB_W(OSSpinLockTry), STB_W(OSSpinLockUnlock), STB_W(OSMemoryBarrier),
+    {"___udivmodsi4", (void*)wrap___udivmodsi4}, {"_strerror", (void*)(char*(*)(int))strerror},
 
     STB_D(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_D(glCopyTexImage2D), STB_D(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, STB_D(glDepthRangef), {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), STB_D(glPolygonOffset), STB_D(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_D(glTexParameterf), STB_D(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
 
@@ -11918,7 +12245,7 @@ std::map<std::string, void*> g_hleStubs = {
 
     STB_W(__assert_rtn), STB_W(__error), STB_W(__memset_chk), STB_W(strnstr), STB_W(__memcpy_chk), STB_W(__memmove_chk), STB_W(__strcpy_chk), STB_W(__strcat_chk), STB_W(__sprintf_chk), STB_W(__snprintf_chk), STB_W(__tolower), STB_W(__toupper),
     {"__Znwm", (void*)wrap_malloc}, {"__Znwj", (void*)wrap_malloc}, {"__Znam", (void*)wrap_malloc}, {"__Znaj", (void*)wrap_malloc}, {"__ZdlPv", (void*)wrap_free}, {"__ZdaPv", (void*)wrap_free},
-    {"___dynamic_cast", (void*)wrap_dynamic_cast}, {"___cxa_throw", (void*)wrap_cxa_throw}, {"___cxa_allocate_exception", (void*)malloc}, {"___cxa_free_exception", (void*)free}, STB_W(__cxa_guard_acquire), STB_W(__cxa_guard_release), STB_W(__cxa_begin_catch), STB_W(__cxa_call_unexpected), STB_W(__cxa_rethrow), STB_W(objc_begin_catch), STB_W(_Unwind_SjLj_Resume), STB_W(dyld_stub_binder), STB_W(__divsi3), STB_W(__fixdfdi), STB_W(__fixsfdi), STB_W(__fixunsdfdi), STB_W(__floatdidf), STB_W(__floatundidf), STB_W(__floatundisf), STB_W(__gxx_personality_sj0), STB_W(__maskrune), STB_W(__modsi3), STB_W(__objc_personality_v0), STB_W(__udivdi3), STB_W(__udivsi3), STB_W(__divdi3), STB_W(__fixunssfdi), STB_W(__cxa_demangle), STB_W(__umoddi3), STB_W(__umodsi3),
+    {"___dynamic_cast", (void*)wrap_dynamic_cast}, {"___cxa_throw", (void*)wrap_cxa_throw}, {"___cxa_allocate_exception", (void*)malloc}, {"___cxa_free_exception", (void*)free}, STB_W(__cxa_guard_acquire), STB_W(__cxa_guard_release), STB_W(__cxa_begin_catch), STB_W(__cxa_call_unexpected), STB_W(__cxa_rethrow), STB_W(objc_begin_catch), STB_W(_Unwind_SjLj_Resume), STB_W(dyld_stub_binder), STB_W(__divsi3), STB_W(__fixdfdi), STB_W(__fixsfdi), STB_W(__fixunsdfdi), STB_W(__floatdidf), STB_W(__floatundidf), STB_W(__floatundisf), STB_W(__floatdisf), STB_W(__gxx_personality_sj0), STB_W(__maskrune), STB_W(__modsi3), STB_W(__objc_personality_v0), STB_W(__udivdi3), STB_W(__udivsi3), STB_W(__divdi3), STB_W(__fixunssfdi), STB_W(__cxa_demangle), STB_W(__umoddi3), STB_W(__moddi3), STB_W(__umodsi3),
     STB_W(crc32), STB_W(deflate), STB_W(deflateEnd), STB_W(deflateInit2_), STB_W(inflate), STB_W(inflateEnd), STB_W(inflateInit2_), STB_W(inflateInit_), STB_W(inflateReset),
     {"__dyld_get_image_header", (void*)Stub_ReturnZero}, {"__dyld_get_image_name", (void*)Stub_ReturnZero}, {"__dyld_image_count", (void*)Stub_ReturnZero}, STB_W(_NSGetExecutablePath), {"__dyld_register_func_for_add_image", (void*)wrap__dyld_register_func_for_add_image},
     
@@ -11985,6 +12312,7 @@ std::map<std::string, void*> g_hleStubs = {
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm", (void*)wrap_lcxx_str_find_ptr_len},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm", (void*)wrap_lcxx_str_find_char},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEPKcmm", (void*)wrap_lcxx_str_rfind_ptr_len},
+    {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm", (void*)wrap_lcxx_str_rfind_char},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc", (void*)wrap_lcxx_str_compare_ptr},
     {"__ZNKSt3__119__shared_weak_count13__get_deleterERKSt9type_info", (void*)wrap_lcxx_swc_get_deleter},
     {"__ZNKSt3__120__vector_base_commonILb1EE20__throw_length_errorEv", (void*)wrap_lcxx_throw_length_error},
@@ -12044,7 +12372,10 @@ std::map<std::string, void*> g_hleStubs = {
     {"__ZNSt3__118condition_variable10notify_allEv", (void*)wrap_lcxx_cv_notify_all},
     {"__ZNSt3__118condition_variable10notify_oneEv", (void*)wrap_lcxx_cv_notify_one},
     {"__ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE", (void*)wrap_lcxx_cv_wait},
+    {"__ZNSt3__118condition_variable15__do_timed_waitERNS_11unique_lockINS_5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_5ratioILx1ELx1000000000EEEEEEE", (void*)wrap_lcxx_cv_do_timed_wait},
     {"__ZNSt3__118condition_variableD1Ev", (void*)wrap_lcxx_cv_dtor},
+    {"__ZNSt3__16chrono12steady_clock3nowEv", (void*)wrap_lcxx_steady_clock_now},
+    {"__ZNSt3__16chrono12system_clock3nowEv", (void*)wrap_lcxx_system_clock_now},
     {"__ZNSt3__119__shared_weak_count12__add_sharedEv", (void*)wrap_lcxx_swc_add_shared},
     {"__ZNSt3__119__shared_weak_count16__release_sharedEv", (void*)wrap_lcxx_swc_release_shared},
     {"__ZNSt3__119__shared_weak_countD2Ev", (void*)wrap_lcxx_swc_dtor},
@@ -14001,7 +14332,11 @@ extern "C" void wrap__dyld_register_func_for_add_image(void (*func)(const void* 
 extern "C" int wrap_asprintf(char** ret, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    int res = vasprintf(ret, format, args);
+    int need = IOSFormatV(nullptr, 0, format, args);
+    char* buf = (char*)malloc((size_t)need + 1);
+    int res = -1;
+    if (buf) { IOSFormatV(buf, (size_t)need + 1, format, args); res = need; }
+    if (ret) *ret = buf;
     va_end(args);
     return res;
 }
@@ -14280,6 +14615,16 @@ extern "C" size_t wrap_lcxx_str_rfind_ptr_len(const void* s, const char* p, size
     for (size_t i = pos + 1; i-- > 0; ) if (n == 0 || memcmp(d + i, p, n) == 0) return i;
     return lcxx::kNpos;
 }
+extern "C" size_t wrap_lcxx_str_rfind_char(const void* s, char c, size_t pos) {
+    size_t sz = lcxx::Size(s);
+    if (sz == 0) return lcxx::kNpos;
+    const char* d = lcxx::Data(s);
+    size_t i = (pos >= sz) ? (sz - 1) : pos;
+    for (;; --i) {
+        if (d[i] == c) return i;
+        if (i == 0) return lcxx::kNpos;
+    }
+}
 extern "C" size_t wrap_lcxx_str_find_last_not_of(const void* s, const char* p, size_t pos, size_t n) {
     size_t sz = lcxx::Size(s);
     if (sz == 0) return lcxx::kNpos;
@@ -14340,6 +14685,33 @@ extern "C" void wrap_lcxx_cv_wait(void* c, void* ul) {
     void* gm = ul ? *(void**)ul : nullptr;   // unique_lock: { mutex* __m_; bool __owns_; }
     if (!gm) return;
     pthread_cond_wait(LcxxCondFor(c), LcxxMutexFor(gm));
+}
+// time_point возвращается композитом в 8 байт, то есть по AAPCS через скрытый указатель в r0.
+extern "C" void* wrap_lcxx_system_clock_now(void* ret) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    *(long long*)ret = (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;  // microseconds
+    return ret;
+}
+extern "C" void* wrap_lcxx_steady_clock_now(void* ret) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    *(long long*)ret = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;      // nanoseconds
+    return ret;
+}
+// ns — абсолютный дедлайн от эпохи system_clock, ровно та база, что у CLOCK_REALTIME.
+extern "C" void wrap_lcxx_cv_do_timed_wait(void* c, void* ul, long long ns) {
+    void* gm = ul ? *(void**)ul : nullptr;
+    if (!gm) return;
+    pthread_cond_t* cond = LcxxCondFor(c);
+    pthread_mutex_t* mtx = LcxxMutexFor(gm);
+    if (ns <= 0) return;
+    long long sec = ns / 1000000000LL;
+    if (sec > 0x7fffffffLL) { pthread_cond_wait(cond, mtx); return; }
+    struct timespec ts;
+    ts.tv_sec = (time_t)sec;
+    ts.tv_nsec = (long)(ns % 1000000000LL);
+    pthread_cond_timedwait(cond, mtx, &ts);
 }
 extern "C" void* wrap_lcxx_cv_dtor(void* c) {
     pthread_mutex_lock(&g_lcxxSideLock);
@@ -14412,8 +14784,9 @@ extern "C" size_t wrap_lcxx_next_prime(size_t n) {
     }
 }
 extern "C" void wrap_lcxx_throw_length_error(void* self) {
+    uint32_t lr = (uint32_t)__builtin_return_address(0);
     (void)self;
-    LogToJava("C++ EXCEPTION (libc++): length_error");
+    LogToJava("C++ EXCEPTION (libc++): length_error Caller: " + GetModuleInfoForAddress(lr));
     wrap_abort();
 }
 extern "C" void wrap_lcxx_throw_system_error(int ev, const char* what) {
@@ -15019,7 +15392,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     return JNI_VERSION_1_6;
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_initWrapper(JNIEnv *env, jobject thiz, jstring workDir, jstring appBundle, jstring bundleId, jboolean logRender, jboolean logSound, jboolean logFs, jboolean logNet, jboolean logTodo, jboolean logRenderDebug, jboolean logFuncList, jboolean logHiddenClasses, jboolean logOther, jint spamFiltersMask, jboolean onScreenDebugOverlay, jboolean showPerfOverlay, jboolean nativeRootMmap, jint resWidth, jint resHeight, jint esMode, jint gpuOffloadMask) {
+extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_initWrapper(JNIEnv *env, jobject thiz, jstring workDir, jstring sandboxRoot, jstring appBundle, jstring bundleId, jboolean logRender, jboolean logSound, jboolean logFs, jboolean logNet, jboolean logTodo, jboolean logRenderDebug, jboolean logFuncList, jboolean logHiddenClasses, jboolean logOther, jint spamFiltersMask, jboolean onScreenDebugOverlay, jboolean showPerfOverlay, jboolean nativeRootMmap, jint resWidth, jint resHeight, jint esMode, jint gpuOffloadMask) {
     g_mainActivity = env->NewGlobalRef(thiz); 
     g_gpuOffloadMask = gpuOffloadMask;
     g_surfaceWidth = resWidth;
@@ -15053,13 +15426,18 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     std::string bundleIdStr = bId;
     env->ReleaseStringUTFChars(bundleId, bId);
     
-    // Инициализация изолированной песочницы для файловой системы приложения
-    g_sandboxDir = g_workDir + "sandbox/" + bundleIdStr + "/";
-    system(("mkdir -p '" + g_sandboxDir + "'").c_str());
-    system(("mkdir -p '" + g_sandboxDir + "tmp/'").c_str());
-    system(("mkdir -p '" + g_sandboxDir + "Documents/'").c_str());
-    system(("mkdir -p '" + g_sandboxDir + "Library/Caches/'").c_str());
-    system(("mkdir -p '" + g_sandboxDir + "Library/Preferences/'").c_str());
+    // Песочница живёт вне FUSE (приватный каталог приложения): MediaProvider держит
+    // записи об удалённых каталогах и отвечает на mkdir EEXIST при отсутствующем пути.
+    const char* sbRoot = env->GetStringUTFChars(sandboxRoot, 0);
+    g_sandboxDir = sbRoot;
+    env->ReleaseStringUTFChars(sandboxRoot, sbRoot);
+    if (g_sandboxDir.empty()) g_sandboxDir = g_workDir + "sandbox/" + bundleIdStr + "/";
+    if (g_sandboxDir[g_sandboxDir.size() - 1] != '/') g_sandboxDir += "/";
+    MakeDirsRecursive(g_sandboxDir);
+    MakeDirsRecursive(g_sandboxDir + "tmp/");
+    MakeDirsRecursive(g_sandboxDir + "Documents/");
+    MakeDirsRecursive(g_sandboxDir + "Library/Caches/");
+    MakeDirsRecursive(g_sandboxDir + "Library/Preferences/");
 
     LoadUserDefaults();
 
