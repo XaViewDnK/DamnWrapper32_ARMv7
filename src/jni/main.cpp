@@ -208,6 +208,8 @@ extern std::map<GLuint, std::vector<uint32_t>> g_cpuTextures;
 extern std::map<GLuint, int> g_cpuTexW;
 extern std::map<GLuint, int> g_cpuTexH;
 extern GLuint g_cpuActiveTexture;
+extern GLuint g_cpuUnitTexture[8];
+extern int g_cpuTextureUnit;
 
 // --- ES 1.1 FFP CONSTANTS (Missing in GLES2) ---
 #ifndef GL_MODELVIEW
@@ -724,7 +726,7 @@ void _LogToJava(const std::string& msg) {
     bool isFs = msg.find("C-API-IO") != std::string::npos || msg.find("FOPEN") != std::string::npos || msg.find("fopen") != std::string::npos || msg.find("stat") != std::string::npos;
     bool isNet = msg.find("Reachability") != std::string::npos || msg.find("socket") != std::string::npos || msg.find("bind") != std::string::npos || msg.find("connect") != std::string::npos || msg.find("gethostbyname") != std::string::npos;
     bool isTodo = msg.find("TODO") != std::string::npos || msg.find("Unimplemented") != std::string::npos || msg.find("STUBBED") != std::string::npos || msg.find("STUB") != std::string::npos;
-    bool isRenderDebug = msg.find("[ABSOLUTE-DEBUG]") != std::string::npos || msg.find("[MEGA-DEBUG]") != std::string::npos || msg.find("DumpGLState") != std::string::npos;
+    bool isRenderDebug = msg.find("[ABSOLUTE-DEBUG]") != std::string::npos || msg.find("[MEGA-DEBUG]") != std::string::npos || msg.find("[DRAW-DEBUG]") != std::string::npos || msg.find("DumpGLState") != std::string::npos;
     bool isFuncList = msg.find("C-API-IMPLEMENTED") != std::string::npos || msg.find("=== РЕАЛИЗОВАННЫЕ") != std::string::npos || msg.find("=== C-API ЗАГЛУШКИ") != std::string::npos || msg.find("==================================") != std::string::npos;
     bool isHiddenClass = msg.find("OBJC-CLASS-FOUND") != std::string::npos;
     bool isOther = !(isRender || isSound || isFs || isNet || isTodo || isRenderDebug || isFuncList || isHiddenClass);
@@ -2061,6 +2063,10 @@ extern "C" void Stub_glDeleteBuffers(GLsizei n, const GLuint* buffers) {
     if (g_gpuOffloadMask & 16) glDeleteBuffers(n, buffers);
 }
 
+extern "C" void Stub_glGetShaderPrecisionFormat(GLenum shaderType, GLenum precType, GLint *range, GLint *precision) {
+    glGetShaderPrecisionFormat(shaderType, precType, range, precision);
+}
+
 extern "C" void Stub_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
     if (count <= 0 || !string) return;
 
@@ -2076,6 +2082,12 @@ extern "C" void Stub_glShaderSource(GLuint shader, GLsizei count, const GLchar *
             if (c >= 32 && c <= 126) fullSrc += c;
             else if (c == '\n' || c == '\r' || c == '\t') fullSrc += c;
         }
+    }
+
+    {
+        std::string hdr = "[SHADER-DUMP] RAW id=" + std::to_string(shader) + " count=" + std::to_string(count) + " lens=";
+        for (int i = 0; i < count; i++) hdr += std::to_string(length ? length[i] : -1) + ",";
+        LogToJava(hdr + "\n=== RAW ===\n" + fullSrc + "\n===========");
     }
 
     // БУЛЬДОЗЕР 3.0: Интеллектуальный разделитель шейдеров
@@ -2169,8 +2181,8 @@ extern "C" void Stub_glShaderSource(GLuint shader, GLsizei count, const GLchar *
     glShaderSource(shader, 1, &p, &l); 
 }
 
-extern "C" void Stub_glCompileShader(GLuint shader) { glCompileShader(shader); GLint status = 0; glGetShaderiv(shader, GL_COMPILE_STATUS, &status); if (status == GL_FALSE) { GLint logLength = 0; glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetShaderInfoLog(shader, logLength, nullptr, log.data()); LogToJava(std::string("ОШИБКА КОМПИЛЯЦИИ: ") + log.data()); } } }
-extern "C" void Stub_glLinkProgram(GLuint program) { glLinkProgram(program); GLint status = 0; glGetProgramiv(program, GL_LINK_STATUS, &status); if (status == GL_FALSE) { GLint logLength = 0; glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetProgramInfoLog(program, logLength, nullptr, log.data()); LogToJava(std::string("ОШИБКА ЛИНКОВКИ: ") + log.data()); } } }
+extern "C" void Stub_glCompileShader(GLuint shader) { glCompileShader(shader); GLint status = 0; glGetShaderiv(shader, GL_COMPILE_STATUS, &status); if (status == GL_FALSE) { GLint logLength = 0; glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetShaderInfoLog(shader, logLength, nullptr, log.data()); LogToJava(std::string("[SHADER-DUMP] ОШИБКА КОМПИЛЯЦИИ: ") + log.data()); } } }
+extern "C" void Stub_glLinkProgram(GLuint program) { glLinkProgram(program); GLint status = 0; glGetProgramiv(program, GL_LINK_STATUS, &status); if (status == GL_FALSE) { GLint logLength = 0; glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetProgramInfoLog(program, logLength, nullptr, log.data()); LogToJava(std::string("[SHADER-DUMP] ОШИБКА ЛИНКОВКИ: ") + log.data()); } } }
 
 extern GLuint g_uiProgram;
 extern GLuint g_textProgram;
@@ -2181,6 +2193,8 @@ std::map<GLuint, std::vector<uint32_t>> g_cpuTextures;
 std::map<GLuint, int> g_cpuTexW;
 std::map<GLuint, int> g_cpuTexH;
 GLuint g_cpuActiveTexture = 0;
+int g_cpuTextureUnit = 0;
+GLuint g_cpuUnitTexture[8] = {0};
 extern int g_clientActiveTexture;
 
 // Вспомогательная функция для вычисления точного размера текстуры в байтах
@@ -2201,15 +2215,24 @@ static inline size_t SafeGetGLTextureSize(GLsizei width, GLsizei height, GLenum 
     return (size_t)width * (size_t)height * bpp;
 }
 
+extern "C" void Stub_glActiveTexture(GLenum texture) {
+    int u = (int)texture - GL_TEXTURE0;
+    if (u >= 0 && u < 8) g_cpuTextureUnit = u;
+    glActiveTexture(texture);
+}
+
 extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
-    if (target == GL_TEXTURE_2D) g_cpuActiveTexture = texture;
+    if (target == GL_TEXTURE_2D) {
+        g_cpuActiveTexture = texture;
+        g_cpuUnitTexture[g_cpuTextureUnit] = texture;
+    }
     if (g_gpuOffloadMask & 8) glBindTexture(target, texture);
 }
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
     // Лог с hex-значениями для диагностики
     char logbuf[256];
-    snprintf(logbuf, sizeof(logbuf), "[GL-TEX] glTexImage2D: tex=%u w=%d h=%d intFmt=0x%X fmt=0x%X type=0x%X pixels=%d",
+    snprintf(logbuf, sizeof(logbuf), "[GL-TRACE][GL-TEX] glTexImage2D: tex=%u w=%d h=%d intFmt=0x%X fmt=0x%X type=0x%X pixels=%d",
         g_cpuActiveTexture, width, height, (unsigned)internalformat, (unsigned)format, (unsigned)type, pixels != nullptr);
     LogToJava(logbuf);
     if (target == GL_TEXTURE_2D && level == 0) {
@@ -2466,12 +2489,12 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
 }
 
 extern "C" void Stub_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const GLvoid *data) {
-    LogToJava("[GL-TEX] glCompressedTexSubImage2D called!");
+    LogToJava("[GL-TRACE][GL-TEX] glCompressedTexSubImage2D called!");
     if (g_gpuOffloadMask & 8) glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 }
 
 extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid *data) {
-    LogToJava("[GL-TEX] glCompressedTexImage2D: tex=" + std::to_string(g_cpuActiveTexture) + " w=" + std::to_string(width) + " h=" + std::to_string(height) + " intFmt=0x" + std::to_string(internalformat) + " size=" + std::to_string(imageSize));
+    LogToJava("[GL-TRACE][GL-TEX] glCompressedTexImage2D: tex=" + std::to_string(g_cpuActiveTexture) + " w=" + std::to_string(width) + " h=" + std::to_string(height) + " intFmt=0x" + std::to_string(internalformat) + " size=" + std::to_string(imageSize));
     if (target == GL_TEXTURE_2D && level == 0) {
         g_cpuTexW[g_cpuActiveTexture] = width;
         g_cpuTexH[g_cpuActiveTexture] = height;
@@ -2490,7 +2513,11 @@ extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum i
     if (g_gpuOffloadMask & 8) glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 }
 
-std::map<GLint, std::vector<float>> g_uniformShadowFloat;
+// Ключ обязан включать программу: glGetUniformLocation уникален только внутри неё,
+// иначе матрицы разных шейдеров затирают друг друга в кэше.
+std::map<uint64_t, std::vector<float>> g_uniformShadowFloat;
+GLuint g_currentProgram = 0;
+static inline uint64_t UniShadowKey(GLuint prog, GLint loc) { return ((uint64_t)prog << 32) | (uint32_t)loc; }
 
 struct SWVertex { float x, y, z, w, invW, r, g, b, a, u, v; };
 
@@ -2527,6 +2554,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     }
 
     GLint posLoc = -1, colorLoc = -1, texLoc = -1, idxLoc = -1, weightLoc = -1;
+    char texName[256] = {0};
     if (prog > 0) {
         GLint numActiveAttrs = 0;
         glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTES, &numActiveAttrs);
@@ -2537,12 +2565,18 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             if (g_attribLocations[prog].count(name)) loc = g_attribLocations[prog][name];
             else loc = glGetAttribLocation(prog, name);
             
-            if (strstr(name, "Pos") || strstr(name, "pos") || strstr(name, "Vert") || strstr(name, "vert")) posLoc = loc;
-            else if (strstr(name, "Norm") || strstr(name, "norm")) { /* ignore */ }
-            else if (strstr(name, "Color") || strstr(name, "color") || strstr(name, "Col") || strstr(name, "col") || strstr(name, "Diff") || strstr(name, "diff")) colorLoc = loc;
-            else if (strstr(name, "Tex") || strstr(name, "tex") || strstr(name, "UV") || strstr(name, "uv")) texLoc = loc;
-            else if (strstr(name, "Weig") || strstr(name, "weig") || strstr(name, "Wt") || strstr(name, "wt")) weightLoc = loc;
-            else if (strstr(name, "Ind") || strstr(name, "ind") || strstr(name, "Idx") || strstr(name, "idx") || strstr(name, "Bone") || strstr(name, "bone") || strstr(name, "Mat") || strstr(name, "mat")) idxLoc = loc;
+            char up[256]; { size_t k = 0; for (; name[k] && k < sizeof(up) - 1; k++) up[k] = toupper((unsigned char)name[k]); up[k] = 0; }
+
+            if (strstr(up, "POS") || strstr(up, "VERT")) posLoc = loc;
+            else if (strstr(up, "NORM")) { /* ignore */ }
+            else if (strstr(up, "COLOR") || strstr(up, "COL") || strstr(up, "DIFF")) colorLoc = loc;
+            // Растеризатор однотекстурный: из TEXCOORD_0/TEXCOORD_1 нужен нулевой набор
+            // (атлас), иначе UV берутся от карты освещения и геометрия выходит белой.
+            else if (strstr(up, "TEX") || strstr(up, "UV")) {
+                if (texLoc == -1 || strcmp(up, texName) < 0) { texLoc = loc; strncpy(texName, up, sizeof(texName) - 1); }
+            }
+            else if (strstr(up, "WEIG") || strstr(up, "WT")) weightLoc = loc;
+            else if (strstr(up, "IND") || strstr(up, "IDX") || strstr(up, "BONE") || strstr(up, "MAT")) idxLoc = loc;
         }
     }
     
@@ -2572,24 +2606,26 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             for (int i = 0; i < numUniforms; i++) {
                 char name[256]; GLsizei len; GLint u_size; GLenum u_type;
                 glGetActiveUniform(prog, i, sizeof(name), &len, &u_size, &u_type, name);
-                if (u_type == GL_FLOAT_MAT4 && (strstr(name, "WVP") || strstr(name, "MVP") || strstr(name, "Projection"))) {
+                char up[256]; { size_t k = 0; for (; name[k] && k < sizeof(up) - 1; k++) up[k] = toupper((unsigned char)name[k]); up[k] = 0; }
+
+                if (u_type == GL_FLOAT_MAT4 && (strstr(up, "WVP") || strstr(up, "MVP") || strstr(up, "PROJ"))) {
                     GLint loc = glGetUniformLocation(prog, name);
-                    if (g_uniformShadowFloat.count(loc) && g_uniformShadowFloat[loc].size() >= 16) memcpy(mvp, g_uniformShadowFloat[loc].data(), 16 * sizeof(float));
+                    if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 16) memcpy(mvp, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 16 * sizeof(float));
                 }
                 if (u_type == GL_FLOAT_VEC4 && (strstr(name, "Diffuse") || strstr(name, "Color"))) {
                     GLint loc = glGetUniformLocation(prog, name);
-                    if (g_uniformShadowFloat.count(loc) && g_uniformShadowFloat[loc].size() >= 4) memcpy(diffuseUniform, g_uniformShadowFloat[loc].data(), 4 * sizeof(float));
+                    if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 4) memcpy(diffuseUniform, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 4 * sizeof(float));
                 }
                 if (u_type == GL_FLOAT_MAT4 && (strstr(name, "Texture") || strstr(name, "TexMatrix"))) {
                     GLint loc = glGetUniformLocation(prog, name);
-                    if (g_uniformShadowFloat.count(loc) && g_uniformShadowFloat[loc].size() >= 16) memcpy(texMat, g_uniformShadowFloat[loc].data(), 16 * sizeof(float));
+                    if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 16) memcpy(texMat, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 16 * sizeof(float));
                     hasTexMat = true;
                 }
                 if ((u_type == GL_FLOAT_MAT4 || u_type == 0x8B52 /*GL_FLOAT_VEC4*/) && 
                    (strstr(name, "alette") || strstr(name, "one") || strstr(name, "atrix") || strstr(name, "atrices"))) {
                     paletteLoc = glGetUniformLocation(prog, name);
                     
-                    int uploadedFloats = g_uniformShadowFloat.count(paletteLoc) ? g_uniformShadowFloat[paletteLoc].size() : 0;
+                    int uploadedFloats = g_uniformShadowFloat.count(UniShadowKey(prog, paletteLoc)) ? g_uniformShadowFloat[UniShadowKey(prog, paletteLoc)].size() : 0;
                     
                     if (u_type == 0x8B52) { 
                         isPackedVec4 = true;
@@ -2597,7 +2633,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                         if (numVec4s < u_size) numVec4s = u_size;
                         paletteSize = numVec4s / 3;
                         bonePalette.resize(paletteSize * 16, 0.0f);
-                        const float* src = g_uniformShadowFloat.count(paletteLoc) ? g_uniformShadowFloat[paletteLoc].data() : nullptr;
+                        const float* src = g_uniformShadowFloat.count(UniShadowKey(prog, paletteLoc)) ? g_uniformShadowFloat[UniShadowKey(prog, paletteLoc)].data() : nullptr;
                         if (src) {
                             for (int i = 0; i < paletteSize; i++) {
                                 bonePalette[i*16 + 0] = src[i*12 + 0]; bonePalette[i*16 + 4] = src[i*12 + 1]; bonePalette[i*16 + 8] = src[i*12 + 2]; bonePalette[i*16 + 12] = src[i*12 + 3];
@@ -2610,7 +2646,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                         paletteSize = uploadedFloats / 16;
                         if (paletteSize < u_size) paletteSize = u_size;
                         bonePalette.resize(paletteSize * 16, 0.0f);
-                        if (uploadedFloats > 0) memcpy(bonePalette.data(), g_uniformShadowFloat[paletteLoc].data(), uploadedFloats * sizeof(float));
+                        if (uploadedFloats > 0) memcpy(bonePalette.data(), g_uniformShadowFloat[UniShadowKey(prog, paletteLoc)].data(), uploadedFloats * sizeof(float));
                     }
                 }
             }
@@ -2635,13 +2671,14 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         return 1;
     };
     
-    GLvoid* pPtr = nullptr; GLint pSize=0, pStride=0, pType=0; GLint pVBO = 0;
+    GLvoid* pPtr = nullptr; GLint pSize=0, pStride=0, pType=0; GLint pVBO = 0; bool pNorm = false;
     if (posLoc != -1 && posLoc < 16) {
         pPtr = (GLvoid*)g_vertexAttribs[posLoc].pointer;
         pSize = g_vertexAttribs[posLoc].size;
         pStride = g_vertexAttribs[posLoc].stride;
         pType = g_vertexAttribs[posLoc].type;
         pVBO = g_vertexAttribs[posLoc].vbo;
+        pNorm = g_vertexAttribs[posLoc].normalized != GL_FALSE;
         if (pStride == 0) pStride = pSize * getTypeSize(pType);
     }
     
@@ -2658,7 +2695,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
-    GLvoid* tPtr = nullptr; GLint tSize=0, tStride=0, tType=0; GLint tVBO = 0; GLint tEnabled = 0; 
+    GLvoid* tPtr = nullptr; GLint tSize=0, tStride=0, tType=0; GLint tVBO = 0; GLint tEnabled = 0; bool tNorm = false;
     if (texLoc != -1 && texLoc < 16) {
         tEnabled = g_vertexAttribs[texLoc].enabled;
         if (tEnabled) {
@@ -2667,6 +2704,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             tStride = g_vertexAttribs[texLoc].stride;
             tType = g_vertexAttribs[texLoc].type;
             tVBO = g_vertexAttribs[texLoc].vbo;
+            tNorm = g_vertexAttribs[texLoc].normalized != GL_FALSE;
             if (tStride == 0) tStride = tSize * getTypeSize(tType);
         }
     }
@@ -2747,14 +2785,14 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             r.u = (s << 31) | ((e + 112) << 23) | (f << 13);
             return r.f;
         };
-        auto readG = [&halfToFloat](uint8_t* p, GLenum t, int o) -> float {
+        auto readG = [&halfToFloat](uint8_t* p, GLenum t, int o, bool norm = false) -> float {
             if (!p) return 0.0f;
             if (t == GL_FLOAT) { float v; memcpy(&v, p + o * 4, 4); return v; }
             if (t == 0x8D61) { uint16_t v; memcpy(&v, p + o * 2, 2); return halfToFloat(v); }
             if (t == 0x140C) { int32_t v; memcpy(&v, p + o * 4, 4); return v * 0.00001525878f; }
-            if (t == GL_SHORT) { int16_t v; memcpy(&v, p + o * 2, 2); return v; }
-            if (t == 0x1403) { uint16_t v; memcpy(&v, p + o * 2, 2); return v; }
-            if (t == GL_UNSIGNED_BYTE) return p[o];
+            if (t == GL_SHORT) { int16_t v; memcpy(&v, p + o * 2, 2); return norm ? v * (1.0f / 32767.0f) : (float)v; }
+            if (t == 0x1403) { uint16_t v; memcpy(&v, p + o * 2, 2); return norm ? v * (1.0f / 65535.0f) : (float)v; }
+            if (t == GL_UNSIGNED_BYTE) return norm ? p[o] * (1.0f / 255.0f) : (float)p[o];
             return 0.0f;
         };
         auto readC = [&halfToFloat](uint8_t* p, GLenum t, int o) -> float {
@@ -2777,7 +2815,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
         if (pBase) {
             uint8_t* v = pBase + idx * pStride;
-            px = readG(v, pType, 0); if (pSize > 1) py = readG(v, pType, 1); if (pSize > 2) pz = readG(v, pType, 2); if (pSize > 3) pw = readG(v, pType, 3);
+            px = readG(v, pType, 0, pNorm); if (pSize > 1) py = readG(v, pType, 1, pNorm); if (pSize > 2) pz = readG(v, pType, 2, pNorm); if (pSize > 3) pw = readG(v, pType, 3, pNorm);
         }
         
         float cr = 1, cg = 1, cb = 1, ca = 1;
@@ -2801,7 +2839,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
         if (tBase && tEnabled) {
             uint8_t* v = tBase + idx * tStride;
-            tu = readG(v, tType, 0); if (tSize > 1) tv = readG(v, tType, 1);
+            tu = readG(v, tType, 0, tNorm); if (tSize > 1) tv = readG(v, tType, 1, tNorm);
         }
 
         if (prog > 0 && hasTexMat) {
@@ -3062,17 +3100,20 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     size_t step = (drawMode == GL_TRIANGLES) ? 3 : 1;
     size_t endIdx = (drawMode == GL_TRIANGLES) ? extractedVerts.size() : (extractedVerts.size() < 3 ? 0 : extractedVerts.size() - 2);
 
-    bool useTex = (g_texture2DEnabled || prog > 0) && tEnabled && g_cpuActiveTexture != 0;
+    // Мы рисуем одним сэмплером, а игра может держать привязки на нескольких юнитах,
+    // поэтому берём текстуру нулевого юнита, а не просто последнюю привязанную.
+    GLuint drawTex = g_cpuUnitTexture[0] ? g_cpuUnitTexture[0] : g_cpuActiveTexture;
+    bool useTex = (g_texture2DEnabled || prog > 0) && tEnabled && drawTex != 0;
     const uint32_t* activeTexPtr = nullptr;
     int activeTexW = 0, activeTexH = 0;
     bool isFboTexture = false;
     if (useTex) {
-        auto it = g_cpuTextures.find(g_cpuActiveTexture);
+        auto it = g_cpuTextures.find(drawTex);
         if (it != g_cpuTextures.end() && !it->second.empty()) {
             activeTexPtr = it->second.data();
-            activeTexW = g_cpuTexW[g_cpuActiveTexture];
-            activeTexH = g_cpuTexH[g_cpuActiveTexture];
-            isFboTexture = g_fboTextures.count(g_cpuActiveTexture) && g_fboTextures[g_cpuActiveTexture];
+            activeTexW = g_cpuTexW[drawTex];
+            activeTexH = g_cpuTexH[drawTex];
+            isFboTexture = g_fboTextures.count(drawTex) && g_fboTextures[drawTex];
         } else {
             useTex = false;
         }
@@ -3082,18 +3123,23 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         bool isSpamOn = (g_spamFiltersMask & (1 << 5)) != 0;
         static int draw_cnt = 0; draw_cnt++;
         if (!isSpamOn || draw_cnt <= 30 || draw_cnt % 120 == 0) {
-            SyncLog("[DRAW-DEBUG] Prog: " + std::to_string(prog) + " drawMode: " + std::to_string(drawMode) + " count: " + std::to_string(count));
-            SyncLog("[DRAW-DEBUG] Attributes -> PosLoc: " + std::to_string(posLoc) + " (En: " + std::to_string(posEnabled) + "), ColLoc: " + std::to_string(colorLoc) + " (En: " + std::to_string(cEnabled) + "), TexLoc: " + std::to_string(texLoc) + " (En: " + std::to_string(tEnabled) + ")");
-            SyncLog("[DRAW-DEBUG] Texture Setup -> useTex: " + std::to_string(useTex) + " ActiveTexID: " + std::to_string(g_cpuActiveTexture) + " TexSize: " + std::to_string(activeTexW) + "x" + std::to_string(activeTexH) + " FBO: " + std::to_string(g_lastActiveFBO));
-            
-            if (tEnabled && texLoc != -1) {
-                SyncLog("[DRAW-DEBUG] TexAttr -> VBO: " + std::to_string(g_vertexAttribs[texLoc].vbo) + " Stride: " + std::to_string(tStride) + " Type: " + std::to_string(tType));
-            }
+            // Всё в одну строку со счётчиком: повторяющиеся строки лог схлопывает в «...»,
+            // и разбитый на части блок становится нечитаемым.
+            char dbg[512];
+            snprintf(dbg, sizeof(dbg),
+                "[DRAW-DEBUG] #%d Prog:%d mode:%u cnt:%d pos:%d(%d) col:%d(%d) tex:%d(%d) useTex:%d texId:%u %dx%d fbo:%d texVBO:%d stride:%d type:%u depth:%d dmask:%d blend:%d cull:%d mvp0:%g mvp5:%g mvp10:%g mvp12:%g mvp13:%g mvp14:%g",
+                draw_cnt, (int)prog, (unsigned)drawMode, (int)count,
+                (int)posLoc, (int)posEnabled, (int)colorLoc, (int)cEnabled, (int)texLoc, (int)tEnabled,
+                (int)useTex, (unsigned)drawTex, activeTexW, activeTexH, (int)g_lastActiveFBO,
+                (texLoc != -1 && tEnabled) ? (int)g_vertexAttribs[texLoc].vbo : -1, (int)tStride, (unsigned)tType,
+                (int)g_depthTestEnabled, (int)g_depthMask, (int)g_blendEnabled, (int)g_cullFaceEnabled,
+                (double)mvp[0], (double)mvp[5], (double)mvp[10], (double)mvp[12], (double)mvp[13], (double)mvp[14]);
+            SyncLog(dbg);
 
             if (!extractedVerts.empty()) {
-                char dbg[256];
-                snprintf(dbg, sizeof(dbg), "[DRAW-DEBUG] Vert0 Raw: x=%g y=%g u=%g v=%g", (double)extractedVerts[0].x, (double)extractedVerts[0].y, (double)extractedVerts[0].u, (double)extractedVerts[0].v);
-                SyncLog(dbg);
+                char dbg2[256];
+                snprintf(dbg2, sizeof(dbg2), "[DRAW-DEBUG] #%d Vert0 Raw: x=%g y=%g u=%g v=%g", draw_cnt, (double)extractedVerts[0].x, (double)extractedVerts[0].y, (double)extractedVerts[0].u, (double)extractedVerts[0].v);
+                SyncLog(dbg2);
             }
         }
     }
@@ -3593,6 +3639,7 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
 }
 extern "C" void MegaDebug_glUseProgram(GLuint program) {
     SyncLog("[GL-TRACE] glUseProgram(prog=" + std::to_string(program) + ")");
+    g_currentProgram = program;
     glUseProgram(program);
 }
 // ES 1.1 знает капабилити, которых в ES 2.0 нет. Прокидывать их в железо нельзя:
@@ -3685,12 +3732,12 @@ extern "C" GLenum MegaDebug_glGetError() {
     return err;
 }
 extern "C" void wrap_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    if (value && count > 0) g_uniformShadowFloat[location].assign(value, value + count * 16);
+    if (value && count > 0) g_uniformShadowFloat[UniShadowKey(g_currentProgram, location)].assign(value, value + count * 16);
     glUniformMatrix4fv(location, count, transpose, value);
 }
 
 extern "C" void wrap_glUniform4fv(GLint location, GLsizei count, const GLfloat *value) {
-    if (value && count > 0) g_uniformShadowFloat[location].assign(value, value + count * 4);
+    if (value && count > 0) g_uniformShadowFloat[UniShadowKey(g_currentProgram, location)].assign(value, value + count * 4);
     glUniform4fv(location, count, value);
 }
 
@@ -3928,10 +3975,10 @@ void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = f
     } else if (v.hasBg) {
         HLEColor c = v.bgColor;
         float finalAlpha = c.a * v.alpha;
-        // При выводе через GPU кадр игры живёт в реальном фреймбуфере, а CPU-буфер
-        // накладывается поверх него. Фон корневого вью на iOS лежит ПОД GL-слоем,
-        // поэтому заливать им весь экран здесь нельзя — он закроет кадр игры.
-        bool bgUnderGL = isRoot && (g_gpuOffloadMask & 1);
+        // Фон корневого вью на iOS лежит ПОД GL-слоем, поэтому заливать им весь экран
+        // здесь нельзя — он закроет кадр игры. При GPU-выводе кадр живёт в реальном
+        // фреймбуфере, при программном — в этом же CPU-буфере; затирается и там, и там.
+        bool bgUnderGL = isRoot;
         if (finalAlpha > 0.0f && !bgUnderGL) {
             CPUDrawSolidRect(x, y, w, h, c.r, c.g, c.b, finalAlpha, v.cornerRadius);
         }
@@ -9542,6 +9589,7 @@ extern "C" void wrap_alGenSources(int n, uint32_t* sources) { for(int i=0; i<n; 
 extern "C" void wrap_alGenBuffers(int n, uint32_t* buffers) { for(int i=0; i<n; i++) buffers[i] = g_alIdCounter++; }
 
 extern "C" void wrap_alSourcei(uint32_t source, int param, int value) {
+    LogToJava("HLE_AUDIO: alSourcei src=" + std::to_string(source) + " param=" + std::to_string(param) + " val=" + std::to_string(value));
     JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity) return;
     jclass clazz = env->GetObjectClass(g_mainActivity);
     jmethodID m = env->GetMethodID(clazz, "alSourceiJava", "(III)V");
@@ -9558,6 +9606,7 @@ extern "C" void wrap_alSourcef(uint32_t source, int param, float value) {
 }
 
 extern "C" void wrap_alBufferData(uint32_t buffer, int format, const void* data, int size, int freq) {
+    LogToJava("HLE_AUDIO: alBufferData buf=" + std::to_string(buffer) + " fmt=" + std::to_string(format) + " size=" + std::to_string(size) + " freq=" + std::to_string(freq) + (data ? "" : " DATA=NULL"));
     JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity || !data || size <= 0) return;
     jclass clazz = env->GetObjectClass(g_mainActivity);
     jmethodID m = env->GetMethodID(clazz, "alBufferDataJava", "(II[BI)V");
@@ -9582,6 +9631,7 @@ extern "C" void wrap_alSourceQueueBuffers(uint32_t source, int nb, const uint32_
 }
 
 extern "C" void wrap_alSourcePlay(uint32_t source) {
+    LogToJava("HLE_AUDIO: alSourcePlay src=" + std::to_string(source));
     JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity) return;
     jclass clazz = env->GetObjectClass(g_mainActivity);
     jmethodID m = env->GetMethodID(clazz, "alSourcePlayJava", "(I)V");
@@ -10064,6 +10114,37 @@ extern "C" char* wrap_strncat(char* dest, const char* src, size_t n) {
     }
     return res;
 }
+// iOS ARM32 держит SP выровненным лишь по 4 байтам, поэтому весь гость (и наши обёртки,
+// вызванные из него) обычно работает с sp = 4 (mod 8). Наш код кладёт 64-битный вararg
+// по смещению, кратному 8 от своего sp, а bionic-овский va_arg выравнивает указатель по
+// абсолютному адресу — и читает на слово раньше, выдавая мусор|значение<<32. Любой вызов
+// printf-семейства с 64-битным аргументом идём делать через этот трамплин: он выравнивает
+// SP перед прыжком в C и возвращает как было.
+extern "C" int DwFmt64Impl(char* buf, size_t size, const char* spec, const void* pv) {
+    char conv = 0;
+    for (const char* p = spec; *p; p++) conv = *p;
+    if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' ||
+        conv == 'g' || conv == 'G' || conv == 'a' || conv == 'A') {
+        double d;
+        memcpy(&d, pv, sizeof(d));
+        return ::snprintf(buf, size, spec, d);
+    }
+    unsigned long long u;
+    memcpy(&u, pv, sizeof(u));
+    return ::snprintf(buf, size, spec, u);
+}
+__attribute__((naked)) extern "C" int DwFmt64(char* buf, size_t size, const char* spec, const void* pv) {
+    __asm__ volatile(
+        "push {r4, lr}\n"
+        "mov r4, sp\n"
+        "mov r12, sp\n"
+        "bic r12, r12, #7\n"
+        "mov sp, r12\n"
+        "bl DwFmt64Impl\n"
+        "mov sp, r4\n"
+        "pop {r4, pc}\n");
+}
+
 // iOS ARM32 кладёт 64-битные варарги с выравниванием 4, а AAPCS/bionic ждёт 8, поэтому
 // формат игры разбираем сами и читаем аргументы упакованно словами.
 __attribute__((noinline))
@@ -10173,7 +10254,10 @@ static int IOSFormatV(char* out, size_t outSize, const char* fmt, va_list apIn) 
             case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
                 unsigned long long bits; IOSFMT_POP64(bits);
                 double d; memcpy(&d, &bits, sizeof(d));
-                IOSFMT_EMIT(spec, d);
+                char* dst_ = (out && pos < outSize) ? out + pos : nullptr;
+                size_t cap_ = (out && pos < outSize) ? outSize - pos : 0;
+                int n_ = DwFmt64(dst_, cap_, spec, &d);
+                if (n_ > 0) pos += (size_t)n_;
                 break;
             }
             case 's': case 'p':
@@ -10399,9 +10483,11 @@ extern "C" int wrap_fcntl(int fd, int cmd, ...) {
     }
     return fcntl(fd, cmd, argp);
 }
-// off_t у Darwin всегда 64-битный, а у bionic на 32 битах — 32-битный. Принимаем
-// смещение явным int64_t (AAPCS кладёт его так же, как ждёт гость) и уходим в pread64.
-extern "C" ssize_t wrap_pread(int fd, void* buf, size_t nbyte, int64_t offset) {
+// off_t у Darwin всегда 64-битный, а у bionic на 32 битах — 32-битный. Вдобавок Apple
+// выравнивает 64-битный аргумент по 4 байта, то есть кладёт его в r3:[sp], а не в [sp]
+// с пропуском r3, как сделал бы AAPCS. Поэтому принимаем смещение половинками.
+extern "C" ssize_t wrap_pread(int fd, void* buf, size_t nbyte, uint32_t offLo, uint32_t offHi) {
+    int64_t offset = (int64_t)(((uint64_t)offHi << 32) | offLo);
     ssize_t r = pread64(fd, buf, nbyte, (off64_t)offset);
     LogToBlackBox("C-API-IO: [pread] fd=" + std::to_string(fd) + " len=" + std::to_string(nbyte) +
                   " off=" + std::to_string(offset) + " -> " + std::to_string(r));
@@ -11429,6 +11515,151 @@ extern "C" int wrap_AudioFileReadBytes(void* inAudioFile, uint8_t inUseCache, in
     }
     return 0;
 }
+// --- ExtAudioFile HLE ---
+// Начиная с MCPE 0.3.0.0 звуки лежат в .m4a и игра берёт их через ExtAudioFile,
+// который на iOS decodes-on-read. Здесь файл декодируется целиком в 16-битный PCM
+// силами Android MediaCodec, а дальше отдаётся кусками, как того ждёт гость.
+struct HLE_ExtAudioFile {
+    std::string path;
+    std::vector<uint8_t> pcm;
+    int sampleRate;
+    int channels;
+    int64_t frames;
+    int64_t readPos;
+    HLE_ExtAudioFile() : sampleRate(44100), channels(1), frames(0), readPos(0) {}
+};
+
+static bool ExtAudioDecodeToPCM(HLE_ExtAudioFile* ef) {
+    JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity) return false;
+    jclass clazz = env->GetObjectClass(g_mainActivity);
+    jmethodID m = env->GetMethodID(clazz, "decodeAudioFileJava", "(Ljava/lang/String;)[B");
+    if (!m) { env->DeleteLocalRef(clazz); return false; }
+    jstring jpath = env->NewStringUTF(ef->path.c_str());
+    jbyteArray arr = (jbyteArray)env->CallObjectMethod(g_mainActivity, m, jpath);
+    env->DeleteLocalRef(jpath);
+    env->DeleteLocalRef(clazz);
+    if (!arr) return false;
+    jsize len = env->GetArrayLength(arr);
+    if (len < 8) { env->DeleteLocalRef(arr); return false; }
+    std::vector<uint8_t> raw((size_t)len);
+    env->GetByteArrayRegion(arr, 0, len, (jbyte*)raw.data());
+    env->DeleteLocalRef(arr);
+    memcpy(&ef->sampleRate, raw.data(), 4);
+    memcpy(&ef->channels, raw.data() + 4, 4);
+    if (ef->channels < 1) ef->channels = 1;
+    if (ef->sampleRate < 1) ef->sampleRate = 44100;
+    ef->pcm.assign(raw.begin() + 8, raw.end());
+    ef->frames = (int64_t)(ef->pcm.size() / (size_t)(2 * ef->channels));
+    return true;
+}
+
+static void ExtAudioFillASBD(HLE_ExtAudioFile* ef, void* outData) {
+    memset(outData, 0, 40);
+    *(double*)outData = (double)ef->sampleRate;
+    uint32_t* p = (uint32_t*)((uint8_t*)outData + 8);
+    p[0] = 0x6C70636D;              // 'lpcm'
+    p[1] = 0xC;                     // signed integer | packed
+    p[2] = (uint32_t)(2 * ef->channels);
+    p[3] = 1;
+    p[4] = (uint32_t)(2 * ef->channels);
+    p[5] = (uint32_t)ef->channels;
+    p[6] = 16;
+}
+
+extern "C" int wrap_ExtAudioFileOpenURL(void* inURL, void** outExtAudioFile) {
+    if (!outExtAudioFile) return -50;
+    std::string path;
+    if (inURL) {
+        uint32_t* urlInst = (uint32_t*)inURL;
+        if (urlInst[1]) {
+            path = GetNSString((void*)urlInst[1]);
+            if (!path.empty()) {
+                if (path.find("file://") == 0) path = path.substr(7);
+                if (path[0] != '/') path = g_appBundlePath + "/" + path;
+            }
+        }
+    }
+    if (path.empty()) {
+        LogToJava("HLE_AUDIO_ERROR: ExtAudioFileOpenURL получил пустой путь");
+        return -43;
+    }
+    HLE_ExtAudioFile* ef = new HLE_ExtAudioFile();
+    ef->path = path;
+    if (!ExtAudioDecodeToPCM(ef)) {
+        LogToJava("HLE_AUDIO_ERROR: ExtAudioFileOpenURL не смог декодировать: " + path);
+        delete ef;
+        return -43;
+    }
+    LogToJava("HLE_AUDIO: ExtAudioFileOpenURL " + path + " -> " + std::to_string(ef->frames) + " кадров, " + std::to_string(ef->sampleRate) + " Гц, каналов: " + std::to_string(ef->channels));
+    *outExtAudioFile = ef;
+    return 0;
+}
+
+extern "C" int wrap_ExtAudioFileGetProperty(void* ref, uint32_t propID, uint32_t* ioSize, void* outData) {
+    if (!ref || !ioSize || !outData) return -50;
+    HLE_ExtAudioFile* ef = (HLE_ExtAudioFile*)ref;
+    if (propID == 0x66666D74 || propID == 0x63666D74) { // 'ffmt' / 'cfmt'
+        if (*ioSize < 40) return -50;
+        ExtAudioFillASBD(ef, outData);
+        *ioSize = 40;
+        return 0;
+    }
+    if (propID == 0x2366726D) { // '#frm'
+        if (*ioSize >= 8) { *(int64_t*)outData = ef->frames; *ioSize = 8; }
+        else if (*ioSize >= 4) { *(int32_t*)outData = (int32_t)ef->frames; *ioSize = 4; }
+        return 0;
+    }
+    char prop[5] = { (char)(propID >> 24), (char)((propID >> 16) & 0xFF), (char)((propID >> 8) & 0xFF), (char)(propID & 0xFF), 0 };
+    LogToJava(std::string("HLE_AUDIO: ExtAudioFileGetProperty запрошен неизвестный ID: ") + prop);
+    memset(outData, 0, *ioSize);
+    return 0;
+}
+
+extern "C" int wrap_ExtAudioFileSetProperty(void* ref, uint32_t propID, uint32_t inSize, const void* inData) {
+    return 0;
+}
+
+extern "C" int wrap_ExtAudioFileRead(void* ref, uint32_t* ioNumberFrames, void* ioData) {
+    if (!ref || !ioNumberFrames || !ioData) return -50;
+    HLE_ExtAudioFile* ef = (HLE_ExtAudioFile*)ref;
+    uint32_t* abl = (uint32_t*)ioData;
+    if (abl[0] < 1) { *ioNumberFrames = 0; return 0; }
+    uint32_t* buf0 = abl + 1; // mNumberChannels, mDataByteSize, mData
+    int64_t bytesPerFrame = 2 * ef->channels;
+    int64_t want = (int64_t)*ioNumberFrames;
+    int64_t avail = ef->frames - ef->readPos;
+    if (want > avail) want = avail;
+    int64_t capacityFrames = (int64_t)buf0[1] / bytesPerFrame;
+    if (want > capacityFrames) want = capacityFrames;
+    if (want < 0) want = 0;
+    void* dst = (void*)(uintptr_t)buf0[2];
+    if (want > 0 && dst) memcpy(dst, ef->pcm.data() + ef->readPos * bytesPerFrame, (size_t)(want * bytesPerFrame));
+    buf0[1] = (uint32_t)(want * bytesPerFrame);
+    ef->readPos += want;
+    *ioNumberFrames = (uint32_t)want;
+    return 0;
+}
+
+extern "C" int wrap_ExtAudioFileSeek(void* ref, int64_t inFrameOffset) {
+    if (!ref) return -50;
+    HLE_ExtAudioFile* ef = (HLE_ExtAudioFile*)ref;
+    if (inFrameOffset < 0) inFrameOffset = 0;
+    if (inFrameOffset > ef->frames) inFrameOffset = ef->frames;
+    ef->readPos = inFrameOffset;
+    return 0;
+}
+
+extern "C" int wrap_ExtAudioFileTell(void* ref, int64_t* outFrameOffset) {
+    if (!ref || !outFrameOffset) return -50;
+    *outFrameOffset = ((HLE_ExtAudioFile*)ref)->readPos;
+    return 0;
+}
+
+extern "C" int wrap_ExtAudioFileDispose(void* ref) {
+    if (ref) delete (HLE_ExtAudioFile*)ref;
+    return 0;
+}
+
 extern "C" int wrap_AudioConverterNew(void* inSourceFormat, void* inDestinationFormat, void** outAudioConverter) {
     if (outAudioConverter) *outAudioConverter = new HLE_AudioConverter(); return 0;
 }
@@ -11930,8 +12161,11 @@ extern "C" void wrap_lcxx_str_grow_by(void*, size_t, size_t, size_t, size_t, siz
 extern "C" void* wrap_lcxx_str_append_ptr_len(void*, const char*, size_t);
 extern "C" void* wrap_lcxx_str_append_ptr(void*, const char*);
 extern "C" void* wrap_lcxx_str_assign_ptr(void*, const char*);
+extern "C" void* wrap_lcxx_str_assign_ptr_len(void*, const char*, size_t);
+extern "C" void wrap_lcxx_sort_u64(uint64_t*, uint64_t*, void*);
 extern "C" void* wrap_lcxx_str_assign_str(void*, const void*);
 extern "C" void* wrap_lcxx_str_insert_ptr(void*, size_t, const char*);
+extern "C" void* wrap_lcxx_str_insert_ptr_len(void*, size_t, const char*, size_t);
 extern "C" void* wrap_lcxx_str_resize(void*, size_t, char);
 extern "C" void wrap_lcxx_str_reserve(void*, size_t);
 extern "C" void wrap_lcxx_str_push_back(void*, char);
@@ -11944,6 +12178,7 @@ extern "C" size_t wrap_lcxx_str_find_char(const void*, char, size_t);
 extern "C" size_t wrap_lcxx_str_find_ptr_len(const void*, const char*, size_t, size_t);
 extern "C" size_t wrap_lcxx_str_rfind_ptr_len(const void*, const char*, size_t, size_t);
 extern "C" size_t wrap_lcxx_str_rfind_char(const void*, char, size_t);
+extern "C" size_t wrap_lcxx_str_find_last_of(const void*, const char*, size_t, size_t);
 extern "C" size_t wrap_lcxx_str_find_last_not_of(const void*, const char*, size_t, size_t);
 extern "C" int wrap_lcxx_str_compare_ptr(const void*, const char*);
 extern "C" void wrap_lcxx_mutex_lock(void*);
@@ -11993,8 +12228,8 @@ extern "C" void* wrap_lcxx_os_ls_int(void*, int);
 extern "C" void* wrap_lcxx_os_ls_uint(void*, unsigned);
 extern "C" void* wrap_lcxx_os_ls_ulong(void*, unsigned long);
 extern "C" void* wrap_lcxx_os_ls_short(void*, short);
-extern "C" void* wrap_lcxx_os_ls_longlong(void*, long long);
-extern "C" void* wrap_lcxx_os_ls_double(void*, double);
+extern "C" void* wrap_lcxx_os_ls_longlong(void*, uint32_t, uint32_t);
+extern "C" void* wrap_lcxx_os_ls_double(void*, uint32_t, uint32_t);
 extern "C" void* wrap_lcxx_os_ls_float(void*, float);
 extern "C" void* wrap_lcxx_os_sentry_ctor(void*, void*);
 extern "C" void* wrap_lcxx_os_sentry_dtor(void*);
@@ -12182,7 +12417,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_S(UIApplicationMain), STB_S(objc_msgSend), STB_S(objc_msgSendSuper2), STB_S(objc_msgSend_stret), STB_S(objc_msgSendSuper2_stret), STB_S(objc_setProperty), STB_S(NSLog), STB_W(NSLogv),
     STB_S(exit), {"___stack_chk_guard", (void*)&hle_stack_chk_guard_val}, {"___stack_chk_fail", (void*)Stub_exit}, STB_D(sinf), STB_D(cosf), STB_D(tanf), 
     {"_NSDefaultRunLoopMode", (void*)&hle_NSDefaultRunLoopMode_ptr}, {"_kEAGLColorFormatRGBA8", (void*)&hle_kEAGLColorFormatRGBA8_ptr}, {"_kEAGLColorFormatRGB565", (void*)&hle_kEAGLColorFormatRGB565_ptr}, {"_kEAGLDrawablePropertyColorFormat", (void*)&hle_kEAGLDrawablePropertyColorFormat_ptr}, {"_kEAGLDrawablePropertyRetainedBacking", (void*)&hle_kEAGLDrawablePropertyRetainedBacking_ptr}, 
-    STB_D(glAttachShader), STB_S(glBindBuffer), STB_S(glBufferData), STB_S(glBufferSubData), STB_S(glDeleteBuffers), STB_S(glBindFramebuffer), {"_glBindFramebufferOES", (void*)Stub_glBindFramebuffer}, STB_S(glBindRenderbuffer), {"_glBindRenderbufferOES", (void*)Stub_glBindRenderbuffer}, STB_S(glBindAttribLocation), {"_glClear", (void*)MegaDebug_glClear}, STB_S(glClearColor), STB_S(glCompileShader),
+    STB_D(glAttachShader), STB_S(glBindBuffer), STB_S(glBufferData), STB_S(glBufferSubData), STB_S(glDeleteBuffers), STB_S(glBindFramebuffer), {"_glBindFramebufferOES", (void*)Stub_glBindFramebuffer}, STB_S(glBindRenderbuffer), {"_glBindRenderbufferOES", (void*)Stub_glBindRenderbuffer}, STB_S(glBindAttribLocation), {"_glClear", (void*)MegaDebug_glClear}, STB_S(glClearColor), STB_S(glCompileShader), STB_S(glGetShaderPrecisionFormat),
     STB_D(glCreateProgram), STB_D(glCreateShader), {"_glDrawElements", (void*)MegaDebug_glDrawElements}, {"_glEnable", (void*)MegaDebug_glEnable}, STB_S(glEnableVertexAttribArray), STB_S(glFramebufferRenderbuffer), {"_glFramebufferRenderbufferOES", (void*)Stub_glFramebufferRenderbuffer}, STB_D(glGenFramebuffers), {"_glGenFramebuffersOES", (void*)glGenFramebuffers}, STB_D(glGenRenderbuffers), {"_glGenRenderbuffersOES", (void*)glGenRenderbuffers}, {"_glGetAttribLocation", (void*)MegaDebug_glGetAttribLocation}, STB_S(glBindAttribLocation), {"_glGetBufferParameteriv", (void*)Stub_glGetBufferParameteriv}, {"_glGetShaderInfoLog", (void*)MegaDebug_glGetShaderInfoLog}, STB_D(glGetShaderiv), {"_glGetUniformLocation", (void*)MegaDebug_glGetUniformLocation},
     STB_S(glLinkProgram), STB_S(glRenderbufferStorage), {"_glRenderbufferStorageOES", (void*)Stub_glRenderbufferStorage}, STB_S(glGetRenderbufferParameteriv), {"_glGetRenderbufferParameterivOES", (void*)Stub_glGetRenderbufferParameteriv}, STB_S(glCheckFramebufferStatus), {"_glCheckFramebufferStatusOES", (void*)Stub_glCheckFramebufferStatus}, STB_S(glShaderSource), STB_W(glUniformMatrix4fv), {"_glUseProgram", (void*)MegaDebug_glUseProgram}, STB_S(glVertexAttribPointer), STB_S(glViewport), STB_S(NSHomeDirectory), STB_S(NSTemporaryDirectory), STB_S(NSSearchPathForDirectoriesInDomains),
     STB_W(SCNetworkReachabilityCreateWithName), {"_SCNetworkReachabilityCreateWithAddress", (void*)+[](void* a, void* b) -> void* { return (void*)0xDEADBEEF; }}, {"_SCNetworkReachabilityGetFlags", (void*)+[](void* r, uint32_t* f) -> bool { if(f) *f = 2; return true; }},
@@ -12220,7 +12455,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(OSAtomicOr32Barrier), STB_W(OSAtomicTestAndClearBarrier), STB_W(OSSpinLockLock), STB_W(OSSpinLockTry), STB_W(OSSpinLockUnlock), STB_W(OSMemoryBarrier),
     {"___udivmodsi4", (void*)wrap___udivmodsi4}, {"_strerror", (void*)(char*(*)(int))strerror},
 
-    STB_D(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_D(glCopyTexImage2D), STB_D(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, STB_D(glDepthRangef), {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), STB_D(glPolygonOffset), STB_D(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_D(glTexParameterf), STB_D(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
+    STB_S(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_D(glCopyTexImage2D), STB_D(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, STB_D(glDepthRangef), {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), STB_D(glPolygonOffset), STB_D(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_D(glTexParameterf), STB_D(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
 
 
     STB_W(CFRetain), STB_W(CFRelease), STB_W(CFStringCreateWithCString), STB_W(CFStringGetLength),
@@ -12259,7 +12494,7 @@ std::map<std::string, void*> g_hleStubs = {
 
     {"___stderrp", (void*)&hle_stderrp_ptr}, {"___stdoutp", (void*)&hle_stdoutp_ptr},
 
-    STB_W(AudioComponentInstanceDispose), STB_W(AudioConverterDispose), STB_W(AudioConverterFillComplexBuffer), STB_W(AudioConverterNew), STB_W(AudioFileClose), STB_W(AudioFileGetProperty), STB_W(AudioFileGetPropertyInfo), STB_W(AudioFileOpenURL), STB_W(AudioFileOpenWithCallbacks), STB_W(AudioFileReadPackets), STB_W(AudioFileReadBytes), STB_W(AudioQueueAllocateBuffer), STB_W(AudioQueueAllocateBufferWithPacketDescriptions), STB_W(AudioQueueDispose), STB_W(AudioQueueEnqueueBuffer), STB_W(AudioQueueEnqueueBufferWithParameters), STB_W(AudioQueueFreeBuffer), STB_W(AudioQueueGetProperty), STB_W(AudioQueueGetCurrentTime), STB_W(AudioQueuePrime), STB_W(AudioQueueSetParameter), STB_W(AudioQueueNewOutput), STB_W(AudioQueuePause), STB_W(AudioQueueStart), STB_W(AudioQueueStop), STB_W(AudioSessionInitialize), STB_W(AudioSessionSetActive), STB_W(AudioSessionAddPropertyListener), STB_W(AudioSessionGetProperty), STB_W(AudioSessionSetProperty), STB_W(AudioUnitInitialize), STB_W(AudioUnitUninitialize), STB_W(AudioUnitGetParameter), STB_W(AudioUnitGetProperty), STB_W(AudioUnitSetProperty), STB_W(AudioOutputUnitStart), STB_W(AudioOutputUnitStop),
+    STB_W(AudioComponentInstanceDispose), STB_W(AudioConverterDispose), STB_W(AudioConverterFillComplexBuffer), STB_W(AudioConverterNew), STB_W(AudioFileClose), STB_W(AudioFileGetProperty), STB_W(AudioFileGetPropertyInfo), STB_W(AudioFileOpenURL), STB_W(AudioFileOpenWithCallbacks), STB_W(AudioFileReadPackets), STB_W(AudioFileReadBytes), STB_W(ExtAudioFileOpenURL), STB_W(ExtAudioFileGetProperty), STB_W(ExtAudioFileSetProperty), STB_W(ExtAudioFileRead), STB_W(ExtAudioFileSeek), STB_W(ExtAudioFileTell), STB_W(ExtAudioFileDispose),STB_W(AudioQueueAllocateBuffer), STB_W(AudioQueueAllocateBufferWithPacketDescriptions), STB_W(AudioQueueDispose), STB_W(AudioQueueEnqueueBuffer), STB_W(AudioQueueEnqueueBufferWithParameters), STB_W(AudioQueueFreeBuffer), STB_W(AudioQueueGetProperty), STB_W(AudioQueueGetCurrentTime), STB_W(AudioQueuePrime), STB_W(AudioQueueSetParameter), STB_W(AudioQueueNewOutput), STB_W(AudioQueuePause), STB_W(AudioQueueStart), STB_W(AudioQueueStop), STB_W(AudioSessionInitialize), STB_W(AudioSessionSetActive), STB_W(AudioSessionAddPropertyListener), STB_W(AudioSessionGetProperty), STB_W(AudioSessionSetProperty), STB_W(AudioUnitInitialize), STB_W(AudioUnitUninitialize), STB_W(AudioUnitGetParameter), STB_W(AudioUnitGetProperty), STB_W(AudioUnitSetProperty), STB_W(AudioOutputUnitStart), STB_W(AudioOutputUnitStop),
     
     {"__ZNKSs12find_last_ofEPKcm", (void*)wrap_cxx_string_find_last_of_ptr_len},
     {"__ZNKSs4findERKSsm", (void*)wrap_cxx_string_find_string},
@@ -12311,6 +12546,7 @@ std::map<std::string, void*> g_hleStubs = {
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE16find_last_not_ofEPKcmm", (void*)wrap_lcxx_str_find_last_not_of},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm", (void*)wrap_lcxx_str_find_ptr_len},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm", (void*)wrap_lcxx_str_find_char},
+    {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE12find_last_ofEPKcmm", (void*)wrap_lcxx_str_find_last_of},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEPKcmm", (void*)wrap_lcxx_str_rfind_ptr_len},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm", (void*)wrap_lcxx_str_rfind_char},
     {"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc", (void*)wrap_lcxx_str_compare_ptr},
@@ -12329,7 +12565,10 @@ std::map<std::string, void*> g_hleStubs = {
     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc", (void*)wrap_lcxx_str_append_ptr},
     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm", (void*)wrap_lcxx_str_append_ptr_len},
     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc", (void*)wrap_lcxx_str_assign_ptr},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKcm", (void*)wrap_lcxx_str_assign_ptr_len},
+    {"__ZNSt3__16__sortIRNS_6__lessIyyEEPyEEvT0_S5_T_", (void*)wrap_lcxx_sort_u64},
     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc", (void*)wrap_lcxx_str_insert_ptr},
+    {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm", (void*)wrap_lcxx_str_insert_ptr_len},
     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc", (void*)wrap_lcxx_str_resize},
     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm", (void*)wrap_lcxx_str_replace_ptr_len},
     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm", (void*)wrap_lcxx_str_reserve},
@@ -14510,6 +14749,10 @@ extern "C" void* wrap_lcxx_str_append_ptr_len(void* s, const char* p, size_t n) 
 extern "C" void* wrap_lcxx_str_append_ptr(void* s, const char* p) {
     return wrap_lcxx_str_append_ptr_len(s, p, p ? strlen(p) : 0);
 }
+extern "C" void* wrap_lcxx_str_assign_ptr_len(void* s, const char* p, size_t n) {
+    lcxx::Assign(s, p, n);
+    return s;
+}
 extern "C" void* wrap_lcxx_str_assign_ptr(void* s, const char* p) {
     lcxx::Assign(s, p, p ? strlen(p) : 0);
     return s;
@@ -14518,8 +14761,7 @@ extern "C" void* wrap_lcxx_str_assign_str(void* s, const void* o) {
     if (s != o && o) lcxx::Assign(s, lcxx::Data(o), lcxx::Size(o));
     return s;
 }
-extern "C" void* wrap_lcxx_str_insert_ptr(void* s, size_t pos, const char* p) {
-    size_t n = p ? strlen(p) : 0;
+extern "C" void* wrap_lcxx_str_insert_ptr_len(void* s, size_t pos, const char* p, size_t n) {
     size_t sz = lcxx::Size(s);
     if (pos > sz) pos = sz;
     if (!n) return s;
@@ -14531,6 +14773,9 @@ extern "C" void* wrap_lcxx_str_insert_ptr(void* s, size_t pos, const char* p) {
     memcpy(d + pos, tmp.data(), n);
     lcxx::SetSizeTerm(s, sz + n);
     return s;
+}
+extern "C" void* wrap_lcxx_str_insert_ptr(void* s, size_t pos, const char* p) {
+    return wrap_lcxx_str_insert_ptr_len(s, pos, p, p ? strlen(p) : 0);
 }
 extern "C" void* wrap_lcxx_str_resize(void* s, size_t n, char c) {
     size_t sz = lcxx::Size(s);
@@ -14624,6 +14869,17 @@ extern "C" size_t wrap_lcxx_str_rfind_char(const void* s, char c, size_t pos) {
         if (d[i] == c) return i;
         if (i == 0) return lcxx::kNpos;
     }
+}
+extern "C" size_t wrap_lcxx_str_find_last_of(const void* s, const char* p, size_t pos, size_t n) {
+    size_t sz = lcxx::Size(s);
+    if (sz == 0 || n == 0) return lcxx::kNpos;
+    const char* d = lcxx::Data(s);
+    size_t i = (pos >= sz) ? (sz - 1) : pos;
+    for (;; --i) {
+        if (memchr(p, d[i], n)) return i;
+        if (i == 0) break;
+    }
+    return lcxx::kNpos;
 }
 extern "C" size_t wrap_lcxx_str_find_last_not_of(const void* s, const char* p, size_t pos, size_t n) {
     size_t sz = lcxx::Size(s);
@@ -14783,10 +15039,12 @@ extern "C" size_t wrap_lcxx_next_prime(size_t n) {
         if (prime) return x;
     }
 }
-extern "C" void wrap_lcxx_throw_length_error(void* self) {
-    uint32_t lr = (uint32_t)__builtin_return_address(0);
-    (void)self;
-    LogToJava("C++ EXCEPTION (libc++): length_error Caller: " + GetModuleInfoForAddress(lr));
+extern "C" void wrap_lcxx_sort_u64(uint64_t* first, uint64_t* last, void*) {
+    if (first && last && last > first) std::sort(first, last);
+}
+extern "C" void wrap_lcxx_throw_length_error(void*) {
+    LogToJava("C++ EXCEPTION (libc++): length_error Caller: " +
+              GetModuleInfoForAddress((uint32_t)(uintptr_t)__builtin_return_address(0)));
     wrap_abort();
 }
 extern "C" void wrap_lcxx_throw_system_error(int ev, const char* what) {
@@ -15032,14 +15290,14 @@ static void LcxxOsNum(void* os, long long v, unsigned long long uv, bool sgn) {
     char buf[80];
     int n;
     if (f & LCXX_HEX)
-        n = snprintf(buf, sizeof(buf), (f & LCXX_SHOWBASE) ? ((f & LCXX_UPPERCASE) ? "0X%llX" : "0x%llx")
-                                                           : ((f & LCXX_UPPERCASE) ? "%llX" : "%llx"), uv);
+        n = DwFmt64(buf, sizeof(buf), (f & LCXX_SHOWBASE) ? ((f & LCXX_UPPERCASE) ? "0X%llX" : "0x%llx")
+                                                          : ((f & LCXX_UPPERCASE) ? "%llX" : "%llx"), &uv);
     else if (f & LCXX_OCT)
-        n = snprintf(buf, sizeof(buf), (f & LCXX_SHOWBASE) ? "0%llo" : "%llo", uv);
+        n = DwFmt64(buf, sizeof(buf), (f & LCXX_SHOWBASE) ? "0%llo" : "%llo", &uv);
     else if (sgn)
-        n = snprintf(buf, sizeof(buf), ((f & LCXX_SHOWPOS) && v >= 0) ? "+%lld" : "%lld", v);
+        n = DwFmt64(buf, sizeof(buf), ((f & LCXX_SHOWPOS) && v >= 0) ? "+%lld" : "%lld", &v);
     else
-        n = snprintf(buf, sizeof(buf), "%llu", uv);
+        n = DwFmt64(buf, sizeof(buf), "%llu", &uv);
     if (n > 0) LcxxOsPut(os, buf, (size_t)n);
 }
 extern "C" void* wrap_lcxx_os_ls_bool(void* os, bool v) {
@@ -15052,16 +15310,29 @@ extern "C" void* wrap_lcxx_os_ls_int(void* os, int v) { LcxxOsNum(os, v, (unsign
 extern "C" void* wrap_lcxx_os_ls_uint(void* os, unsigned v) { LcxxOsNum(os, v, v, false); return os; }
 extern "C" void* wrap_lcxx_os_ls_ulong(void* os, unsigned long v) { LcxxOsNum(os, (long long)v, v, false); return os; }
 extern "C" void* wrap_lcxx_os_ls_short(void* os, short v) { LcxxOsNum(os, v, (unsigned long long)(unsigned short)v, true); return os; }
-extern "C" void* wrap_lcxx_os_ls_longlong(void* os, long long v) { LcxxOsNum(os, v, (unsigned long long)v, true); return os; }
-extern "C" void* wrap_lcxx_os_ls_double(void* os, double v) {
+// У Apple 64-битный аргумент выровнен по 4 байта, поэтому после указателя он лежит
+// в r1:r2, а AAPCS Android ждал бы его в r2:r3. Принимаем половинками.
+extern "C" void* wrap_lcxx_os_ls_longlong(void* os, uint32_t lo, uint32_t hi) {
+    long long v = (long long)(((uint64_t)hi << 32) | lo);
+    LcxxOsNum(os, v, (unsigned long long)v, true);
+    return os;
+}
+static void* LcxxOsPutDouble(void* os, double v) {
     LcxxIosBase* io = LcxxIosOf(os);
     int prec = io ? io->precision : 6;
-    char buf[64];
-    int n = snprintf(buf, sizeof(buf), "%.*g", prec > 0 ? prec : 6, v);
+    char buf[64], spec[16];
+    snprintf(spec, sizeof(spec), "%%.%dg", prec > 0 ? prec : 6);
+    int n = DwFmt64(buf, sizeof(buf), spec, &v);
     if (n > 0) LcxxOsPut(os, buf, (size_t)n);
     return os;
 }
-extern "C" void* wrap_lcxx_os_ls_float(void* os, float v) { return wrap_lcxx_os_ls_double(os, (double)v); }
+extern "C" void* wrap_lcxx_os_ls_double(void* os, uint32_t lo, uint32_t hi) {
+    uint64_t bits = ((uint64_t)hi << 32) | lo;
+    double v;
+    memcpy(&v, &bits, sizeof(v));
+    return LcxxOsPutDouble(os, v);
+}
+extern "C" void* wrap_lcxx_os_ls_float(void* os, float v) { return LcxxOsPutDouble(os, (double)v); }
 
 extern "C" void* wrap_lcxx_os_sentry_ctor(void* s, void* os) {
     LcxxIosBase* io = LcxxIosOf(os);
