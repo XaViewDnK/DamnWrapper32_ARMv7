@@ -70,6 +70,20 @@ __attribute__((naked)) extern "C" unsigned char* DwStbLoad(DwStbLoadArgs* a) {
         "mov sp, r4\n"
         "pop {r4, pc}\n");
 }
+// Тот же трамплин для произвольного участка кода: нужен там, где из гостевого стека
+// уходим в системные библиотеки с 64-битными стековыми аргументами.
+extern "C" void DwAligned8CallImpl(void (*fn)()) { fn(); }
+__attribute__((naked)) extern "C" void DwAligned8Call(void (*fn)()) {
+    __asm__ volatile(
+        "push {r4, lr}\n"
+        "mov r4, sp\n"
+        "mov r12, sp\n"
+        "bic r12, r12, #7\n"
+        "mov sp, r12\n"
+        "bl DwAligned8CallImpl\n"
+        "mov sp, r4\n"
+        "pop {r4, pc}\n");
+}
 //
 #include "sqlite3.h"
 #include "ipavfs.h"
@@ -102,7 +116,7 @@ void _SyncLog(const std::string& msg);
 // Ключа в dw_config и в настройках враппера у неё намеренно нет: впереди починка
 // остальных версий игры, поэтому код живёт в репозитории, а включается правкой
 // единицы ниже и пересборкой. При 0 компилятор выбрасывает всю обвязку целиком.
-#define A6_DEBUG_LOG 0
+#define A6_DEBUG_LOG 1
 extern bool g_isAsphalt6;
 static inline bool A6Dbg() { return A6_DEBUG_LOG && g_isAsphalt6; }
 #define A6Log(msg) do { if (A6Dbg()) _LogToJava(msg); } while(0)
@@ -227,9 +241,15 @@ static inline bool OriValid(int o) { return o >= 1 && o <= 4; }
 // повернула против часовой ровно на свою ориентацию интерфейса. Поверхность
 // враппера уже лежит в ориентации 4, доворачивать её не надо — значит кадр надо
 // довернуть до неё, то есть на OriQuarter(ориентация игры) четвертей.
+// Тач читает поворот с чужого потока, где g_gameViewport* может быть посреди RTT-прохода
+// (у Asphalt 6 — 256x256): поворот получался нулевым и палец уезжал мимо кнопок. Поэтому
+// тачу отдаётся поворот, защёлкнутый на последнем проходе в экранный буфер.
+static int g_screenRotQuarters = 0;
 static inline int FrameRotQuarters(int targetW, int targetH) {
-    if (!(g_gameViewportH > g_gameViewportW && targetW > targetH)) return 0;
-    return OriQuarter(g_ifaceOrientation);
+    if (targetW != g_surfaceWidth || targetH != g_surfaceHeight) return 0;  // проход в RTT-текстуру не доворачиваем
+    int q = (g_gameViewportH > g_gameViewportW && targetW > targetH) ? OriQuarter(g_ifaceOrientation) : 0;
+    g_screenRotQuarters = q;
+    return q;
 }
 
 // Акселерометр отдаёт оси портретного устройства — так, как телефон реально лежит.
@@ -245,13 +265,16 @@ static inline void OrientAccel(double& x, double& y) {
 
 // Тач приходит в координатах поверхности. Раз кадру добавлен поворот, точку надо
 // повернуть на столько же в обратную сторону, иначе палец и картинка разъедутся.
-static inline void MapTouchToGameView(float x, float y, float& rx, float& ry) {
-    switch (FrameRotQuarters(g_surfaceWidth, g_surfaceHeight)) {
+static inline void RotTouchPoint(int quarters, float x, float y, float& rx, float& ry) {
+    switch (quarters) {
         case 1:  rx = (float)g_surfaceHeight - y; ry = x;                          break;
         case 2:  rx = (float)g_surfaceWidth  - x; ry = (float)g_surfaceHeight - y; break;
         case 3:  rx = y;                          ry = (float)g_surfaceWidth  - x; break;
         default: rx = x;                          ry = y;                          break;
     }
+}
+static inline void MapTouchToGameView(float x, float y, float& rx, float& ry) {
+    RotTouchPoint(g_screenRotQuarters, x, y, rx, ry);
 }
 int g_activeESVersion = 2;
 int g_debugHeartbeat = 0;
@@ -301,6 +324,9 @@ std::map<GLuint, int> g_progColorModel;
 std::map<GLuint, bool> g_progSamplesTex1;
 
 extern std::map<GLuint, std::vector<uint32_t>> g_cpuTextures;
+// Базовый формат текстуры для GPU-эмуляции ES 1.1: 0 RGBA, 1 RGB, 2 ALPHA,
+// 3 LUMINANCE, 4 LUMINANCE_ALPHA. От него зависят формулы glTexEnv.
+extern std::map<GLuint, int> g_texBaseFormat;
 extern std::map<GLuint, int> g_cpuTexW;
 extern std::map<GLuint, int> g_cpuTexH;
 extern GLuint g_cpuActiveTexture;
@@ -1769,7 +1795,9 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
         LogToJava("[A6-RTT] glClear mask=" + std::to_string((unsigned)mask) + " fbo=" + std::to_string(g_lastActiveFBO) +
                   " depthMask=" + std::to_string((int)g_depthMask) +
                   " colorMask=" + std::to_string((int)g_colorMask[0]) + std::to_string((int)g_colorMask[1]) +
-                  std::to_string((int)g_colorMask[2]) + std::to_string((int)g_colorMask[3]));
+                  std::to_string((int)g_colorMask[2]) + std::to_string((int)g_colorMask[3]) +
+                  " clr=" + std::to_string(g_cpuClearColor[0]) + "," + std::to_string(g_cpuClearColor[1]) + "," +
+                  std::to_string(g_cpuClearColor[2]) + "," + std::to_string(g_cpuClearColor[3]));
         static int a6DepthClears = 0;
         if (mask & GL_COLOR_BUFFER_BIT) a6DepthClears = 0;
         if (mask & GL_DEPTH_BUFFER_BIT) a6DepthClears++;
@@ -1791,7 +1819,15 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
 
     if (g_gpuOffloadMask & 2) {
         SyncLog("[RENDER] Выполняем GPU очистку буфера...");
-        
+
+        // Альфу экрана держим единицей, чтобы сквозь кадр не просвечивал рабочий стол,
+        // но в offscreen-FBO очищать надо тем, что просила игра: там альфа — рабочие
+        // данные, и непрозрачный чёрный превращает пустоту RTT в чёрную заливку.
+        if (mask & GL_COLOR_BUFFER_BIT) {
+            float a = (g_lastActiveFBO > 1) ? g_cpuClearColor[3] : 1.0f;
+            glClearColor(g_cpuClearColor[0], g_cpuClearColor[1], g_cpuClearColor[2], a);
+        }
+
         static bool s_viewport_forced = false;
         if (!s_viewport_forced) {
             EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
@@ -2221,13 +2257,45 @@ extern "C" void Stub_glGenRenderbuffers(GLsizei n, GLuint* rb) {
     }
 }
 
+void ApplyGpuViewport();
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: пустой ли выходит RTT-текстура экрана выбора трассы
+int g_a6DrawsInFbo = 0;
+int g_a6RttQuadDraws = 0;
+extern std::map<GLuint, int> g_cpuTexH;
+static void A6ProbeRttContents() {
+    if ((g_a6FrameNo % 120) != 0) { g_a6DrawsInFbo = 0; return; }
+    GLuint tex = g_fboColorTex.count(g_lastActiveFBO) ? g_fboColorTex[g_lastActiveFBO] : 0;
+    int w = (tex && g_cpuTexW.count(tex)) ? g_cpuTexW[tex] : 0;
+    int h = (tex && g_cpuTexH.count(tex)) ? g_cpuTexH[tex] : 0;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int nonzero = 0, maxA = -1;
+    if (w > 0 && h > 0) {
+        std::vector<uint8_t> px((size_t)w * h * 4);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        for (size_t i = 0; i < px.size(); i += 4) {
+            if (px[i] | px[i + 1] | px[i + 2]) nonzero++;
+            if ((int)px[i + 3] > maxA) maxA = px[i + 3];
+        }
+    }
+    char b[224];
+    snprintf(b, sizeof(b), "[A6-RTT] PROBE-FBO fbo=%u tex=%u %dx%d draws=%d vp=%d,%d,%dx%d nonzeroRGB=%d maxA=%d",
+             (unsigned)g_lastActiveFBO, (unsigned)tex, w, h, g_a6DrawsInFbo,
+             (int)vp[0], (int)vp[1], (int)vp[2], (int)vp[3], nonzero, maxA);
+    LogToJava(b);
+    g_a6DrawsInFbo = 0;
+}
+
 extern "C" void Stub_glBindFramebuffer(GLenum target, GLuint framebuffer) {
+    if (A6Dbg() && (g_gpuOffloadMask & 64) && g_lastActiveFBO > 1 && framebuffer <= 1) A6ProbeRttContents();
     if (A6Dbg() && framebuffer != g_lastActiveFBO) {
         LogToJava("[A6-RTT] FBO " + std::to_string(g_lastActiveFBO) + " -> " + std::to_string(framebuffer));
     }
     g_lastActiveFBO = framebuffer;
     if (g_gpuOffloadMask & 64) {
-        if (framebuffer == 1) glBindFramebuffer(target, 0); else glBindFramebuffer(target, framebuffer); 
+        if (framebuffer == 1) glBindFramebuffer(target, 0); else glBindFramebuffer(target, framebuffer);
+        ApplyGpuViewport();
     }
 }
 extern "C" void Stub_glBindRenderbuffer(GLenum target, GLuint renderbuffer) { 
@@ -2251,7 +2319,19 @@ extern "C" void Stub_glRenderbufferStorage(GLenum target, GLenum internalformat,
 }
 extern "C" GLenum Stub_glCheckFramebufferStatus(GLenum target) { 
     GLint bound_fbo = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound_fbo); if (bound_fbo == 0) return GL_FRAMEBUFFER_COMPLETE; 
-    if (g_gpuOffloadMask & 64) return glCheckFramebufferStatus(target);
+    if (g_gpuOffloadMask & 64) {
+        GLenum st = glCheckFramebufferStatus(target);
+        if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: почему пропадает проход в RTT
+            static std::set<uint64_t> seenFbo;
+            uint64_t k = ((uint64_t)bound_fbo << 32) | (uint64_t)st;
+            if (seenFbo.size() < 16 && seenFbo.insert(k).second) {
+                char b[96];
+                snprintf(b, sizeof(b), "[A6-FBOST] fbo=%d status=0x%x", (int)bound_fbo, (unsigned)st);
+                LogToJava(b);
+            }
+        }
+        return st;
+    }
     return GL_FRAMEBUFFER_COMPLETE;
 }
 extern "C" void Stub_glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint *params) { 
@@ -2291,7 +2371,27 @@ extern "C" void Stub_glFramebufferTexture2D(GLenum target, GLenum attachment, GL
     if (g_gpuOffloadMask & 64) glFramebufferTexture2D(target, attachment, textarget, texture, level);
 }
 
-extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) { 
+static GLint g_reqViewport[4] = {0, 0, 480, 320};
+
+// Вьюпорт экрана растягиваем на всю EGL-поверхность, вьюпорт RTT берём как просила игра.
+// Применять надо и при смене FBO: игра ставит вьюпорт до glBindFramebuffer, и без
+// переустановки проход в текстуру рисуется с размерами экрана.
+void ApplyGpuViewport() {
+    if (!(g_gpuOffloadMask & 64)) return;
+    if (g_lastActiveFBO == 0 || g_lastActiveFBO == 1) {
+        EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
+        EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+        if (surf != EGL_NO_SURFACE) {
+            eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &realW);
+            eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &realH);
+        }
+        glViewport(0, 0, realW, realH);
+    } else {
+        glViewport(g_reqViewport[0], g_reqViewport[1], g_reqViewport[2], g_reqViewport[3]);
+    }
+}
+
+extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (width == 0 && height == 0) {
         g_isFakeViewport = true;
         width = 480;
@@ -2299,21 +2399,13 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
     } else {
         g_isFakeViewport = false;
     }
-    g_gameViewportW = width; 
+    g_gameViewportW = width;
     g_gameViewportH = height;
-    if (g_gpuOffloadMask & 64) {
-        if (g_lastActiveFBO == 0 || g_lastActiveFBO == 1) {
-            EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
-            EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
-            if (surf != EGL_NO_SURFACE) {
-                eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &realW);
-                eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &realH);
-            }
-            glViewport(0, 0, realW, realH); 
-        } else {
-            glViewport(x, y, width, height); 
-        } 
-    }
+    g_reqViewport[0] = x;
+    g_reqViewport[1] = y;
+    g_reqViewport[2] = width;
+    g_reqViewport[3] = height;
+    ApplyGpuViewport();
 }
 
 std::map<GLenum, GLuint> g_boundBuffers;
@@ -2598,6 +2690,7 @@ extern GLuint g_dummyProgram;
 
 // --- CPU TEXTURE CACHE ---
 std::map<GLuint, std::vector<uint32_t>> g_cpuTextures;
+std::map<GLuint, int> g_texBaseFormat;
 std::map<GLuint, int> g_cpuTexW;
 std::map<GLuint, int> g_cpuTexH;
 GLuint g_cpuActiveTexture = 0;
@@ -2652,6 +2745,11 @@ struct SWTexCombine {
     float envColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 SWTexCombine g_texCombine[8];
+
+// Счётчики правок состояния: GPU-программа эмуляции ES 1.1 перезаливает свои
+// uniform'ы только когда игра что-то изменила, а не на каждой отрисовке.
+uint32_t g_ffEnvSerial = 1;
+uint32_t g_ffLightSerial = 1;
 
 // Одна ступень текстурного окружения ES 1.1. i* — выход предыдущей ступени
 // (для нулевого юнита это цвет вершины), t* — тексель ступени, v* — цвет вершины.
@@ -2875,6 +2973,8 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
             A6Log("[A6-RTT] текстура без данных tex=" + std::to_string(g_cpuActiveTexture) +
                   " " + std::to_string(width) + "x" + std::to_string(height) +
                   " intFmt=0x" + std::to_string((unsigned)internalformat) +
+                  " fmt=0x" + std::to_string((unsigned)format) +
+                  " type=0x" + std::to_string((unsigned)type) +
                   " создал " + GetModuleInfoForAddress((uint32_t)(uintptr_t)__builtin_return_address(0)));
         } else {
             // Намеренно не вызываем glGetIntegerv(GL_UNPACK_ALIGNMENT) — может крашить MTK.
@@ -3031,8 +3131,23 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
             safe_pixels = converted_buf.data();
         }
     }
+    if (level == 0) {
+        int bf = 0; // RGBA
+        if (hw_internalformat == GL_RGB) bf = 1;
+        else if (hw_internalformat == GL_ALPHA) bf = 2;
+        else if (hw_internalformat == GL_LUMINANCE) bf = 3;
+        else if (hw_internalformat == GL_LUMINANCE_ALPHA) bf = 4;
+        g_texBaseFormat[g_cpuActiveTexture] = bf;
+    }
+    if (A6Dbg() && level == 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: в каком формате пришла текстура
+        char b[176];
+        snprintf(b, sizeof(b), "[A6-TEXFMT] tex=%u %dx%d internal=0x%x format=0x%x type=0x%x -> hw 0x%x/0x%x",
+                 (unsigned)g_cpuActiveTexture, width, height, (unsigned)internalformat,
+                 (unsigned)format, (unsigned)type, (unsigned)hw_internalformat, (unsigned)hw_format);
+        LogToJava(b);
+    }
     if (g_gpuOffloadMask & 8) {
-        glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+        glTexImage2D(target, level, hw_internalformat, width, height, border, hw_format, type, safe_pixels);
         ApplyAutoMipmap(target, level);
     }
 }
@@ -3213,7 +3328,24 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
             }
         }
     }
-    if (g_gpuOffloadMask & 8) glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    if (g_gpuOffloadMask & 8) {
+        // Adreno не берёт GL_BGRA_EXT как format при RGBA-текстуре: уровень остаётся
+        // неопределённым и выборка даёт мусор. Переставляем каналы сами.
+        std::vector<uint8_t> swapped;
+        if (format == 0x80E1 && type == GL_UNSIGNED_BYTE && pixels && width > 0 && height > 0) {
+            swapped.resize((size_t)width * height * 4);
+            const uint8_t* src = (const uint8_t*)pixels;
+            for (size_t i = 0; i < (size_t)width * height; i++) {
+                swapped[i*4+0] = src[i*4+2];
+                swapped[i*4+1] = src[i*4+1];
+                swapped[i*4+2] = src[i*4+0];
+                swapped[i*4+3] = src[i*4+3];
+            }
+            glTexSubImage2D(target, level, xoffset, yoffset, width, height, GL_RGBA, type, swapped.data());
+        } else {
+            glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+        }
+    }
 }
 
 extern "C" void Stub_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const GLvoid *data) {
@@ -4989,6 +5121,17 @@ static GLint g_ffLocMvp = -1, g_ffLocTexEnable = -1, g_ffLocTex = -1;
 static GLint g_ffLocConstColor = -1, g_ffLocUseColorArray = -1;
 static GLint g_ffLocAlphaFunc = -1, g_ffLocAlphaRef = -1;
 static GLint g_ffLocRot = -1, g_ffLocPointSize = -1;
+static GLint g_ffLocTex1 = -1, g_ffLocStage1 = -1;
+static GLint g_ffLocMv = -1, g_ffLocNrm = -1, g_ffLocLighting = -1, g_ffLocColorMaterial = -1;
+static GLint g_ffLocMatAmb = -1, g_ffLocMatDif = -1, g_ffLocMatSpec = -1, g_ffLocMatEmis = -1;
+static GLint g_ffLocShininess = -1, g_ffLocLmAmb = -1;
+static GLint g_ffLocLightAmb = -1, g_ffLocLightDif = -1, g_ffLocLightSpec = -1;
+static GLint g_ffLocLightPos = -1, g_ffLocSpotDir = -1, g_ffLocLightAtt = -1;
+static GLint g_ffLocTexFmt = -1;
+static GLint g_ffLocEnvMode = -1, g_ffLocEnvColor = -1, g_ffLocCombRGB = -1, g_ffLocCombA = -1;
+static GLint g_ffLocSrcRGB = -1, g_ffLocSrcA = -1, g_ffLocOpRGB = -1, g_ffLocOpA = -1;
+static GLint g_ffLocScaleRGB = -1, g_ffLocScaleA = -1;
+static uint32_t g_ffEnvUploaded = 0, g_ffLightUploaded = 0;
 static bool g_ffFailed = false;
 
 static void MatMul4(const float* a, const float* b, float* out) {
@@ -5005,16 +5148,78 @@ static bool EnsureFixedFunctionProgram() {
         "attribute vec4 a_pos;\n"
         "attribute vec4 a_color;\n"
         "attribute vec2 a_uv;\n"
+        "attribute vec2 a_uv1;\n"
+        "attribute vec3 a_normal;\n"
         "uniform mat4 u_mvp;\n"
+        "uniform mat4 u_mv;\n"
+        "uniform mat3 u_nrm;\n"
         "uniform vec4 u_constColor;\n"
         "uniform float u_useColorArray;\n"
         "uniform float u_rot;\n"
         "uniform float u_pointSize;\n"
+        "uniform float u_lighting;\n"
+        "uniform float u_colorMaterial;\n"
+        "uniform vec4 u_matAmb;\n"
+        "uniform vec4 u_matDif;\n"
+        "uniform vec4 u_matSpec;\n"
+        "uniform vec4 u_matEmis;\n"
+        "uniform float u_shininess;\n"
+        "uniform vec4 u_lmAmb;\n"
+        // .w у ambient — признак включённого источника, .w у spotDir — косинус
+        // угла отсечки (меньше -1.5 значит прожектор выключен), .w у att — экспонента.
+        "uniform vec4 u_lightAmb[8];\n"
+        "uniform vec4 u_lightDif[8];\n"
+        "uniform vec4 u_lightSpec[8];\n"
+        "uniform vec4 u_lightPos[8];\n"
+        "uniform vec4 u_spotDir[8];\n"
+        "uniform vec4 u_lightAtt[8];\n"
         "varying vec4 v_color;\n"
         "varying vec2 v_uv;\n"
+        "varying vec2 v_uv1;\n"
+        "vec4 computeLighting(vec4 vcolor, vec4 eye) {\n"
+        "  vec3 n = normalize(u_nrm * a_normal);\n"
+        "  vec3 ep = eye.xyz;\n"
+        "  if (abs(eye.w) > 1e-8 && abs(eye.w - 1.0) > 1e-6) ep /= eye.w;\n"
+        "  vec4 mAmb = (u_colorMaterial > 0.5) ? vcolor : u_matAmb;\n"
+        "  vec4 mDif = (u_colorMaterial > 0.5) ? vcolor : u_matDif;\n"
+        "  vec3 acc = u_matEmis.rgb + mAmb.rgb * u_lmAmb.rgb;\n"
+        "  for (int i = 0; i < 8; i++) {\n"
+        "    if (u_lightAmb[i].w < 0.5) continue;\n"
+        "    vec3 vp; float att = 1.0;\n"
+        "    if (abs(u_lightPos[i].w) < 1e-8) {\n"
+        "      vp = normalize(u_lightPos[i].xyz);\n"
+        "    } else {\n"
+        "      vec3 d = u_lightPos[i].xyz / u_lightPos[i].w - ep;\n"
+        "      float dist = length(d);\n"
+        "      vp = (dist > 1e-8) ? d / dist : vec3(0.0, 0.0, 1.0);\n"
+        "      float denom = u_lightAtt[i].x + u_lightAtt[i].y * dist + u_lightAtt[i].z * dist * dist;\n"
+        "      att = (denom > 1e-8) ? 1.0 / denom : 1.0;\n"
+        "    }\n"
+        "    if (u_spotDir[i].w > -1.5) {\n"
+        "      float sdot = dot(-vp, normalize(u_spotDir[i].xyz));\n"
+        "      if (sdot < u_spotDir[i].w) att = 0.0;\n"
+        "      else att *= pow(max(sdot, 1e-6), u_lightAtt[i].w);\n"
+        "    }\n"
+        "    if (att <= 0.0) continue;\n"
+        "    float ndotl = max(dot(n, vp), 0.0);\n"
+        "    float spec = 0.0;\n"
+        "    if (ndotl > 0.0 && dot(u_matSpec.rgb, vec3(1.0)) > 0.0) {\n"
+        // Наблюдатель по умолчанию в бесконечности: половинный вектор от (0,0,1).
+        "      float ndoth = dot(n, normalize(vp + vec3(0.0, 0.0, 1.0)));\n"
+        "      if (ndoth > 0.0) spec = pow(ndoth, u_shininess);\n"
+        "    }\n"
+        "    acc += att * (mAmb.rgb * u_lightAmb[i].rgb\n"
+        "                + ndotl * mDif.rgb * u_lightDif[i].rgb\n"
+        "                + spec * u_matSpec.rgb * u_lightSpec[i].rgb);\n"
+        "  }\n"
+        "  return vec4(clamp(acc, 0.0, 1.0), clamp(mDif.a, 0.0, 1.0));\n"
+        "}\n"
         "void main() {\n"
-        "  v_color = mix(u_constColor, a_color, u_useColorArray);\n"
+        "  vec4 vcolor = mix(u_constColor, a_color, u_useColorArray);\n"
+        "  vec4 eye = u_mv * a_pos;\n"
+        "  v_color = (u_lighting > 0.5) ? computeLighting(vcolor, eye) : vcolor;\n"
         "  v_uv = a_uv;\n"
+        "  v_uv1 = a_uv1;\n"
         "  vec4 p = u_mvp * a_pos;\n"
         "  if (u_rot > 0.5) {\n"
         "    if (u_rot < 1.5) p.xy = vec2(-p.y, p.x);\n"
@@ -5028,13 +5233,98 @@ static bool EnsureFixedFunctionProgram() {
         "precision mediump float;\n"
         "varying vec4 v_color;\n"
         "varying vec2 v_uv;\n"
+        "varying vec2 v_uv1;\n"
         "uniform sampler2D u_tex;\n"
+        "uniform sampler2D u_tex1;\n"
         "uniform float u_texEnable;\n"
+        // 0 — ступени второго юнита нет, 1 — с выборкой, 2 — без выборки
+        // (COMBINE, который не читает GL_TEXTURE: например премультипликация альфы).
+        "uniform int u_stage1;\n"
         "uniform float u_alphaRef;\n"
         "uniform int u_alphaFunc;\n"
+        "uniform int u_envMode[2];\n"
+        "uniform int u_texFmt[2];\n"
+        "uniform vec4 u_envColor[2];\n"
+        "uniform int u_combRGB[2];\n"
+        "uniform int u_combA[2];\n"
+        "uniform ivec3 u_srcRGB[2];\n"
+        "uniform ivec3 u_srcA[2];\n"
+        "uniform ivec3 u_opRGB[2];\n"
+        "uniform ivec3 u_opA[2];\n"
+        "uniform vec2 u_scaleRGB;\n"
+        "uniform vec2 u_scaleA;\n"
+        "vec4 pickSrc(int src, vec4 t, vec4 cst, vec4 prim, vec4 prev) {\n"
+        "  if (src == 0) return t;\n"
+        "  if (src == 1) return cst;\n"
+        "  if (src == 2) return prim;\n"
+        "  return prev;\n"
+        "}\n"
+        "vec3 argRGB(int src, int op, vec4 t, vec4 cst, vec4 prim, vec4 prev) {\n"
+        "  vec4 s = pickSrc(src, t, cst, prim, prev);\n"
+        "  if (op == 1) return vec3(1.0) - s.rgb;\n"
+        "  if (op == 2) return vec3(s.a);\n"
+        "  if (op == 3) return vec3(1.0 - s.a);\n"
+        "  return s.rgb;\n"
+        "}\n"
+        "float argA(int src, int op, vec4 t, vec4 cst, vec4 prim, vec4 prev) {\n"
+        "  vec4 s = pickSrc(src, t, cst, prim, prev);\n"
+        "  return (op == 3) ? (1.0 - s.a) : s.a;\n"
+        "}\n"
+        "vec3 comb3(int f, vec3 a0, vec3 a1, vec3 a2) {\n"
+        "  if (f == 1) return a0;\n"
+        "  if (f == 2) return a0 + a1;\n"
+        "  if (f == 3) return a0 + a1 - 0.5;\n"
+        "  if (f == 4) return a0 - a1;\n"
+        "  if (f == 5) return a0 * a2 + a1 * (1.0 - a2);\n"
+        "  return a0 * a1;\n"
+        "}\n"
+        "float comb1(int f, float a0, float a1, float a2) {\n"
+        "  if (f == 1) return a0;\n"
+        "  if (f == 2) return a0 + a1;\n"
+        "  if (f == 3) return a0 + a1 - 0.5;\n"
+        "  if (f == 4) return a0 - a1;\n"
+        "  if (f == 5) return a0 * a2 + a1 * (1.0 - a2);\n"
+        "  return a0 * a1;\n"
+        "}\n"
+        // fmt — базовый формат текстуры: 0 RGBA, 1 RGB, 2 ALPHA, 3 LUMINANCE, 4 LUMINANCE_ALPHA.
+        // ES 1.1 задаёт режимы окружения таблицей по формату: у ALPHA нет цвета (берётся
+        // предыдущий), у RGB и LUMINANCE нет альфы. Без этого шрифты (ALPHA) чернеют.
+        "vec4 texStage(int mode, int fmt, vec4 prev, vec4 t, vec4 prim, vec4 cst,\n"
+        "              int cRGB, int cA, ivec3 sR, ivec3 sA, ivec3 oR, ivec3 oA,\n"
+        "              float sclR, float sclA) {\n"
+        "  bool hasRGB = (fmt != 2);\n"
+        "  bool hasA = (fmt == 0 || fmt == 2 || fmt == 4);\n"
+        "  if (mode == 1) return vec4(hasRGB ? t.rgb : prev.rgb, hasA ? t.a : prev.a);\n"
+        "  if (mode == 2) return vec4((fmt == 1) ? t.rgb : mix(prev.rgb, t.rgb, t.a), prev.a);\n"
+        "  if (mode == 3) return vec4(hasRGB ? prev.rgb + t.rgb : prev.rgb, hasA ? prev.a * t.a : prev.a);\n"
+        "  if (mode == 4) return vec4(hasRGB ? mix(prev.rgb, cst.rgb, t.rgb) : prev.rgb, hasA ? prev.a * t.a : prev.a);\n"
+        "  if (mode != 5) return vec4(hasRGB ? prev.rgb * t.rgb : prev.rgb, hasA ? prev.a * t.a : prev.a);\n"
+        "  vec3 r0 = argRGB(sR.x, oR.x, t, cst, prim, prev);\n"
+        "  vec3 r1 = argRGB(sR.y, oR.y, t, cst, prim, prev);\n"
+        "  vec3 r2 = argRGB(sR.z, oR.z, t, cst, prim, prev);\n"
+        "  float a0 = argA(sA.x, oA.x, t, cst, prim, prev);\n"
+        "  float a1 = argA(sA.y, oA.y, t, cst, prim, prev);\n"
+        "  float a2 = argA(sA.z, oA.z, t, cst, prim, prev);\n"
+        "  if (cRGB == 6 || cRGB == 7) {\n"
+        "    float d = clamp(4.0 * dot(r0 - 0.5, r1 - 0.5), 0.0, 1.0);\n"
+        "    return vec4(vec3(d), (cRGB == 7) ? d : clamp(comb1(cA, a0, a1, a2) * sclA, 0.0, 1.0));\n"
+        "  }\n"
+        "  return clamp(vec4(comb3(cRGB, r0, r1, r2) * sclR,\n"
+        "                    comb1(cA, a0, a1, a2) * sclA), 0.0, 1.0);\n"
+        "}\n"
         "void main() {\n"
         "  vec4 c = v_color;\n"
-        "  if (u_texEnable > 0.5) c *= texture2D(u_tex, v_uv);\n"
+        "  if (u_texEnable > 0.5) {\n"
+        "    c = texStage(u_envMode[0], u_texFmt[0], c, texture2D(u_tex, v_uv), v_color, u_envColor[0],\n"
+        "                 u_combRGB[0], u_combA[0], u_srcRGB[0], u_srcA[0], u_opRGB[0], u_opA[0],\n"
+        "                 u_scaleRGB.x, u_scaleA.x);\n"
+        "  }\n"
+        "  if (u_stage1 > 0) {\n"
+        "    vec4 t1 = (u_stage1 == 1) ? texture2D(u_tex1, v_uv1) : vec4(0.0);\n"
+        "    c = texStage(u_envMode[1], (u_stage1 == 1) ? u_texFmt[1] : 0, c, t1, v_color, u_envColor[1],\n"
+        "                 u_combRGB[1], u_combA[1], u_srcRGB[1], u_srcA[1], u_opRGB[1], u_opA[1],\n"
+        "                 u_scaleRGB.y, u_scaleA.y);\n"
+        "  }\n"
         "  if (u_alphaFunc == 0) discard;\n"
         "  else if (u_alphaFunc == 1 && !(c.a <  u_alphaRef)) discard;\n"
         "  else if (u_alphaFunc == 2 && !(c.a == u_alphaRef)) discard;\n"
@@ -5055,6 +5345,8 @@ static bool EnsureFixedFunctionProgram() {
     glBindAttribLocation(prog, 0, "a_pos");   // соответствует glVertexPointer
     glBindAttribLocation(prog, 1, "a_color"); // соответствует glColorPointer
     glBindAttribLocation(prog, 2, "a_uv");    // соответствует glTexCoordPointer (юнит 0)
+    glBindAttribLocation(prog, 3, "a_uv1");   // юнит 1
+    glBindAttribLocation(prog, 5, "a_normal");// соответствует glNormalPointer
     glLinkProgram(prog);
 
     GLint linkOk = 0; glGetProgramiv(prog, GL_LINK_STATUS, &linkOk);
@@ -5078,6 +5370,37 @@ static bool EnsureFixedFunctionProgram() {
     g_ffLocAlphaRef      = glGetUniformLocation(prog, "u_alphaRef");
     g_ffLocRot           = glGetUniformLocation(prog, "u_rot");
     g_ffLocPointSize     = glGetUniformLocation(prog, "u_pointSize");
+    g_ffLocTex1          = glGetUniformLocation(prog, "u_tex1");
+    g_ffLocStage1        = glGetUniformLocation(prog, "u_stage1");
+    g_ffLocMv            = glGetUniformLocation(prog, "u_mv");
+    g_ffLocNrm           = glGetUniformLocation(prog, "u_nrm");
+    g_ffLocLighting      = glGetUniformLocation(prog, "u_lighting");
+    g_ffLocColorMaterial = glGetUniformLocation(prog, "u_colorMaterial");
+    g_ffLocMatAmb        = glGetUniformLocation(prog, "u_matAmb");
+    g_ffLocMatDif        = glGetUniformLocation(prog, "u_matDif");
+    g_ffLocMatSpec       = glGetUniformLocation(prog, "u_matSpec");
+    g_ffLocMatEmis       = glGetUniformLocation(prog, "u_matEmis");
+    g_ffLocShininess     = glGetUniformLocation(prog, "u_shininess");
+    g_ffLocLmAmb         = glGetUniformLocation(prog, "u_lmAmb");
+    g_ffLocLightAmb      = glGetUniformLocation(prog, "u_lightAmb");
+    g_ffLocLightDif      = glGetUniformLocation(prog, "u_lightDif");
+    g_ffLocLightSpec     = glGetUniformLocation(prog, "u_lightSpec");
+    g_ffLocLightPos      = glGetUniformLocation(prog, "u_lightPos");
+    g_ffLocSpotDir       = glGetUniformLocation(prog, "u_spotDir");
+    g_ffLocLightAtt      = glGetUniformLocation(prog, "u_lightAtt");
+    g_ffLocEnvMode       = glGetUniformLocation(prog, "u_envMode");
+    g_ffLocTexFmt        = glGetUniformLocation(prog, "u_texFmt");
+    g_ffLocEnvColor      = glGetUniformLocation(prog, "u_envColor");
+    g_ffLocCombRGB       = glGetUniformLocation(prog, "u_combRGB");
+    g_ffLocCombA         = glGetUniformLocation(prog, "u_combA");
+    g_ffLocSrcRGB        = glGetUniformLocation(prog, "u_srcRGB");
+    g_ffLocSrcA          = glGetUniformLocation(prog, "u_srcA");
+    g_ffLocOpRGB         = glGetUniformLocation(prog, "u_opRGB");
+    g_ffLocOpA           = glGetUniformLocation(prog, "u_opA");
+    g_ffLocScaleRGB      = glGetUniformLocation(prog, "u_scaleRGB");
+    g_ffLocScaleA        = glGetUniformLocation(prog, "u_scaleA");
+    g_ffEnvUploaded = 0;
+    g_ffLightUploaded = 0;
     SyncLog("[RENDER] FFP: программа эмуляции ES 1.1 готова, prog=" + std::to_string(prog)
         + " loc mvp=" + std::to_string(g_ffLocMvp)
         + " texEn=" + std::to_string(g_ffLocTexEnable)
@@ -5087,6 +5410,112 @@ static bool EnsureFixedFunctionProgram() {
         + " alphaFunc=" + std::to_string(g_ffLocAlphaFunc)
         + " rot=" + std::to_string(g_ffLocRot));
     return true;
+}
+
+// Перевод перечислений ES 1.1 в маленькие номера, которыми оперирует шейдер.
+static int FFEnvMode(GLenum m) {
+    switch (m) {
+        case GL_REPLACE: return 1;
+        case GL_DECAL:   return 2;
+        case GL_ADD:     return 3;
+        case 0x0BE2:     return 4; // GL_BLEND
+        case GL_COMBINE: return 5;
+        default:         return 0; // GL_MODULATE
+    }
+}
+static int FFCombFunc(GLenum f) {
+    switch (f) {
+        case GL_REPLACE: return 1;
+        case GL_ADD:     return 2;
+        case 0x8574:     return 3; // GL_ADD_SIGNED
+        case 0x84E7:     return 4; // GL_SUBTRACT
+        case 0x8575:     return 5; // GL_INTERPOLATE
+        case 0x86AE:     return 6; // GL_DOT3_RGB
+        case 0x86AF:     return 7; // GL_DOT3_RGBA
+        default:         return 0; // GL_MODULATE
+    }
+}
+static int FFSrc(GLenum s) {
+    switch (s) {
+        case GL_TEXTURE: return 0;
+        case 0x8576:     return 1; // GL_CONSTANT
+        case 0x8577:     return 2; // GL_PRIMARY_COLOR
+        default:         return 3; // GL_PREVIOUS
+    }
+}
+static int FFOpRGB(GLenum o) {
+    switch (o) {
+        case 0x0301:       return 1; // GL_ONE_MINUS_SRC_COLOR
+        case GL_SRC_ALPHA: return 2;
+        case 0x0303:       return 3; // GL_ONE_MINUS_SRC_ALPHA
+        default:           return 0; // GL_SRC_COLOR
+    }
+}
+
+// Ступени юнитов 0 и 1 целиком: то же, что делает SWApplyTexEnv в растеризаторе.
+static void UploadFFTexEnv() {
+    GLint envMode[2], combRGB[2], combA[2];
+    GLint srcRGB[6], srcA[6], opRGB[6], opA[6];
+    GLfloat envColor[8], scaleRGB[2], scaleA[2];
+    for (int u = 0; u < 2; u++) {
+        const SWTexCombine& C = g_texCombine[u];
+        envMode[u] = FFEnvMode(g_texEnvMode[u]);
+        combRGB[u] = FFCombFunc(C.combineRGB);
+        combA[u]   = FFCombFunc(C.combineAlpha);
+        scaleRGB[u] = C.rgbScale;
+        scaleA[u]   = C.alphaScale;
+        for (int n = 0; n < 3; n++) {
+            srcRGB[u*3+n] = FFSrc(C.srcRGB[n]);
+            srcA[u*3+n]   = FFSrc(C.srcAlpha[n]);
+            opRGB[u*3+n]  = FFOpRGB(C.operandRGB[n]);
+            opA[u*3+n]    = (C.operandAlpha[n] == 0x0303) ? 3 : 2;
+        }
+        for (int k = 0; k < 4; k++) envColor[u*4+k] = C.envColor[k];
+    }
+    glUniform1iv(g_ffLocEnvMode, 2, envMode);
+    glUniform1iv(g_ffLocCombRGB, 2, combRGB);
+    glUniform1iv(g_ffLocCombA, 2, combA);
+    glUniform3iv(g_ffLocSrcRGB, 2, srcRGB);
+    glUniform3iv(g_ffLocSrcA, 2, srcA);
+    glUniform3iv(g_ffLocOpRGB, 2, opRGB);
+    glUniform3iv(g_ffLocOpA, 2, opA);
+    glUniform4fv(g_ffLocEnvColor, 2, envColor);
+    glUniform2fv(g_ffLocScaleRGB, 1, scaleRGB);
+    glUniform2fv(g_ffLocScaleA, 1, scaleA);
+}
+
+static void UploadFFLighting() {
+    glUniform4fv(g_ffLocMatAmb, 1, g_matAmbient);
+    glUniform4fv(g_ffLocMatDif, 1, g_matDiffuse);
+    glUniform4fv(g_ffLocMatSpec, 1, g_matSpecular);
+    glUniform4fv(g_ffLocMatEmis, 1, g_matEmission);
+    glUniform1f(g_ffLocShininess, g_matShininess);
+    glUniform4fv(g_ffLocLmAmb, 1, g_lightModelAmbient);
+
+    GLfloat amb[32], dif[32], spec[32], pos[32], spot[32], att[32];
+    for (int i = 0; i < 8; i++) {
+        const SWLight& L = g_lights[i];
+        for (int k = 0; k < 3; k++) {
+            amb[i*4+k]  = L.ambient[k];
+            dif[i*4+k]  = L.diffuse[k];
+            spec[i*4+k] = L.specular[k];
+            att[i*4+k]  = L.attenuation[k];
+            spot[i*4+k] = L.spotDir[k];
+        }
+        amb[i*4+3] = g_lightEnabled[i] ? 1.0f : 0.0f;
+        dif[i*4+3] = 1.0f;
+        spec[i*4+3] = 1.0f;
+        for (int k = 0; k < 4; k++) pos[i*4+k] = L.position[k];
+        // Отсечку держим уже косинусом, чтобы шейдер не считал её на каждой вершине.
+        spot[i*4+3] = (L.spotCutoff < 179.999f) ? std::cos(L.spotCutoff * 3.14159265f / 180.0f) : -2.0f;
+        att[i*4+3] = L.spotExponent;
+    }
+    glUniform4fv(g_ffLocLightAmb, 8, amb);
+    glUniform4fv(g_ffLocLightDif, 8, dif);
+    glUniform4fv(g_ffLocLightSpec, 8, spec);
+    glUniform4fv(g_ffLocLightPos, 8, pos);
+    glUniform4fv(g_ffLocSpotDir, 8, spot);
+    glUniform4fv(g_ffLocLightAtt, 8, att);
 }
 
 // Возвращает true, если кадр рисуется нашей fixed-function программой.
@@ -5107,6 +5536,70 @@ static bool ApplyFixedFunctionState(int rotQuarters) {
     bool useTex = g_texture2DUnitEnabled[0] && g_cpuActiveTexture != 0 && g_vertexAttribs[2].enabled;
     glUniform1f(g_ffLocTexEnable, useTex ? 1.0f : 0.0f);
     glUniform1i(g_ffLocTex, 0);
+    glUniform1i(g_ffLocTex1, 1);
+
+    // Ступень второго юнита в ES 1.1 включается glEnable(GL_TEXTURE_2D), а не массивом
+    // координат: без массива координата постоянная, а COMBINE вида GL_PREVIOUS×GL_PREVIOUS
+    // обязан отработать и без привязанной текстуры.
+    int stage1 = 0;
+    if (useTex && g_texture2DUnitEnabled[1]) {
+        if (g_cpuUnitTexture[1] != 0) {
+            stage1 = 1;
+        } else if (g_texEnvMode[1] == GL_COMBINE) {
+            const SWTexCombine& c1 = g_texCombine[1];
+            stage1 = 2;
+            for (int n = 0; n < 3; n++) {
+                if (c1.srcRGB[n] == GL_TEXTURE || c1.srcAlpha[n] == GL_TEXTURE) { stage1 = 0; break; }
+            }
+        }
+    }
+    glUniform1i(g_ffLocStage1, stage1);
+
+    GLuint fmtTex0 = g_cpuUnitTexture[0] ? g_cpuUnitTexture[0] : g_cpuActiveTexture;
+    int texFmt[2] = {0, 0};
+    auto bf0 = g_texBaseFormat.find(fmtTex0);
+    if (bf0 != g_texBaseFormat.end()) texFmt[0] = bf0->second;
+    auto bf1 = g_texBaseFormat.find(g_cpuUnitTexture[1]);
+    if (bf1 != g_texBaseFormat.end()) texFmt[1] = bf1->second;
+    glUniform1iv(g_ffLocTexFmt, 2, texFmt);
+
+    if (g_ffEnvUploaded != g_ffEnvSerial) {
+        UploadFFTexEnv();
+        g_ffEnvUploaded = g_ffEnvSerial;
+    }
+
+    glUniform1f(g_ffLocLighting, g_lightingEnabled ? 1.0f : 0.0f);
+    if (g_lightingEnabled) {
+        const float* mv = g_modelViewStack.back().data();
+        glUniformMatrix4fv(g_ffLocMv, 1, GL_FALSE, mv);
+        // Нормаль переводится в координаты глаза обратно-транспонированной матрицей:
+        // при неравномерном масштабе обычная даёт перекошенное освещение.
+        float a = mv[0], b = mv[4], c = mv[8];
+        float d = mv[1], e = mv[5], f = mv[9];
+        float g = mv[2], h = mv[6], i2 = mv[10];
+        float det = a * (e * i2 - f * h) - b * (d * i2 - f * g) + c * (d * h - e * g);
+        float nrm[9];
+        if (std::abs(det) > 1e-12f) {
+            float id = 1.0f / det;
+            nrm[0] = (e * i2 - f * h) * id; nrm[3] = (c * h - b * i2) * id; nrm[6] = (b * f - c * e) * id;
+            nrm[1] = (f * g - d * i2) * id; nrm[4] = (a * i2 - c * g) * id; nrm[7] = (c * d - a * f) * id;
+            nrm[2] = (d * h - e * g) * id; nrm[5] = (b * g - a * h) * id; nrm[8] = (a * e - b * d) * id;
+        } else {
+            nrm[0] = a; nrm[3] = b; nrm[6] = c;
+            nrm[1] = d; nrm[4] = e; nrm[7] = f;
+            nrm[2] = g; nrm[5] = h; nrm[8] = i2;
+        }
+        glUniformMatrix3fv(g_ffLocNrm, 1, GL_FALSE, nrm);
+        glUniform1f(g_ffLocColorMaterial, g_colorMaterialEnabled ? 1.0f : 0.0f);
+        if (!g_vertexAttribs[5].enabled) {
+            const float* n = g_vertexAttribs[5].constantValue;
+            glVertexAttrib3f(5, n[0], n[1], n[2]);
+        }
+        if (g_ffLightUploaded != g_ffLightSerial) {
+            UploadFFLighting();
+            g_ffLightUploaded = g_ffLightSerial;
+        }
+    }
 
     const float* cc = g_vertexAttribs[1].constantValue;
     glUniform4f(g_ffLocConstColor, cc[0], cc[1], cc[2], cc[3]);
@@ -5119,6 +5612,25 @@ static bool ApplyFixedFunctionState(int rotQuarters) {
 
     glUniform1f(g_ffLocRot, (float)rotQuarters);
     glUniform1f(g_ffLocPointSize, g_pointSize);
+
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: с каким окружением идёт отрисовка на GPU
+        static std::set<uint64_t> seen;
+        const SWTexCombine& C0 = g_texCombine[0];
+        uint64_t key = ((uint64_t)g_cpuUnitTexture[0] << 40) ^ ((uint64_t)g_texEnvMode[0] << 24)
+                     ^ ((uint64_t)C0.combineRGB << 8) ^ ((uint64_t)stage1 << 4)
+                     ^ ((uint64_t)g_lightingEnabled << 2) ^ (uint64_t)useTex;
+        if (seen.size() < 60 && seen.insert(key).second) {
+            char b[240];
+            snprintf(b, sizeof(b), "[A6-FFP] tex0=%u tex1=%u useTex=%d stage1=%d env0=0x%x cRGB=0x%x "
+                                   "src=0x%x/0x%x/0x%x op=0x%x/0x%x/0x%x light=%d blend=%d 0x%x/0x%x",
+                     (unsigned)g_cpuUnitTexture[0], (unsigned)g_cpuUnitTexture[1], (int)useTex, stage1,
+                     (unsigned)g_texEnvMode[0], (unsigned)C0.combineRGB,
+                     (unsigned)C0.srcRGB[0], (unsigned)C0.srcRGB[1], (unsigned)C0.srcRGB[2],
+                     (unsigned)C0.operandRGB[0], (unsigned)C0.operandRGB[1], (unsigned)C0.operandRGB[2],
+                     (int)g_lightingEnabled, (int)g_blendEnabled, (unsigned)g_blendSrc, (unsigned)g_blendDst);
+            LogToJava(b);
+        }
+    }
     return true;
 }
 
@@ -5151,6 +5663,28 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
 extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
     SyncLog("[GL-TRACE] glDrawElements(mode=" + std::to_string(mode) + ", count=" + std::to_string(count) + ", type=" + std::to_string(type) + ")");
     g_frameHasDraw = true;
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: куда и с какой матрицей уходит отрисовка
+        if (g_lastActiveFBO > 1) g_a6DrawsInFbo++;
+        else if (g_cpuUnitTexture[0] != 0 && g_fboTextures.count(g_cpuUnitTexture[0]) > 0) g_a6RttQuadDraws++;
+        static std::set<uint64_t> seenDE;
+        float m[16];
+        MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), m);
+        uint64_t k = ((uint64_t)(int)(m[12] * 4.0f) << 40) ^ ((uint64_t)(int)(m[13] * 4.0f) << 20)
+                   ^ (uint64_t)(int)(m[14] * 4.0f) ^ ((uint64_t)g_lastActiveFBO << 60);
+        bool isRttQuad = g_cpuUnitTexture[0] != 0 && g_fboTextures.count(g_cpuUnitTexture[0]) > 0;
+        if (isRttQuad) k ^= 0x5a5a000000000000ull;
+        if (seenDE.size() < 60 && seenDE.insert(k).second) {
+            char b[256];
+            snprintf(b, sizeof(b), "[A6-DE]%s fbo=%u tex0=%u cnt=%d t=(%.2f,%.2f,%.2f) blend=%d %x/%x env=%x fmt=%d at=%d",
+                     isRttQuad ? " RTTQUAD" : "",
+                     (unsigned)g_lastActiveFBO, (unsigned)g_cpuUnitTexture[0], (int)count,
+                     m[12], m[13], m[14], (int)g_blendEnabled, (unsigned)g_blendSrc, (unsigned)g_blendDst,
+                     (unsigned)g_texEnvMode[0],
+                     g_texBaseFormat.count(g_cpuUnitTexture[0]) ? g_texBaseFormat[g_cpuUnitTexture[0]] : -1,
+                     (int)g_alphaTestEnabled);
+            LogToJava(b);
+        }
+    }
     if (g_gpuOffloadMask & 16) {
         int targetW = g_surfaceWidth;
         int targetH = g_surfaceHeight;
@@ -5212,7 +5746,7 @@ extern "C" void MegaDebug_glEnable(GLenum cap) {
     else if (cap == 0x0B50) g_lightingEnabled = true; // GL_LIGHTING
     else if (cap == 0x0B57) g_colorMaterialEnabled = true; // GL_COLOR_MATERIAL
     else if (cap == 0x0BA1) g_normalizeEnabled = true; // GL_NORMALIZE
-    else if (cap >= 0x4000 && cap <= 0x4007) g_lightEnabled[cap - 0x4000] = true; // GL_LIGHT0..7
+    else if (cap >= 0x4000 && cap <= 0x4007) { g_lightEnabled[cap - 0x4000] = true; g_ffLightSerial++; } // GL_LIGHT0..7
     if ((g_gpuOffloadMask & 32) && !IsES1OnlyCap(cap)) glEnable(cap);
 }
 extern "C" void MegaDebug_glDisable(GLenum cap) {
@@ -5225,7 +5759,7 @@ extern "C" void MegaDebug_glDisable(GLenum cap) {
     else if (cap == 0x0B50) g_lightingEnabled = false;
     else if (cap == 0x0B57) g_colorMaterialEnabled = false;
     else if (cap == 0x0BA1) g_normalizeEnabled = false;
-    else if (cap >= 0x4000 && cap <= 0x4007) g_lightEnabled[cap - 0x4000] = false;
+    else if (cap >= 0x4000 && cap <= 0x4007) { g_lightEnabled[cap - 0x4000] = false; g_ffLightSerial++; }
     if ((g_gpuOffloadMask & 32) && !IsES1OnlyCap(cap)) glDisable(cap);
 }
 extern "C" void MegaDebug_glCullFace(GLenum mode) { g_cullFaceMode = mode; if (g_gpuOffloadMask & 32) glCullFace(mode); }
@@ -6411,6 +6945,11 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
             }
             g_a6FrameNo++; LogToJava("[A6-RTT] ===== PRESENT =====");
+            {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: доходит ли RTT-текстура до экрана
+                if ((g_a6FrameNo % 120) == 0)
+                    LogToJava("[A6-RTT] PROBE-FRAME rttQuads=" + std::to_string(g_a6RttQuadDraws));
+                g_a6RttQuadDraws = 0;
+            }
         }
         if (a6_cnt < 12 || a6_cnt % 200 == 0) {
             uint32_t st = (strcmp(op, "drawView") == 0 && self) ? *(uint32_t*)((uint8_t*)self + 104) : 0xffffffff;
@@ -8910,12 +9449,6 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if ((strcmp(op, "locationInView:") == 0 || strcmp(op, "previousLocationInView:") == 0) && clsName == "FakeUITouch") {
             FakeUITouch* t = (FakeUITouch*)self;
             float rx, ry; MapTouchToGameView(t->x, t->y, rx, ry);
-            
-            // Если запрашивают координаты относительно конкретного View, а не окна (a1 != nil)
-            if (a1 && g_views.count(a1)) {
-                // В SMB2 обычно всё на одном уровне, но для порядка вычтем смещение View
-                // rx -= g_views[a1].frame[0]; ry -= g_views[a1].frame[1];
-            }
             uint32_t bx, by; memcpy(&bx, &rx, 4); memcpy(&by, &ry, 4);
             return ((uint64_t)by << 32) | bx; // r0 = x, r1 = y
         }
@@ -10794,14 +11327,25 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
                 continue;
             }
 
-            SyncLog("[ABSOLUTE-IDLE-LOOP] 2. Entering MegaDebug_glClear...");
-            MegaDebug_glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            // Кадр идёт через трамплин выравнивания: сюда мы попадаем из гостевого стека,
+            // где SP кратен 4, а драйвер Adreno зовёт HIDL getFormatLayout с 64-битным
+            // аргументом и на таком SP читает его со сдвигом, роняя gralloc.
+            // Свой кадр рисуем в окно, а не в FBO, который игра успела забиндить:
+            // у её drawable-рендербуфера реального storage нет.
+            DwAligned8Call(+[]() {
+                GLuint gameFbo = (GLuint)g_lastActiveFBO;
+                if (g_gpuOffloadMask & 64) Stub_glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-            SyncLog("[ABSOLUTE-IDLE-LOOP] 3. Entering RenderHLEUI...");
-            RenderHLEUI();
-            
-            SyncLog("[ABSOLUTE-IDLE-LOOP] 4. Entering MegaDebug_eglSwapBuffers...");
-            MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+                SyncLog("[ABSOLUTE-IDLE-LOOP] 2. Entering MegaDebug_glClear...");
+                MegaDebug_glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                SyncLog("[ABSOLUTE-IDLE-LOOP] 3. Entering RenderHLEUI...");
+                RenderHLEUI();
+
+                SyncLog("[ABSOLUTE-IDLE-LOOP] 4. Entering MegaDebug_eglSwapBuffers...");
+                MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+                if (g_gpuOffloadMask & 64) Stub_glBindFramebuffer(GL_FRAMEBUFFER, gameFbo);
+            });
             SyncLog("[ABSOLUTE-IDLE-LOOP] --- FRAME END ---\n");
         }
         usleep(16000); 
@@ -10892,6 +11436,41 @@ uint32_t wrap_ZTVSt15basic_stringbufIcSt11char_traitsIcESaIcEE[16] = {0};
 uint32_t wrap_ZTVSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE[16] = {0};
 uint32_t wrap_ZTVSt9basic_iosIcSt11char_traitsIcEE[16] = {0};
 uint32_t wrap_ZTTSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE[4] = {0};
+static uint32_t wrap_cxx_ostringstream_ctor_vtable[8] = {0};
+
+// Конструктор std::ostringstream компилятор гостя инлайнит целиком: он сам читает
+// VTT, берёт смещение виртуальной базы из [VTT[1]-12] и раскладывает vptr'ы.
+// Нулевые таблицы давали чтение по нулевому адресу, поэтому раскладка ниже
+// повторяет Itanium C++ ABI. Смещение базы basic_ios = 4 (vptr) + 40 (stringbuf).
+extern "C" uint32_t Stub_CxxStreamVirtual() {
+    uint32_t lr = (uint32_t)__builtin_return_address(0);
+    LogToJava("C-API-STUB: виртуальный вызов таблицы std::stream из: " + GetModuleInfoForAddress(lr));
+    return 0;
+}
+
+__attribute__((constructor)) static void InitHleCxxStreamVTables() {
+    const uint32_t kIosVBaseOffset = 44;
+    uint32_t* plain[] = { wrap_ZTVSt15basic_streambufIcSt11char_traitsIcEE,
+                          wrap_ZTVSt15basic_stringbufIcSt11char_traitsIcESaIcEE,
+                          wrap_ZTVSt9basic_iosIcSt11char_traitsIcEE };
+    for (uint32_t* t : plain)
+        for (int i = 2; i < 16; i++) t[i] = (uint32_t)Stub_CxxStreamVirtual;
+
+    uint32_t* os = wrap_ZTVSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE;
+    os[0] = kIosVBaseOffset;
+    os[3] = os[4] = (uint32_t)Stub_CxxStreamVirtual;          // vptr ostream = os+12
+    os[6] = (uint32_t)(-(int32_t)kIosVBaseOffset);
+    os[8] = os[9] = (uint32_t)Stub_CxxStreamVirtual;          // vptr basic_ios = os+32
+
+    uint32_t* cv = wrap_cxx_ostringstream_ctor_vtable;
+    cv[0] = kIosVBaseOffset;
+    cv[3] = cv[4] = (uint32_t)Stub_CxxStreamVirtual;
+
+    uint32_t* vtt = wrap_ZTTSt19basic_ostringstreamIcSt11char_traitsIcESaIcEE;
+    vtt[0] = (uint32_t)&os[3];
+    vtt[1] = (uint32_t)&cv[3];
+    vtt[2] = (uint32_t)&os[8];
+}
 size_t wrap_ZNSt8numpunctIwE2idE = 0;
 uint32_t wrap_ZTISt9bad_alloc[8] = {0};
 
@@ -11710,6 +12289,7 @@ extern "C" {
         }
         if (target != GL_TEXTURE_ENV) return;
         if (g_cpuTextureUnit < 0 || g_cpuTextureUnit >= 8) return;
+        g_ffEnvSerial++;
         SWTexCombine& C = g_texCombine[g_cpuTextureUnit];
         switch (pname) {
             case GL_TEXTURE_ENV_MODE: g_texEnvMode[g_cpuTextureUnit] = (GLenum)param; break;
@@ -11739,6 +12319,7 @@ extern "C" {
         if (!params) return;
         if (pname == 0x2201 && g_cpuTextureUnit >= 0 && g_cpuTextureUnit < 8) { // GL_TEXTURE_ENV_COLOR
             memcpy(g_texCombine[g_cpuTextureUnit].envColor, params, sizeof(float) * 4);
+            g_ffEnvSerial++;
             {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
                 static std::set<uint64_t> seen;
                 uint64_t k = ((uint64_t)g_cpuTextureUnit << 40) ^ (uint64_t)(params[0] * 1000) ^ ((uint64_t)(params[1] * 1000) << 12) ^ ((uint64_t)(params[2] * 1000) << 24);
@@ -11797,10 +12378,14 @@ extern "C" {
     void wrap_glFogfv(GLenum pname, const GLfloat *params) {}
     void wrap_glLightModelf(GLenum pname, GLfloat param) {}
     void wrap_glLightModelfv(GLenum pname, const GLfloat *params) {
-        if (pname == 0x0B53 && params) memcpy(g_lightModelAmbient, params, sizeof(float) * 4); // GL_LIGHT_MODEL_AMBIENT
+        if (pname == 0x0B53 && params) { // GL_LIGHT_MODEL_AMBIENT
+            memcpy(g_lightModelAmbient, params, sizeof(float) * 4);
+            g_ffLightSerial++;
+        }
     }
     void wrap_glLightf(GLenum light, GLenum pname, GLfloat param) {
         if (light < 0x4000 || light > 0x4007) return;
+        g_ffLightSerial++;
         SWLight& L = g_lights[light - 0x4000];
         switch (pname) {
             case 0x1206: L.spotExponent = param; break;            // GL_SPOT_EXPONENT
@@ -11823,6 +12408,7 @@ extern "C" {
                 LogToJava(b);
             }
         }
+        g_ffLightSerial++;
         SWLight& L = g_lights[light - 0x4000];
         // GL_POSITION и GL_SPOT_DIRECTION по спеке переводятся в координаты глаза
         // текущей модельно-видовой матрицей В МОМЕНТ ВЫЗОВА, а не при отрисовке.
@@ -11850,10 +12436,11 @@ extern "C" {
         }
     }
     void wrap_glMaterialf(GLenum face, GLenum pname, GLfloat param) {
-        if (pname == 0x1601) g_matShininess = param; // GL_SHININESS
+        if (pname == 0x1601) { g_matShininess = param; g_ffLightSerial++; } // GL_SHININESS
     }
     void wrap_glMaterialfv(GLenum face, GLenum pname, const GLfloat *params) {
         if (!params) return;
+        g_ffLightSerial++;
         {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
             static std::set<uint64_t> seen;
             uint64_t k = ((uint64_t)pname << 32) ^ (uint64_t)(params[0] * 1000) ^ ((uint64_t)(params[1] * 1000) << 10) ^ ((uint64_t)(params[2] * 1000) << 20);
@@ -17629,6 +18216,14 @@ static HleStringStream* HleStreamCreate(void* this_ptr) {
     g_hleStreams[this_ptr] = st;
     return st;
 }
+// Тот же поток, но vptr не трогаем: при заинлайненном конструкторе гость уже
+// разложил свои указатели и позже считает по ним смещение виртуальной базы.
+static void HleStreamAttach(void* obj) {
+    if (!obj) return;
+    auto it = g_hleStreams.find(obj);
+    if (it != g_hleStreams.end()) { delete it->second; g_hleStreams.erase(it); }
+    g_hleStreams[obj] = new HleStringStream();
+}
 static void* HleStreamAppend(void* this_ptr, const char* s, size_t n) {
     HleStringStream* st = HleFindStream(this_ptr);
     if (st && s) st->data.append(s, n);
@@ -17669,7 +18264,11 @@ extern "C" void* wrap_cxx_basic_ios_operator_void_ptr(void* this_ptr) {
     HleStringStream* st = HleFindStream(this_ptr);
     return (st && st->fail) ? nullptr : this_ptr;
 }
-extern "C" void* wrap_cxx_ios_init(void* this_ptr, void* sb_ptr) { return this_ptr; }
+extern "C" void* wrap_cxx_ios_init(void* this_ptr, void* sb_ptr) {
+    // Базой потока служит объект, чей первый член — этот streambuf.
+    if (sb_ptr) HleStreamAttach((char*)sb_ptr - 4);
+    return this_ptr;
+}
 char wrap_ZSt7nothrow = 0;
 extern "C" bool wrap_cxx_string_empty(void* this_ptr) { return wrap_cxx_string_size(this_ptr) == 0; }
 extern "C" const char* wrap_cxx_string_c_str(void* this_ptr) { char** dest = (char**)this_ptr; return (dest && *dest) ? *dest : ""; }
@@ -17996,10 +18595,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     // RGBX, а не RGBA: композитор учитывает альфу кадра, а игра пишет в неё что попало
     // (у прозрачных мест текстур она 0), из-за чего кадр местами становится прозрачным.
     ANativeWindow_setBuffersGeometry(g_nativeWindow, g_surfaceWidth, g_surfaceHeight, WINDOW_FORMAT_RGBX_8888);
-    
+
     LogToJava("Render: Инициализация ANativeWindow для рендера! EGL переведен в режим PBuffer (Offscreen).");
     g_cpuColorBuffer.resize(g_surfaceWidth * g_surfaceHeight, 0xFF000000);
-    
+
     g_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY); eglInitialize(g_eglDisplay, 0, 0);
     // ФИКС КРАША 0x8: Обязательно добавляем EGL_WINDOW_BIT, иначе драйвер упадет при eglSwapBuffers
     // ФИКС КРАША GL_STENCIL_BUFFER_BIT: Добавляем EGL_STENCIL_SIZE и EGL_ALPHA_SIZE для Adreno
@@ -18033,6 +18632,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     if (g_ignoringInteractionEvents > 0) return;
     void* activeView = g_presentedView ? g_presentedView : g_mainView; if (!activeView) return;
 
+    if (A6Dbg()) {
+        float mx, my; MapTouchToGameView(x, y, mx, my);
+        A6Log("[A6-TOUCH] act=" + std::to_string(actionMasked) + " surf=(" + std::to_string(x) + "," + std::to_string(y) +
+              ") -> game=(" + std::to_string(mx) + "," + std::to_string(my) + ") rot=" + std::to_string(g_screenRotQuarters));
+    }
+
     // UIKit никогда не отдаёт тач вью нулевого размера. Asphalt последним кладёт в окно
     // свой служебный substView с фреймом 0x0, и без этой проверки весь ввод уходил в него
     // мимо EAGLView. Если текущая цель не накрывает точку — ищем ту, что накрывает.
@@ -18052,7 +18657,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         }
         if (best) activeView = best;
     }
-
     bool isDown = (actionMasked == 0 || actionMasked == 5);
     bool isUp = (actionMasked == 1 || actionMasked == 6);
     bool isMove = (actionMasked == 2);
