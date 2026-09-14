@@ -10,6 +10,9 @@ import android.graphics.Color;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
@@ -29,8 +32,10 @@ import android.widget.FrameLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.nio.ByteBuffer;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.text.SimpleDateFormat;
@@ -67,7 +72,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     private ScrollView scrollView;
     private FrameLayout rootLayout;
     private SurfaceView surfaceView;
-    private boolean isRendering = false;
+    private volatile boolean isRendering = false;
 
     private LinearLayout unpackLayout;
     private ProgressBar unpackProgress;
@@ -93,15 +98,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     private LinearLayout loggingFiltersLayout;
     private LinearLayout loggingSpamFiltersLayout;
     private LinearLayout gpuOffloadLayout;
-    private android.widget.CheckBox ignoreIpaCheckbox;
     private android.widget.CheckBox onScreenDebugOverlayCheckbox;
     private android.widget.CheckBox showPerfOverlayCheckbox;
-    private android.widget.CheckBox cpuRenderCheckbox;
     private android.widget.CheckBox nativeRootMmapCheckbox;
     private android.widget.Button esModeButton;
     private List<AppInfo> installedApps = new ArrayList<>();
-    private java.util.HashSet<String> deletedInThisSession = new java.util.HashSet<>();
-    private java.util.HashMap<String, String> availableIpas = new java.util.HashMap<>();
 
     private float scaleFactorX = 1f;
     private float scaleFactorY = 1f;
@@ -149,10 +150,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
     private static final String WORK_DIR = Environment.getExternalStorageDirectory() + "/DamnWrapper32_ARMv7/";
     private static final String APPS_DIR = WORK_DIR + "apps/";
-    private static final String APPS_INSTALLED_DIR = WORK_DIR + "apps_installed/";
     private static final String SETUP_DIR = WORK_DIR + "setup/";
 
-    public native void initWrapper(String workDir, String appBundlePath, String bundleId, boolean logRender, boolean logSound, boolean logFs, boolean logNet, boolean logTodo, boolean logRenderDebug, boolean logFuncList, boolean logHiddenClasses, boolean logOther, int spamFiltersMask, boolean onScreenDebugOverlay, boolean showPerfOverlay, boolean nativeRootMmap, int resWidth, int resHeight, int esMode, int gpuOffloadMask);
+    // Порядок задаёт номера битов в маске и должен совпадать с enum LogCat в main.cpp.
+    static final String[] LOG_CAT_KEYS = {"log_render", "log_render_dump", "log_sound", "log_fs", "log_mem",
+                                          "log_objc", "log_net", "log_todo", "log_diag", "log_game", "log_other"};
+    static final String[] LOG_SPAM_KEYS = {"spam_log_render", "spam_log_render_dump", "spam_log_sound", "spam_log_fs", "spam_log_mem",
+                                           "spam_log_objc", "spam_log_net", "spam_log_todo", "spam_log_diag", "spam_log_game", "spam_log_other"};
+    static final String[] LOG_CAT_NAMES = {"Render: GL, EGL, шейдеры", "Render dump: покадровый снимок GL-состояния",
+                                           "Sound: аудио и OpenAL", "File system: файловые операции",
+                                           "Memory: malloc/free гостя", "ObjC: вызовы сообщений",
+                                           "Network, Bluetooth, GPS", "TODO: заглушки и нереализованное",
+                                           "Diag: списки функций и классов", "Game: вывод самой игры (printf, NSLog)",
+                                           "Other: всё остальное"};
+
+    private int buildLogMask() {
+        android.content.SharedPreferences prefs = getSharedPreferences("DamnPrefs", MODE_PRIVATE);
+        int m = 0;
+        for (int j = 0; j < LOG_CAT_KEYS.length; j++) if (prefs.getBoolean(LOG_CAT_KEYS[j], false)) m |= (1 << j);
+        return m;
+    }
+
+    private int buildSpamMask() {
+        android.content.SharedPreferences prefs = getSharedPreferences("DamnPrefs", MODE_PRIVATE);
+        int m = 0;
+        for (int j = 0; j < LOG_SPAM_KEYS.length; j++) if (prefs.getBoolean(LOG_SPAM_KEYS[j], true)) m |= (1 << j);
+        return m;
+    }
+
+    public native void initWrapper(String workDir, String sandboxRoot, String appBundlePath, String bundleId, int logMask, int spamMask, boolean onScreenDebugOverlay, boolean showPerfOverlay, boolean nativeRootMmap, int resWidth, int resHeight, int esMode, int gpuOffloadMask);
+    public native void setLogUiVisible(boolean visible);
     public native void onSurfaceCreated(android.view.Surface surface);
     public native void onSurfaceChanged(int width, int height);
     public native void onTouchEventNative(int actionMasked, int pointerId, float x, float y);
@@ -360,8 +387,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         loggingFiltersLayout.setBackgroundColor(Color.BLACK);
         loggingFiltersLayout.setVisibility(View.GONE);
 
-        String[] filterNames = {"Render", "Sound", "File system", "Network, Bluetooth, GPS", "TODO, unimplemented, stubs", "Render debug logs (Outdated, OnScreen overlay replaced it partically)", "Functions list in logs", "Hidden classes list in logs", "Other"};
-        String[] filterKeys = {"log_render", "log_sound", "log_fs", "log_net", "log_todo", "log_render_debug", "log_func_list", "log_hidden_classes", "log_other"};
+        String[] filterNames = LOG_CAT_NAMES;
+        String[] filterKeys = LOG_CAT_KEYS;
 
         for (int i = 0; i < filterNames.length; i++) {
             android.widget.CheckBox cb = new android.widget.CheckBox(this);
@@ -395,7 +422,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         loggingSpamFiltersLayout.setBackgroundColor(Color.BLACK);
         loggingSpamFiltersLayout.setVisibility(View.GONE);
 
-        String[] spamFilterKeys = {"spam_log_render", "spam_log_sound", "spam_log_fs", "spam_log_net", "spam_log_todo", "spam_log_render_debug", "spam_log_func_list", "spam_log_hidden_classes", "spam_log_other"};
+        String[] spamFilterKeys = LOG_SPAM_KEYS;
 
         for (int i = 0; i < filterNames.length; i++) {
             android.widget.CheckBox cb = new android.widget.CheckBox(this);
@@ -468,14 +495,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
             settingsLayout.setVisibility(View.VISIBLE);
         });
 
-        ignoreIpaCheckbox = new android.widget.CheckBox(this);
-        ignoreIpaCheckbox.setText("Ignore IPA in /apps for installation with same version and package name");
-        ignoreIpaCheckbox.setTextColor(Color.WHITE);
-        ignoreIpaCheckbox.setChecked(getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("ignore_same_ipa", true));
-        ignoreIpaCheckbox.setOnCheckedChangeListener((btnView, isChecked) -> {
-            getSharedPreferences("DamnPrefs", MODE_PRIVATE).edit().putBoolean("ignore_same_ipa", isChecked).apply();
-        });
-
         onScreenDebugOverlayCheckbox = new android.widget.CheckBox(this);
         onScreenDebugOverlayCheckbox.setText("OnScreen debug overlay");
         onScreenDebugOverlayCheckbox.setTextColor(Color.WHITE);
@@ -491,12 +510,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         showPerfOverlayCheckbox.setOnCheckedChangeListener((btnView, isChecked) -> {
             getSharedPreferences("DamnPrefs", MODE_PRIVATE).edit().putBoolean("show_perf_overlay", isChecked).apply();
         });
-
-        cpuRenderCheckbox = new android.widget.CheckBox(this);
-        cpuRenderCheckbox.setText("Program CPU render (Slow but safe)");
-        cpuRenderCheckbox.setTextColor(Color.GRAY);
-        cpuRenderCheckbox.setChecked(true);
-        cpuRenderCheckbox.setEnabled(false);
 
         nativeRootMmapCheckbox = new android.widget.CheckBox(this);
         nativeRootMmapCheckbox.setText("Native ROOT mmap (Better compatability but need root access)");
@@ -576,10 +589,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         settingsLayout.addView(loggingSpamFiltersButton);
         settingsLayout.addView(gpuOffloadButton);
         settingsLayout.addView(resLayout);
-        settingsLayout.addView(ignoreIpaCheckbox);
         settingsLayout.addView(onScreenDebugOverlayCheckbox);
         settingsLayout.addView(showPerfOverlayCheckbox);
-        settingsLayout.addView(cpuRenderCheckbox);
         settingsLayout.addView(nativeRootMmapCheckbox);
         settingsLayout.addView(esModeButton);
         settingsLayout.addView(settingsBackButton, backParams);
@@ -726,9 +737,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     }
 
     private void setupDirectories() {
+        try {
+            boolean esm = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) && Environment.isExternalStorageManager();
+            boolean mk = new File(WORK_DIR).mkdirs();
+            File probe = new File(WORK_DIR + "__java_probe.txt");
+            java.io.FileOutputStream p = new java.io.FileOutputStream(probe);
+            p.write("ok".getBytes()); p.close();
+            Log.e("DW32PROBE", "isExternalStorageManager=" + esm + " workMkdirs=" + mk +
+                  " workExists=" + new File(WORK_DIR).exists() + " probeWritten=" + probe.exists() +
+                  " canWrite=" + new File(WORK_DIR).canWrite());
+        } catch (Exception e) {
+            Log.e("DW32PROBE", "ПРОБНАЯ ЗАПИСЬ УПАЛА: " + e);
+        }
         new File(WORK_DIR).mkdirs();
         new File(APPS_DIR).mkdirs();
-        new File(APPS_INSTALLED_DIR).mkdirs();
         new File(SETUP_DIR).mkdirs();
         try {
             File optionsFile = new File(WORK_DIR + "damn32_options.txt");
@@ -802,7 +824,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         } catch (Exception e) {}
     }
 
-    private void startGameThread(String workDir, String appDirPath, String bundleId, boolean logRender, boolean logSound, boolean logFs, boolean logNet, boolean logTodo, boolean logRenderDebug, boolean logFuncList, boolean logHiddenClasses, boolean logOther, int spamMask, boolean onScreenDebugOverlay, boolean showPerfOverlay, boolean nativeRootMmap, int targetW, int targetH, int esMode, int gpuOffloadMask) {
+    // Каталог приложения на /sdcard/Android/data примонтирован f2fs в обход FUSE,
+    // поэтому mkdir там работает, а на /sdcard MediaProvider отдаёт EEXIST для удалённых путей.
+    private String sandboxRootFor(String bundleId) {
+        File base = getExternalFilesDir(null);
+        if (base == null) base = getFilesDir();
+        return new File(base, "sandbox/" + bundleId).getAbsolutePath() + "/";
+    }
+
+    private void startGameThread(String workDir, String appDirPath, String bundleId, int logMask, int spamMask, boolean onScreenDebugOverlay, boolean showPerfOverlay, boolean nativeRootMmap, int targetW, int targetH, int esMode, int gpuOffloadMask) {
         new Thread(() -> {
             if (nativeRootMmap) {
                 try {
@@ -821,39 +851,161 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
                     return;
                 }
             }
-            initWrapper(workDir, appDirPath, bundleId, logRender, logSound, logFs, logNet, logTodo, logRenderDebug, logFuncList, logHiddenClasses, logOther, spamMask, onScreenDebugOverlay, showPerfOverlay, nativeRootMmap, targetW, targetH, esMode, gpuOffloadMask);
+            String sb = sandboxRootFor(bundleId);
+            try {
+                new File(sb + "Documents").mkdirs();
+                new File(sb + "tmp").mkdirs();
+                new File(sb + "Library/Caches").mkdirs();
+                new File(sb + "Library/Preferences").mkdirs();
+                Log.e("DW32PROBE", "sandbox базовый создан: " + new File(sb + "Documents").exists() + " -> " + sb);
+            } catch (Exception e) {
+                Log.e("DW32PROBE", "sandbox mkdirs упал: " + e);
+            }
+            initWrapper(workDir, sb, appDirPath, bundleId, logMask, spamMask, onScreenDebugOverlay, showPerfOverlay, nativeRootMmap, targetW, targetH, esMode, gpuOffloadMask);
         }).start();
     }
 
-    private AppInfo peekIpaInfo(File zipFile) {
-        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(zipFile)) {
+    private static int countSlashes(String s) {
+        int n = 0;
+        for (int i = 0; i < s.length(); i++) if (s.charAt(i) == '/') n++;
+        return n;
+    }
+
+    private void copyZipEntry(java.util.zip.ZipFile zip, java.util.zip.ZipEntry entry, File dst) throws Exception {
+        dst.getParentFile().mkdirs();
+        try (InputStream is = zip.getInputStream(entry); FileOutputStream fos = new FileOutputStream(dst)) {
+            byte[] buffer = new byte[65536]; int len;
+            while ((len = is.read(buffer)) > 0) fos.write(buffer, 0, len);
+        }
+    }
+
+    // Имя иконки по Info.plist, иначе типовые варианты.
+    private java.util.List<String> iconCandidates(HashMap<String, Object> plist) {
+        java.util.List<String> names = new ArrayList<>();
+        String iconName = (String) plist.get("CFBundleIconFile");
+        if (iconName == null && plist.get("CFBundleIcons") instanceof HashMap) {
+            HashMap icons = (HashMap) plist.get("CFBundleIcons");
+            if (icons.get("CFBundlePrimaryIcon") instanceof HashMap) {
+                HashMap primary = (HashMap) icons.get("CFBundlePrimaryIcon");
+                if (primary.get("CFBundleIconFiles") instanceof ArrayList) {
+                    ArrayList list = (ArrayList) primary.get("CFBundleIconFiles");
+                    if (!list.isEmpty()) iconName = (String) list.get(list.size() - 1);
+                }
+            }
+        }
+        if (iconName != null) names.add(iconName.endsWith(".png") ? iconName : iconName + ".png");
+        names.add("Icon@2x.png"); names.add("Icon-72.png"); names.add("Icon-72@2x.png");
+        names.add("Icon.png"); names.add("icon.png");
+        return names;
+    }
+
+    private void fillCommonInfo(AppInfo info, HashMap<String, Object> plist, String fallbackName, String prefsKey) {
+        info.bundleId = (String) plist.getOrDefault("CFBundleIdentifier", "unknown");
+        info.version = (String) plist.getOrDefault("CFBundleVersion", "1.0");
+        info.name = (String) plist.getOrDefault("CFBundleDisplayName", plist.getOrDefault("CFBundleName", fallbackName));
+        String customName = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getString("custom_name_" + prefsKey, null);
+        if (customName != null) info.name = customName;
+        info.minOS = (String) plist.getOrDefault("MinimumOSVersion", "Unknown");
+        info.targetOS = (String) plist.getOrDefault("DTPlatformVersion", "Unknown");
+        Object familyObj = plist.get("UIDeviceFamily");
+        if (familyObj instanceof ArrayList) {
+            ArrayList famList = (ArrayList) familyObj;
+            boolean hasPhone = famList.contains(1) || famList.contains(1L) || famList.contains("1");
+            boolean hasPad = famList.contains(2) || famList.contains(2L) || famList.contains("2");
+            if (hasPhone && hasPad) info.deviceFamily = "Universal";
+            else if (hasPad) info.deviceFamily = "iPad";
+            else if (hasPhone) info.deviceFamily = "iPhone";
+            else info.deviceFamily = "Unknown";
+        } else if (familyObj != null) {
+            String f = familyObj.toString();
+            if (f.equals("1")) info.deviceFamily = "iPhone";
+            else if (f.equals("2")) info.deviceFamily = "iPad";
+            else info.deviceFamily = f;
+        } else {
+            info.deviceFamily = "iPhone";
+        }
+    }
+
+    // Игра берётся прямо из .ipa: распаковки нет, наружу вытаскивается только иконка.
+    private AppInfo readIpaApp(File ipa) {
+        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(ipa)) {
+            java.util.zip.ZipEntry plistEntry = null;
+            String appPrefix = null;
             java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
             while (entries.hasMoreElements()) {
                 java.util.zip.ZipEntry entry = entries.nextElement();
-                String entryName = entry.getName();
-                if (entryName.startsWith("Payload/") && entryName.endsWith(".app/Info.plist")) {
-                    int slashes = 0;
-                    for (int i = 0; i < entryName.length(); i++) {
-                        if (entryName.charAt(i) == '/') slashes++;
-                    }
-                    if (slashes == 2) {
-                        File tempPlist = new File(APPS_INSTALLED_DIR, "temp_Info.plist");
-                        try (InputStream is = zip.getInputStream(entry); FileOutputStream fos = new FileOutputStream(tempPlist)) {
-                            byte[] buffer = new byte[8192]; int len;
-                            while ((len = is.read(buffer)) > 0) fos.write(buffer, 0, len);
-                        }
-                        HashMap<String, Object> plist = BplistParser.parse(tempPlist);
-                        tempPlist.delete();
-                        
-                        AppInfo info = new AppInfo();
-                        info.bundleId = (String) plist.getOrDefault("CFBundleIdentifier", "unknown.app");
-                        info.version = (String) plist.getOrDefault("CFBundleVersion", "1.0");
-                        info.name = (String) plist.getOrDefault("CFBundleDisplayName", plist.getOrDefault("CFBundleName", "Unknown"));
-                        return info;
-                    }
+                String n = entry.getName();
+                if (n.startsWith("Payload/") && n.endsWith(".app/Info.plist") && countSlashes(n) == 2) {
+                    plistEntry = entry;
+                    appPrefix = n.substring(0, n.length() - "Info.plist".length());
+                    break;
                 }
             }
-        } catch (Exception e) {}
+            if (plistEntry == null) return null;
+
+            File tempPlist = new File(getCacheDir(), "temp_Info.plist");
+            copyZipEntry(zip, plistEntry, tempPlist);
+            HashMap<String, Object> plist = BplistParser.parse(tempPlist);
+            tempPlist.delete();
+
+            AppInfo info = new AppInfo();
+            info.appDirPath = ipa.getAbsolutePath();
+            info.internalName = appPrefix.substring("Payload/".length(), appPrefix.length() - 1);
+            fillCommonInfo(info, plist, ipa.getName(), ipa.getName());
+            info.iconPath = extractIpaIcon(zip, ipa, appPrefix, plist);
+            return info;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String extractIpaIcon(java.util.zip.ZipFile zip, File ipa, String appPrefix, HashMap<String, Object> plist) {
+        File cacheDir = new File(getCacheDir(), "icons");
+        cacheDir.mkdirs();
+        File out = new File(cacheDir, ipa.getName() + "_" + ipa.lastModified() + ".png");
+        if (out.exists()) return out.getAbsolutePath();
+
+        java.util.List<String> candidates = new ArrayList<>();
+        candidates.add("iTunesArtwork");
+        candidates.add(appPrefix + "iTunesArtwork");
+        for (String n : iconCandidates(plist)) candidates.add(appPrefix + n);
+
+        for (String name : candidates) {
+            java.util.zip.ZipEntry e = zip.getEntry(name);
+            if (e == null) continue;
+            try {
+                copyZipEntry(zip, e, out);
+                return out.getAbsolutePath();
+            } catch (Exception ex) {}
+        }
+        return null;
+    }
+
+    // Рядом с .ipa допустима и распакованная папка с Payload/<Имя>.app — например, мод.
+    private AppInfo readUnpackedApp(File gameFolder) {
+        File payload = new File(gameFolder, "Payload");
+        File[] children = payload.listFiles();
+        if (children == null) return null;
+        for (File appDir : children) {
+            if (!appDir.getName().endsWith(".app")) continue;
+            HashMap<String, Object> plist = BplistParser.parse(new File(appDir, "Info.plist"));
+            AppInfo info = new AppInfo();
+            info.appDirPath = appDir.getAbsolutePath();
+            info.internalName = appDir.getName();
+            fillCommonInfo(info, plist, gameFolder.getName(), gameFolder.getName());
+
+            File artworkRoot = new File(gameFolder, "iTunesArtwork");
+            File artworkApp = new File(appDir, "iTunesArtwork");
+            if (artworkRoot.exists()) info.iconPath = artworkRoot.getAbsolutePath();
+            else if (artworkApp.exists()) info.iconPath = artworkApp.getAbsolutePath();
+            else {
+                for (String n : iconCandidates(plist)) {
+                    File f = new File(appDir, n);
+                    if (f.exists()) { info.iconPath = f.getAbsolutePath(); break; }
+                }
+            }
+            return info;
+        }
         return null;
     }
 
@@ -896,55 +1048,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
                 } else {
                     getSharedPreferences("DamnPrefs", MODE_PRIVATE).edit().putBoolean("novideo_cmd", noVideo).apply();
                     if (targetApp != null) {
-                        File targetDir = new File(APPS_INSTALLED_DIR, targetApp);
-                    if (targetDir.exists() && targetDir.isDirectory()) {
-                        File payload = new File(targetDir, "Payload");
-                        File appDirToLaunch = null;
-                        if (payload.exists() && payload.listFiles() != null) {
-                            for (File appDir : payload.listFiles()) {
-                                if (appDir.getName().endsWith(".app")) {
-                                    appDirToLaunch = appDir;
-                                    break;
-                                }
-                            }
-                        }
-                        if (appDirToLaunch != null) {
-                            HashMap<String, Object> plist = BplistParser.parse(new File(appDirToLaunch, "Info.plist"));
-                            String bundleId = (String) plist.getOrDefault("CFBundleIdentifier", "unknown");
-                            File finalAppDir = appDirToLaunch;
-                            runOnUiThread(() -> {
-                                if (bottomButtonsLayout != null) bottomButtonsLayout.setVisibility(View.GONE);
-                                scrollView.setVisibility(View.VISIBLE);
-                                logTextView.setText("");
-                                try { new File(WORK_DIR + "damn32_log.txt").delete(); } catch(Exception e) {}
-                                addLog("=== Запуск DamnWrapper32 (ARMv7) (Auto-launch) ===");
-                                addLog("Picked: " + finalAppDir.getAbsolutePath());
-                                boolean logRender = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_render", false);
-                                boolean logSound = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_sound", false);
-                                boolean logFs = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_fs", false);
-                                boolean logNet = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_net", false);
-                                boolean logTodo = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_todo", false);
-                                boolean logRenderDebug = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_render_debug", false);
-                                boolean logFuncList = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_func_list", false);
-                                boolean logHiddenClasses = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_hidden_classes", false);
-                                boolean logOther = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_other", false);
-                                boolean onScreenDebugOverlay = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("onscreen_debug_overlay", false);
-                                boolean showPerfOverlay = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("show_perf_overlay", false);
-                                boolean nativeRootMmap = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("native_root_mmap", false);
-                                int targetW = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getInt("res_width", 480);
-                                int targetH = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getInt("res_height", 320);
-                                int esMode = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getInt("es_mode", 2);
-                                int tempSpamMask = 0;
-                                String[] sfKeys = {"spam_log_render", "spam_log_sound", "spam_log_fs", "spam_log_net", "spam_log_todo", "spam_log_render_debug", "spam_log_func_list", "spam_log_hidden_classes", "spam_log_other"};
-                                for (int j = 0; j < 9; j++) if (getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean(sfKeys[j], true)) tempSpamMask |= (1 << j);
-                                final int finalSpamMask = tempSpamMask;
-                                int gpuMask = 0;
-                                for (int j = 0; j < 7; j++) if (getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("gpu_bit_" + j, true)) gpuMask |= (1 << j);
-                                startGameThread(WORK_DIR, finalAppDir.getAbsolutePath(), bundleId, logRender, logSound, logFs, logNet, logTodo, logRenderDebug, logFuncList, logHiddenClasses, logOther, finalSpamMask, onScreenDebugOverlay, showPerfOverlay, nativeRootMmap, targetW, targetH, esMode, gpuMask);
-                            });
+                        File target = new File(APPS_DIR, targetApp);
+                        AppInfo autoInfo = null;
+                        if (target.isFile() && targetApp.toLowerCase(Locale.US).endsWith(".ipa")) autoInfo = readIpaApp(target);
+                        else if (target.isDirectory()) autoInfo = readUnpackedApp(target);
+                        if (autoInfo != null) {
+                            final AppInfo finalInfo = autoInfo;
+                            runOnUiThread(() -> launchApp(finalInfo, true));
                             return;
                         }
-                    }
                         final String failMsg = "Command error: no app " + targetApp + " founded";
                         runOnUiThread(() -> android.widget.Toast.makeText(MainActivity.this, failMsg, android.widget.Toast.LENGTH_LONG).show());
                     }
@@ -952,176 +1064,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
             }
         } catch (Exception e) {}
 
-        availableIpas.clear();
-        File appsDir = new File(APPS_DIR);
-        File[] ipaFiles = appsDir.listFiles((dir, name) -> name.endsWith(".ipa"));
-
-        if (ipaFiles != null && ipaFiles.length > 0) {
-            android.content.SharedPreferences prefs = getSharedPreferences("DamnPrefs", MODE_PRIVATE);
-            int deleteChoice = prefs.getInt("delete_ipa", -1);
-            
-            if (deleteChoice == -1) {
-                runOnUiThread(() -> {
-                    new android.app.AlertDialog.Builder(MainActivity.this)
-                        .setTitle("Delete IPA's after installation?")
-                        .setMessage("(This applies to all IPA files)")
-                        .setCancelable(false)
-                        .setPositiveButton("Yes", (d, w) -> { prefs.edit().putInt("delete_ipa", 1).apply(); new Thread(this::scanAndUnpackApps).start(); })
-                        .setNegativeButton("No", (d, w) -> { prefs.edit().putInt("delete_ipa", 0).apply(); new Thread(this::scanAndUnpackApps).start(); })
-                        .show();
-                });
-                return; // Ждем выбора пользователя
-            }
-
-            for (File targetIpa : ipaFiles) {
-                AppInfo peekInfo = peekIpaInfo(targetIpa);
-                if (peekInfo != null) {
-                    availableIpas.put(peekInfo.bundleId + "_" + peekInfo.version, targetIpa.getAbsolutePath());
-                    if (deletedInThisSession.contains(peekInfo.bundleId + "_" + peekInfo.version)) {
-                        continue;
-                    }
-
-                    File finalDir = new File(APPS_INSTALLED_DIR, peekInfo.bundleId + "_" + peekInfo.version);
-                    boolean ignoreSameIpa = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("ignore_same_ipa", true);
-                    if (finalDir.exists() && ignoreSameIpa) {
-                        if (deleteChoice == 1) targetIpa.delete();
-                        continue; // Пропускаем полную распаковку, приложение этой версии уже стоит
-                    }
-                    
-                    runOnUiThread(() -> { 
-                        unpackLayout.setVisibility(View.VISIBLE);
-                        if (bottomButtonsLayout != null) bottomButtonsLayout.setVisibility(View.GONE); // Прячем кнопки при распаковке
-                        unpackText.setText("Unpacking: " + targetIpa.getName()); 
-                        unpackAppName.setText("App: " + peekInfo.name);
-                        unpackPkgName.setText("Package: " + peekInfo.bundleId);
-                        unpackVersion.setText("Version: " + peekInfo.version);
-                        unpackProgress.setProgress(0); 
-                    });
-                } else {
-                    runOnUiThread(() -> { 
-                        unpackLayout.setVisibility(View.VISIBLE);
-                        if (bottomButtonsLayout != null) bottomButtonsLayout.setVisibility(View.GONE); // Прячем кнопки при распаковке
-                        unpackText.setText("Unpacking: " + targetIpa.getName()); 
-                        unpackAppName.setText(""); unpackPkgName.setText(""); unpackVersion.setText("");
-                        unpackProgress.setProgress(0); 
-                    });
-                }
-
-                File tempExtractDir = new File(APPS_INSTALLED_DIR, "temp_extract_" + System.currentTimeMillis());
-                unzipWithProgress(targetIpa, tempExtractDir);
-                
-                File payloadDir = new File(tempExtractDir, "Payload");
-                if (payloadDir.exists() && payloadDir.listFiles() != null) {
-                    for (File appDir : payloadDir.listFiles()) {
-                        if (appDir.getName().endsWith(".app")) {
-                            HashMap<String, Object> plist = BplistParser.parse(new File(appDir, "Info.plist"));
-                            String bundleId = (String) plist.getOrDefault("CFBundleIdentifier", "unknown.app");
-                            String version = (String) plist.getOrDefault("CFBundleVersion", "1.0");
-                            File finalDir = new File(APPS_INSTALLED_DIR, bundleId + "_" + version);
-                            
-                            if (finalDir.exists()) deleteRecursive(finalDir);
-                            tempExtractDir.renameTo(finalDir);
-                            if (deleteChoice == 1) targetIpa.delete();
-                            break;
-                        }
-                    }
-                }
-                if (tempExtractDir.exists()) deleteRecursive(tempExtractDir);
-            }
-        }
-
-        // Сканируем установленные
+        // Игры лежат прямо в apps: либо .ipa (читается виртуальным диском), либо распакованная папка.
         installedApps.clear();
-        File installedDir = new File(APPS_INSTALLED_DIR);
-        File[] gameFolders = installedDir.listFiles();
-
-        android.content.SharedPreferences prefs = getSharedPreferences("DamnPrefs", MODE_PRIVATE);
-        java.util.Map<String, ?> allEntries = prefs.getAll();
-        for (java.util.Map.Entry<String, ?> entry : allEntries.entrySet()) {
-            if (entry.getKey().startsWith("custom_name_")) {
-                String folderName = entry.getKey().substring(12);
-                if (!new File(APPS_INSTALLED_DIR, folderName).exists()) {
-                    prefs.edit().remove(entry.getKey()).apply();
-                }
+        File appsDir = new File(APPS_DIR);
+        File[] entries = appsDir.listFiles();
+        if (entries != null) {
+            java.util.Arrays.sort(entries, (a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+            java.util.HashSet<String> present = new java.util.HashSet<>();
+            for (File f : entries) {
+                AppInfo info = null;
+                if (f.isFile() && f.getName().toLowerCase(Locale.US).endsWith(".ipa")) info = readIpaApp(f);
+                else if (f.isDirectory()) info = readUnpackedApp(f);
+                if (info == null) continue;
+                info.sourcePath = f.getAbsolutePath();
+                present.add(f.getName());
+                installedApps.add(info);
             }
-        }
-
-        if (gameFolders != null) {
-            for (File gameFolder : gameFolders) {
-                if (!gameFolder.isDirectory()) continue;
-                File payload = new File(gameFolder, "Payload");
-                if (payload.exists() && payload.listFiles() != null) {
-                    for (File appDir : payload.listFiles()) {
-                        if (appDir.getName().endsWith(".app")) {
-                            HashMap<String, Object> plist = BplistParser.parse(new File(appDir, "Info.plist"));
-                            AppInfo info = new AppInfo();
-                            info.bundleId = (String) plist.getOrDefault("CFBundleIdentifier", "unknown");
-                            info.version = (String) plist.getOrDefault("CFBundleVersion", "1.0");
-                            info.name = (String) plist.getOrDefault("CFBundleDisplayName", plist.getOrDefault("CFBundleName", gameFolder.getName()));
-                            String customName = prefs.getString("custom_name_" + gameFolder.getName(), null);
-                            if (customName != null) info.name = customName;
-                            info.appDirPath = appDir.getAbsolutePath();
-                            info.internalName = appDir.getName();
-                            info.minOS = (String) plist.getOrDefault("MinimumOSVersion", "Unknown");
-                            info.targetOS = (String) plist.getOrDefault("DTPlatformVersion", "Unknown");
-                            Object familyObj = plist.get("UIDeviceFamily");
-                            if (familyObj instanceof ArrayList) {
-                                ArrayList famList = (ArrayList) familyObj;
-                                boolean hasPhone = famList.contains(1) || famList.contains(1L) || famList.contains("1");
-                                boolean hasPad = famList.contains(2) || famList.contains(2L) || famList.contains("2");
-                                if (hasPhone && hasPad) info.deviceFamily = "Universal";
-                                else if (hasPad) info.deviceFamily = "iPad";
-                                else if (hasPhone) info.deviceFamily = "iPhone";
-                                else info.deviceFamily = "Unknown";
-                            } else if (familyObj != null) {
-                                String f = familyObj.toString();
-                                if (f.equals("1")) info.deviceFamily = "iPhone";
-                                else if (f.equals("2")) info.deviceFamily = "iPad";
-                                else if (f.equals("Universal")) info.deviceFamily = "Universal";
-                                else info.deviceFamily = f;
-                            } else {
-                                info.deviceFamily = "iPhone";
-                            }
-                            
-                            // Поиск иконки: Приоритет на iTunesArtwork (как правило, не CgBI и в высоком разрешении)
-                            File artworkRoot = new File(gameFolder, "iTunesArtwork");
-                            File artworkApp = new File(appDir, "iTunesArtwork");
-                            if (artworkRoot.exists()) {
-                                info.iconPath = artworkRoot.getAbsolutePath();
-                            } else if (artworkApp.exists()) {
-                                info.iconPath = artworkApp.getAbsolutePath();
-                            } else {
-                                String iconName = (String) plist.get("CFBundleIconFile");
-                                if (iconName == null && plist.get("CFBundleIcons") instanceof HashMap) {
-                                    HashMap icons = (HashMap) plist.get("CFBundleIcons");
-                                    if (icons.get("CFBundlePrimaryIcon") instanceof HashMap) {
-                                        HashMap primary = (HashMap) icons.get("CFBundlePrimaryIcon");
-                                        if (primary.get("CFBundleIconFiles") instanceof ArrayList) {
-                                            ArrayList list = (ArrayList) primary.get("CFBundleIconFiles");
-                                            if (!list.isEmpty()) iconName = (String) list.get(list.size() - 1);
-                                        }
-                                    }
-                                }
-                                if (iconName != null) {
-                                    if (!iconName.endsWith(".png")) iconName += ".png";
-                                    info.iconPath = new File(appDir, iconName).getAbsolutePath();
-                                }
-                                
-                                // Если по plist не нашлось или файла нет, перебираем жестко заданные имена
-                                if (info.iconPath == null || !new File(info.iconPath).exists()) {
-                                    String[] fallbacks = {"Icon@2x.png", "Icon-72.png", "Icon-72@2x.png", "Icon.png", "icon.png"};
-                                    for (String f : fallbacks) {
-                                        File fallbackFile = new File(appDir, f);
-                                        if (fallbackFile.exists()) {
-                                            info.iconPath = fallbackFile.getAbsolutePath();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            installedApps.add(info);
-                        }
-                    }
+            android.content.SharedPreferences prefs = getSharedPreferences("DamnPrefs", MODE_PRIVATE);
+            for (java.util.Map.Entry<String, ?> e : prefs.getAll().entrySet()) {
+                if (e.getKey().startsWith("custom_name_") && !present.contains(e.getKey().substring(12))) {
+                    prefs.edit().remove(e.getKey()).apply();
                 }
             }
         }
@@ -1138,53 +1100,117 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         });
     }
 
-    private void unzipWithProgress(File zipFile, File targetDirectory) {
-        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(zipFile)) {
-            targetDirectory.mkdirs();
-            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
-            int totalFiles = zip.size();
-            java.util.concurrent.atomic.AtomicInteger processedFiles = new java.util.concurrent.atomic.AtomicInteger(0);
-            int[] lastReportedProgress = {0};
-            int processors = Math.max(2, Runtime.getRuntime().availableProcessors());
-            java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(processors);
-
-            while (entries.hasMoreElements()) {
-                java.util.zip.ZipEntry entry = entries.nextElement();
-                executor.execute(() -> {
-                    File file = new File(targetDirectory, entry.getName());
-                    if (entry.isDirectory()) {
-                        file.mkdirs();
-                    } else {
-                        file.getParentFile().mkdirs();
-                        try (InputStream is = zip.getInputStream(entry);
-                             FileOutputStream fos = new FileOutputStream(file)) {
-                            byte[] buffer = new byte[65536]; int len;
-                            while ((len = is.read(buffer)) > 0) fos.write(buffer, 0, len);
-                        } catch (Exception e) {}
-                    }
-                    int current = processedFiles.incrementAndGet();
-                    int progress = (int) ((current * 100f) / totalFiles);
-                    synchronized (lastReportedProgress) {
-                        if (progress > lastReportedProgress[0]) {
-                            lastReportedProgress[0] = progress;
-                            runOnUiThread(() -> unpackProgress.setProgress(progress));
-                        }
-                    }
-                });
+    // Сжатый .ipa читать дорого: inflate на каждое чтение. Поэтому при запуске архив
+    // один раз перепаковывается в STORED — дальше игра читает данные как с обычного диска.
+    private boolean ipaNeedsRepack(File ipa) {
+        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(ipa)) {
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zip.entries();
+            while (en.hasMoreElements()) {
+                if (en.nextElement().getMethod() != java.util.zip.ZipEntry.STORED) return true;
             }
-            executor.shutdown();
-            executor.awaitTermination(1, java.util.concurrent.TimeUnit.HOURS);
         } catch (Exception e) {}
+        return false;
     }
 
-    private void deleteRecursive(File fileOrDirectory) {
-        if (fileOrDirectory.isDirectory())
-            for (File child : fileOrDirectory.listFiles()) deleteRecursive(child);
-        fileOrDirectory.delete();
+    private void repackStored(File ipa) {
+        File tmp = new File(ipa.getParentFile(), ipa.getName() + ".opt");
+        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(ipa);
+             java.util.zip.ZipOutputStream out = new java.util.zip.ZipOutputStream(
+                 new java.io.BufferedOutputStream(new FileOutputStream(tmp), 1 << 20))) {
+            out.setMethod(java.util.zip.ZipOutputStream.STORED);
+            int total = Math.max(1, zip.size());
+            int done = 0, lastPct = -1;
+            byte[] buf = new byte[1 << 16];
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zip.entries();
+            while (en.hasMoreElements()) {
+                java.util.zip.ZipEntry e = en.nextElement();
+                java.util.zip.ZipEntry ne = new java.util.zip.ZipEntry(e.getName());
+                ne.setMethod(java.util.zip.ZipEntry.STORED);
+                ne.setTime(e.getTime());
+                long size = e.isDirectory() ? 0 : e.getSize();
+                long crc = e.getCrc();
+                if (size < 0 || crc < 0) throw new java.io.IOException("нет размера/CRC у " + e.getName());
+                ne.setSize(size);
+                ne.setCompressedSize(size);
+                ne.setCrc(crc);
+                out.putNextEntry(ne);
+                if (!e.isDirectory()) {
+                    try (InputStream is = zip.getInputStream(e)) {
+                        int r;
+                        while ((r = is.read(buf)) > 0) out.write(buf, 0, r);
+                    }
+                }
+                out.closeEntry();
+                done++;
+                int pct = done * 100 / total;
+                if (pct != lastPct && pct % 10 == 0) {
+                    lastPct = pct;
+                    final int p = pct;
+                    runOnUiThread(() -> addLog("IPA: перепаковка без сжатия " + p + "%"));
+                }
+            }
+        } catch (Exception ex) {
+            tmp.delete();
+            runOnUiThread(() -> addLog("IPA: перепаковка не удалась (" + ex + "), играем как есть"));
+            return;
+        }
+        File bak = new File(ipa.getAbsolutePath() + ".bak");
+        if (ipa.renameTo(bak)) {
+            if (tmp.renameTo(ipa)) bak.delete();
+            else { tmp.delete(); bak.renameTo(ipa); }
+        } else {
+            tmp.delete();
+        }
+    }
+
+    private void launchApp(AppInfo app, boolean autoLaunch) {
+        launcherGrid.setVisibility(View.GONE);
+        if (bottomButtonsLayout != null) bottomButtonsLayout.setVisibility(View.GONE);
+        scrollView.setVisibility(View.VISIBLE);
+        logTextView.setText("");
+        try { new File(WORK_DIR + "damn32_log.txt").delete(); } catch (Exception e) {}
+
+        android.content.SharedPreferences prefs = getSharedPreferences("DamnPrefs", MODE_PRIVATE);
+        addLog(autoLaunch ? "=== Запуск DamnWrapper32 (ARMv7) (Auto-launch) ===" : "=== Запуск DamnWrapper32 (ARMv7) ===");
+        addLog("Дата и время: " + new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault()).format(new Date()));
+        boolean nativeRootMmap = prefs.getBoolean("native_root_mmap", false);
+        if (nativeRootMmap) addLog("ВНИМАНИЕ: Включен Native root mmap! Игра будет загружена по оригинальным адресам.");
+        else addLog("Механизм Total Rebase активен, игра будет загружена по динамическому смещению.");
+        if (!new File(SETUP_DIR, "Roboto-VariableFont_wdth,wght.ttf").exists()) {
+            addLog("HLE: ОШИБКА загрузки TTF шрифта! Проверьте наличие в папке setup.");
+        }
+        addLog("Picked: " + app.appDirPath);
+        addLog("- Name: " + app.name);
+        addLog("- Version: " + app.version);
+        addLog("- Identifier: " + app.bundleId);
+        addLog("- Internal name (canonical): " + app.internalName);
+        addLog("- Minimum IOS version: " + app.minOS);
+        addLog("- Target IOS version: " + app.targetOS);
+        addLog("- Device family: " + app.deviceFamily);
+
+        final int finalLogMask = buildLogMask();
+        boolean onScreenDebugOverlay = prefs.getBoolean("onscreen_debug_overlay", false);
+        boolean showPerfOverlay = prefs.getBoolean("show_perf_overlay", false);
+        int targetW = prefs.getInt("res_width", 480);
+        int targetH = prefs.getInt("res_height", 320);
+        int esMode = prefs.getInt("es_mode", 2);
+        final int finalSpamMask = buildSpamMask();
+        int gpuMask = 0;
+        for (int j = 0; j < 7; j++) if (prefs.getBoolean("gpu_bit_" + j, true)) gpuMask |= (1 << j);
+        final int finalGpuMask = gpuMask;
+
+        new Thread(() -> {
+            File src = new File(app.appDirPath);
+            if (app.appDirPath.toLowerCase(Locale.US).endsWith(".ipa") && ipaNeedsRepack(src)) {
+                runOnUiThread(() -> addLog("IPA: сжатый архив, перепаковываю без сжатия — это разово"));
+                repackStored(src);
+            }
+            startGameThread(WORK_DIR, app.appDirPath, app.bundleId, finalLogMask, finalSpamMask, onScreenDebugOverlay, showPerfOverlay, nativeRootMmap, targetW, targetH, esMode, finalGpuMask);
+        }).start();
     }
 
     // Класс-модель игры
-    private static class AppInfo { String name, bundleId, version, iconPath, appDirPath, internalName, minOS, targetOS, deviceFamily; }
+    private static class AppInfo { String name, bundleId, version, iconPath, appDirPath, sourcePath, internalName, minOS, targetOS, deviceFamily; }
 
     // Адаптер сетки лаунчера
     private class AppsAdapter extends BaseAdapter {
@@ -1268,11 +1294,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
             layout.addView(iconContainer); layout.addView(name);
             
             layout.setOnLongClickListener(v -> {
-                boolean canReinstall = availableIpas.containsKey(app.bundleId + "_" + app.version);
-                String[] options = canReinstall ? new String[]{"Rename app", "Delete app", "Reinstall"} : new String[]{"Rename app", "Delete app"};
+                String prefsKey = new File(app.sourcePath).getName();
                 new android.app.AlertDialog.Builder(MainActivity.this)
                     .setTitle(app.name)
-                    .setItems(options, (dialog, which) -> {
+                    .setItems(new String[]{"Rename app", "Delete app"}, (dialog, which) -> {
                         if (which == 0) {
                             android.widget.EditText input = new android.widget.EditText(MainActivity.this);
                             input.setText(app.name);
@@ -1282,74 +1307,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
                                 .setPositiveButton("OK", (d, w) -> {
                                     String newName = input.getText().toString();
                                     getSharedPreferences("DamnPrefs", MODE_PRIVATE).edit()
-                                        .putString("custom_name_" + app.bundleId + "_" + app.version, newName).apply();
+                                        .putString("custom_name_" + prefsKey, newName).apply();
                                     app.name = newName;
                                     notifyDataSetChanged();
                                 })
                                 .setNegativeButton("Cancel", null)
                                 .show();
-                        } else if (which == 1) {
-                            deleteAppWithProgress(app, false);
-                        } else if (which == 2) {
-                            deleteAppWithProgress(app, true);
+                        } else {
+                            deleteAppWithProgress(app);
                         }
                     })
                     .show();
                 return true;
             });
 
-            layout.setOnClickListener(v -> {
-                launcherGrid.setVisibility(View.GONE);
-                if (bottomButtonsLayout != null) bottomButtonsLayout.setVisibility(View.GONE);
-                scrollView.setVisibility(View.VISIBLE); // Показываем логи
-                
-                logTextView.setText("");
-                try { new File(WORK_DIR + "damn32_log.txt").delete(); } catch(Exception e) {}
-                String currentDateAndTime = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault()).format(new Date());
-                addLog("=== Запуск DamnWrapper32 (ARMv7) ===");
-                addLog("Дата и время: " + currentDateAndTime);
-                boolean isNativeMmap = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("native_root_mmap", false);
-                if (isNativeMmap) {
-                    addLog("ВНИМАНИЕ: Включен Native root mmap! Игра будет загружена по оригинальным адресам.");
-                } else {
-                    addLog("Механизм Total Rebase активен, игра будет загружена по динамическому смещению.");
-                }
-
-                if (!new File(SETUP_DIR, "Roboto-VariableFont_wdth,wght.ttf").exists()) {
-                    addLog("HLE: ОШИБКА загрузки TTF шрифта! Проверьте наличие в папке setup.");
-                }
-                
-                addLog("Picked: " + app.appDirPath);
-                addLog("- Name: " + app.name);
-                addLog("- Version: " + app.version);
-                addLog("- Identifier: " + app.bundleId);
-                addLog("- Internal name (canonical): " + app.internalName);
-                addLog("- Minimum IOS version: " + app.minOS);
-                addLog("- Target IOS version: " + app.targetOS);
-                addLog("- Device family: " + app.deviceFamily);
-                boolean logRender = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_render", false);
-                boolean logSound = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_sound", false);
-                boolean logFs = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_fs", false);
-                boolean logNet = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_net", false);
-                boolean logTodo = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_todo", false);
-                boolean logRenderDebug = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_render_debug", false);
-                boolean logFuncList = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_func_list", false);
-                boolean logHiddenClasses = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_hidden_classes", false);
-                boolean logOther = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("log_other", false);
-                boolean onScreenDebugOverlay = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("onscreen_debug_overlay", false);
-                boolean showPerfOverlay = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("show_perf_overlay", false);
-                boolean nativeRootMmap = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("native_root_mmap", false);
-                int targetW = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getInt("res_width", 480);
-                int targetH = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getInt("res_height", 320);
-                int esMode = getSharedPreferences("DamnPrefs", MODE_PRIVATE).getInt("es_mode", 2);
-                int tempSpamMask = 0;
-                String[] sfKeys = {"spam_log_render", "spam_log_sound", "spam_log_fs", "spam_log_net", "spam_log_todo", "spam_log_render_debug", "spam_log_func_list", "spam_log_hidden_classes", "spam_log_other"};
-                for (int j = 0; j < 9; j++) if (getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean(sfKeys[j], true)) tempSpamMask |= (1 << j);
-                final int finalSpamMask = tempSpamMask;
-                int gpuMask = 0;
-                for (int j = 0; j < 7; j++) if (getSharedPreferences("DamnPrefs", MODE_PRIVATE).getBoolean("gpu_bit_" + j, true)) gpuMask |= (1 << j);
-                startGameThread(WORK_DIR, app.appDirPath, app.bundleId, logRender, logSound, logFs, logNet, logTodo, logRenderDebug, logFuncList, logHiddenClasses, logOther, finalSpamMask, onScreenDebugOverlay, showPerfOverlay, nativeRootMmap, targetW, targetH, esMode, gpuMask);
-            });
+            layout.setOnClickListener(v -> launchApp(app, false));
             return layout;
         }
 
@@ -1504,32 +1476,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         });
     }
 
-    private void deleteAppWithProgress(AppInfo app, boolean isReinstall) {
-        File targetDir = new File(APPS_INSTALLED_DIR, app.bundleId + "_" + app.version);
-        if (!targetDir.exists()) return;
-        
+    private void deleteAppWithProgress(AppInfo app) {
+        File target = new File(app.sourcePath);
+        if (!target.exists()) return;
+
         deleteLayout.setVisibility(View.VISIBLE);
         launcherGrid.setVisibility(View.GONE);
         if (bottomButtonsLayout != null) bottomButtonsLayout.setVisibility(View.GONE);
-        deleteText.setText(isReinstall ? "Reinstalling..." : "Deleting...");
+        deleteText.setText("Deleting...");
         deleteAppName.setText("App: " + app.name);
         deletePkgName.setText("Package: " + app.bundleId);
         deleteVersion.setText("Version: " + app.version);
         deleteProgress.setProgress(0);
 
         new Thread(() -> {
-            // counts[0] = total, counts[1] = deleted, counts[2] = lastReportedProgress
-            int[] counts = new int[]{0, 0, 0};
-            countFiles(targetDir, counts);
-            deleteFilesProgress(targetDir, counts);
-            targetDir.delete();
-            getSharedPreferences("DamnPrefs", MODE_PRIVATE).edit().remove("custom_name_" + app.bundleId + "_" + app.version).apply();
-            
-            if (isReinstall) {
-                deletedInThisSession.remove(app.bundleId + "_" + app.version);
-            } else {
-                deletedInThisSession.add(app.bundleId + "_" + app.version);
+            if (target.isDirectory()) {
+                // counts[0] = total, counts[1] = deleted, counts[2] = lastReportedProgress
+                int[] counts = new int[]{0, 0, 0};
+                countFiles(target, counts);
+                deleteFilesProgress(target, counts);
             }
+            target.delete();
+            getSharedPreferences("DamnPrefs", MODE_PRIVATE).edit().remove("custom_name_" + target.getName()).apply();
 
             runOnUiThread(() -> {
                 deleteLayout.setVisibility(View.GONE);
@@ -1562,12 +1530,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         }
     }
 
-    public void addLogFromNative(String msg) { 
-        runOnUiThread(() -> {
-            logTextView.append(msg + "\n");
-            scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
-            Log.d("DamnWrapper32_ARMv7", msg);
-        }); 
+    private final StringBuilder pendingLog = new StringBuilder();
+    private boolean logFlushScheduled = false;
+    private final Runnable logFlushTask = new Runnable() {
+        @Override public void run() {
+            String chunk;
+            synchronized (pendingLog) {
+                logFlushScheduled = false;
+                if (pendingLog.length() == 0) return;
+                chunk = pendingLog.toString();
+                pendingLog.setLength(0);
+            }
+            logTextView.append(chunk);
+            CharSequence all = logTextView.getText();
+            if (all.length() > 200000) {
+                logTextView.setText(all.subSequence(all.length() - 150000, all.length()));
+            }
+            scrollView.fullScroll(View.FOCUS_DOWN);
+        }
+    };
+
+    // Пачкой раз в 250 мс: построчный append в TextView через runOnUiThread затыкал поток игры
+    // насмерть (18 тыс. строк за прогон = 18 тыс. постов в UI-очередь).
+    public void addLogFromNative(String msg) {
+        if (isRendering) return; // лог-вью не на экране, вся история и так лежит в damn32_log.txt
+        synchronized (pendingLog) {
+            if (pendingLog.length() > 400000) return;
+            pendingLog.append(msg).append('\n');
+            if (logFlushScheduled) return;
+            logFlushScheduled = true;
+        }
+        logTextView.postDelayed(logFlushTask, 250);
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -1576,6 +1569,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
             if (isRendering) return;
             isRendering = true;
             addLog("Окно подготовлено. Ожидание вызовов отрисовки от игры...");
+            setLogUiVisible(false);
 
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
 
@@ -1762,6 +1756,118 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         }
     }
 
+    // Декодирует сжатый аудиофайл (m4a/AAC, mp3, ogg) в 16-битный PCM.
+    // Формат ответа: [0..3] частота, [4..7] число каналов, дальше сам PCM (всё little-endian).
+    public byte[] decodeAudioFileJava(String path) {
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(path);
+        } catch (Exception e) {
+            addLogFromNative("HLE_AUDIO_ERROR: MediaExtractor не открыл " + path + ": " + e);
+            extractor.release();
+            return null;
+        }
+        return decodeWithExtractor(extractor, path);
+    }
+
+    // Звук внутри .ipa: архив без сжатия, поэтому дорожка лежит непрерывным срезом
+    // и MediaExtractor читает её прямо из архива, без распаковки во временный файл.
+    public byte[] decodeAudioRangeJava(String archivePath, long offset, long length) {
+        MediaExtractor extractor = new MediaExtractor();
+        java.io.RandomAccessFile raf = null;
+        try {
+            raf = new java.io.RandomAccessFile(archivePath, "r");
+            extractor.setDataSource(raf.getFD(), offset, length);
+        } catch (Exception e) {
+            addLogFromNative("HLE_AUDIO_ERROR: MediaExtractor не открыл срез " + archivePath
+                             + " [" + offset + ", " + length + "]: " + e);
+            extractor.release();
+            try { if (raf != null) raf.close(); } catch (Exception ignored) {}
+            return null;
+        }
+        try {
+            return decodeWithExtractor(extractor, archivePath + "[" + offset + "]");
+        } finally {
+            try { raf.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private byte[] decodeWithExtractor(MediaExtractor extractor, String path) {
+        MediaCodec codec = null;
+        try {
+            int track = -1;
+            MediaFormat format = null;
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat f = extractor.getTrackFormat(i);
+                if (f.getString(MediaFormat.KEY_MIME).startsWith("audio/")) { track = i; format = f; break; }
+            }
+            if (track < 0) {
+                addLogFromNative("HLE_AUDIO_ERROR: в файле нет аудиодорожки: " + path);
+                return null;
+            }
+            extractor.selectTrack(track);
+
+            int sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+            int channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+
+            codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME));
+            codec.configure(format, null, null, 0);
+            codec.start();
+
+            ByteArrayOutputStream pcm = new ByteArrayOutputStream(1 << 16);
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            boolean inputDone = false, outputDone = false;
+
+            while (!outputDone) {
+                if (!inputDone) {
+                    int inIdx = codec.dequeueInputBuffer(10000);
+                    if (inIdx >= 0) {
+                        ByteBuffer inBuf = codec.getInputBuffer(inIdx);
+                        int size = extractor.readSampleData(inBuf, 0);
+                        if (size < 0) {
+                            codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            inputDone = true;
+                        } else {
+                            codec.queueInputBuffer(inIdx, 0, size, extractor.getSampleTime(), 0);
+                            extractor.advance();
+                        }
+                    }
+                }
+                int outIdx = codec.dequeueOutputBuffer(info, 10000);
+                if (outIdx >= 0) {
+                    if (info.size > 0) {
+                        ByteBuffer outBuf = codec.getOutputBuffer(outIdx);
+                        byte[] chunk = new byte[info.size];
+                        outBuf.position(info.offset);
+                        outBuf.get(chunk);
+                        pcm.write(chunk);
+                    }
+                    codec.releaseOutputBuffer(outIdx, false);
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true;
+                } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // Настоящие параметры известны только после старта декодера
+                    MediaFormat out = codec.getOutputFormat();
+                    sampleRate = out.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+                    channels = out.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+                }
+            }
+
+            byte[] body = pcm.toByteArray();
+            byte[] result = new byte[8 + body.length];
+            for (int i = 0; i < 4; i++) result[i] = (byte)((sampleRate >> (i * 8)) & 0xFF);
+            for (int i = 0; i < 4; i++) result[4 + i] = (byte)((channels >> (i * 8)) & 0xFF);
+            System.arraycopy(body, 0, result, 8, body.length);
+            addLogFromNative("HLE_AUDIO: декодирован " + path + " -> " + body.length + " байт PCM, " + sampleRate + " Гц, каналов: " + channels);
+            return result;
+        } catch (Exception e) {
+            addLogFromNative("HLE_AUDIO_ERROR: не удалось декодировать " + path + ": " + e);
+            return null;
+        } finally {
+            if (codec != null) { try { codec.stop(); } catch (Exception ignored) {} codec.release(); }
+            extractor.release();
+        }
+    }
+
     // ==========================================
     // OPENAL NATIVE BRIDGES
     // ==========================================
@@ -1881,20 +1987,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         }
     }
 
+    // Сообщения самого враппера (шапка запуска, выбранная игра, ошибки) не относятся
+    // ни к одной игровой категории: их режет только полное выключение лога.
     private void addLog(String msg) {
-        android.content.SharedPreferences prefs = getSharedPreferences("DamnPrefs", MODE_PRIVATE);
-        boolean anyLog = prefs.getBoolean("log_render", false) || prefs.getBoolean("log_sound", false) ||
-                         prefs.getBoolean("log_fs", false) || prefs.getBoolean("log_net", false) ||
-                         prefs.getBoolean("log_todo", false) || prefs.getBoolean("log_render_debug", false) ||
-                         prefs.getBoolean("log_func_list", false) || prefs.getBoolean("log_hidden_classes", false) ||
-                         prefs.getBoolean("log_other", false);
-        if (!anyLog) return;
-
-        if (!prefs.getBoolean("log_other", false)) {
-            if (!msg.contains("ERROR") && !msg.contains("FATAL") && !(msg.contains("CRITICAL") && !msg.contains("[SIZE-CRITICAL]")) && !msg.contains("ОШИБКА") && !msg.contains("=== Запуск") && !msg.contains("Дата и время:")) {
-                return;
-            }
-        }
+        if (buildLogMask() == 0) return;
 
         logTextView.append(msg + "\n");
         scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
