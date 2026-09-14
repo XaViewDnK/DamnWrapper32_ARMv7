@@ -25,28 +25,30 @@ jobs:
     - name: Raw Console Build (No Gradle)
       run: |
         set -e
-        
+
         echo "=== 0. Install legacy system libraries for NDK r17c ==="
         sudo apt-get update
         sudo apt-get install -y libncurses5 libtinfo5 || true
         sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
         sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5 || true
-        
+
         echo "=== 1. Setup Build Environment ==="
         export SDK=$ANDROID_SDK_ROOT
         export BUILD_TOOLS=$(ls -d $SDK/build-tools/* | sort -V | tail -1)
-        export PLATFORM_VERSION=33 
+        export PLATFORM_VERSION=33
         export PLATFORM=$SDK/platforms/android-$PLATFORM_VERSION
 
         if [ ! -d "$PLATFORM" ]; then
           echo "Installing android-$PLATFORM_VERSION platform..."
           $SDK/cmdline-tools/latest/bin/sdkmanager "platforms;android-$PLATFORM_VERSION" > /dev/null
         fi
-        
+
         echo "=== 1.5. Download and Setup NDK r17c ==="
         wget -q https://dl.google.com/android/repository/android-ndk-r17c-linux-x86_64.zip
         unzip -q android-ndk-r17c-linux-x86_64.zip
         export NDK=$PWD/android-ndk-r17c
+        export READELF=$NDK/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-readelf
+        [ -x "$READELF" ] || export READELF=readelf
 
         echo "Using Build Tools: $BUILD_TOOLS"
         echo "Using NDK: $NDK"
@@ -54,11 +56,38 @@ jobs:
         mkdir -p build/gen build/obj build/apk build/apk_libs/lib/armeabi-v7a build/res
 
         echo "=== 2. NDK Build ==="
+        # -g -gdwarf-4: символайзер на устройстве читает только .debug_line версий 2..4.
         $NDK/ndk-build NDK_PROJECT_PATH=. \
           APP_BUILD_SCRIPT=src/jni/Android.mk \
           NDK_APPLICATION_MK=src/jni/Application.mk \
           NDK_OUT=./build/ndk-obj \
-          NDK_LIBS_OUT=./build/apk_libs/lib
+          NDK_LIBS_OUT=./build/apk_libs/lib \
+          APP_CFLAGS="-g -gdwarf-4 -fno-limit-debug-info" \
+          APP_STRIP_MODE=none
+
+        echo "=== 2.5. Keep unstripped library (symbolizer needs .debug_line) ==="
+        UNSTRIPPED=build/ndk-obj/local/armeabi-v7a/libDamnWrapper32.so
+        INSTALLED=build/apk_libs/lib/armeabi-v7a/libDamnWrapper32.so
+        ls -l "$UNSTRIPPED" "$INSTALLED"
+        # ndk-build ставит в libs/ обрезанную копию, если LOCAL_STRIP_MODE потеряется.
+        # Кладём поверх ту, что вышла из линковщика, и дальше проверяем секции.
+        cp -f "$UNSTRIPPED" "$INSTALLED"
+
+        check_debug_line() {
+          local so="$1"
+          echo "--- sections of $so ---"
+          $READELF -S "$so" | grep -E "debug_line|debug_info|symtab|build" || true
+          local hex=$($READELF -S -W "$so" | awk '{for(i=1;i<=NF;i++) if($i==".debug_line") print $(i+4)}' | head -1)
+          local sz=0
+          [ -n "$hex" ] && sz=$((16#$hex))
+          if [ "$sz" -lt 1024 ]; then
+            echo "ОШИБКА: в $so нет .debug_line — символайзер на устройстве не заработает."
+            exit 1
+          fi
+          echo "OK: .debug_line = $sz байт в $so"
+          $READELF -n "$so" | grep -A1 -i "build.id" || true
+        }
+        check_debug_line "$INSTALLED"
 
         echo "=== 3. Compile Resources (AAPT2) ==="
         $BUILD_TOOLS/aapt2 compile --dir res -o build/res.zip
@@ -72,8 +101,7 @@ jobs:
         echo "=== 4. Compile Java ==="
         find src/java -name "*.java" > build/java_sources.txt
         find build/gen -name "*.java" >> build/java_sources.txt
-        
-        # Убрали -bootclasspath, перенесли android.jar в -cp
+
         javac -source 8 -target 8 \
           -cp "$PLATFORM/android.jar:build/gen" \
           -d build/obj \
@@ -81,17 +109,16 @@ jobs:
 
         echo "=== 5. Dexing (D8) ==="
         cd build/obj
-        # Добавили --min-api 21 для корректного дешугаринга лямбд
         $BUILD_TOOLS/d8 --release --min-api 21 --lib $PLATFORM/android.jar --output ../apk/ $(find . -name "*.class")
         cd ../..
 
         echo "=== 6. Package Final APK ==="
         cp build/app-unaligned.apk build/app-with-code.apk
-        
+
         cd build/apk
         zip -qj ../app-with-code.apk classes.dex
         cd ../..
-        
+
         cd build/apk_libs
         zip -qr ../app-with-code.apk lib/
         cd ../..
@@ -111,8 +138,22 @@ jobs:
           --out DamnWrapper32_ARMv7.apk \
           build/app-aligned.apk
 
+        echo "=== 9. Verify the library inside the final APK ==="
+        rm -rf build/verify && mkdir -p build/verify
+        unzip -o -q DamnWrapper32_ARMv7.apk lib/armeabi-v7a/libDamnWrapper32.so -d build/verify
+        check_debug_line build/verify/lib/armeabi-v7a/libDamnWrapper32.so
+        ls -l DamnWrapper32_ARMv7.apk
+
     - name: Upload Output APK
       uses: actions/upload-artifact@v4
       with:
         name: DamnWrapper32-APK
         path: DamnWrapper32_ARMv7.apk
+
+    - name: Upload Unstripped Library
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: DamnWrapper32-so-unstripped
+        path: build/ndk-obj/local/armeabi-v7a/libDamnWrapper32.so
+        if-no-files-found: warn
