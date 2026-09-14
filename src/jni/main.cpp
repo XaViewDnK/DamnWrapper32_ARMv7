@@ -51,8 +51,28 @@
 // Подключение stb_image_write
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+
+// Декодер картинок зовут из гостевых потоков, где SP выровнен по 4 байтам (iOS ARM32).
+// Компилятор же строит stb в расчёте на AAPCS с выравниванием 8, поэтому вызов идёт
+// через трамплин: аргументы в структуре, чтобы стековых параметров не было вовсе.
+struct DwStbLoadArgs { const unsigned char* buf; int len; int x, y, comp; };
+extern "C" unsigned char* DwStbLoadImpl(DwStbLoadArgs* a) {
+    return stbi_load_from_memory(a->buf, a->len, &a->x, &a->y, &a->comp, 4);
+}
+__attribute__((naked)) extern "C" unsigned char* DwStbLoad(DwStbLoadArgs* a) {
+    __asm__ volatile(
+        "push {r4, lr}\n"
+        "mov r4, sp\n"
+        "mov r12, sp\n"
+        "bic r12, r12, #7\n"
+        "mov sp, r12\n"
+        "bl DwStbLoadImpl\n"
+        "mov sp, r4\n"
+        "pop {r4, pc}\n");
+}
 //
 #include "sqlite3.h"
+#include "ipavfs.h"
 #include <setjmp.h>
 #include <dirent.h>
 #include <sched.h>
@@ -61,8 +81,15 @@
 
 std::string GetNSString(void* nsstr);
 extern bool g_disableLogging;
-extern bool g_logRender, g_logSound, g_logFs, g_logNet, g_logTodo, g_logRenderDebug, g_logFuncList, g_logHiddenClasses, g_logOther;
-int g_spamFiltersMask = 0;
+
+enum LogCat : uint8_t {
+    LOG_RENDER = 0, LOG_RENDER_DUMP, LOG_SOUND, LOG_FS, LOG_MEM,
+    LOG_OBJC, LOG_NET, LOG_TODO, LOG_DIAG, LOG_GAME, LOG_OTHER, LOG_CAT_COUNT
+};
+extern uint32_t g_logMask;    // какие категории писать
+extern uint32_t g_spamMask;   // в каких категориях схлопывать повторы
+inline bool LogCatOn(LogCat c) { return (g_logMask & (1u << c)) != 0; }
+
 int g_gpuOffloadMask = 0;
 void _LogToJava(const std::string& msg);
 #define LogToJava(msg) do { if (!g_disableLogging) _LogToJava(msg); } while(0)
@@ -70,6 +97,15 @@ void _LogToBlackBox(const std::string& msg);
 #define LogToBlackBox(msg) do { if (!g_disableLogging) _LogToBlackBox(msg); } while(0)
 void _SyncLog(const std::string& msg);
 #define SyncLog(msg) do { if (!g_disableLogging) _SyncLog(msg); } while(0)
+
+// Внутренняя категория диагностики Asphalt 6 (теги [A6-*], дампы текстур и кадров).
+// Ключа в dw_config и в настройках враппера у неё намеренно нет: впереди починка
+// остальных версий игры, поэтому код живёт в репозитории, а включается правкой
+// единицы ниже и пересборкой. При 0 компилятор выбрасывает всю обвязку целиком.
+#define A6_DEBUG_LOG 0
+extern bool g_isAsphalt6;
+static inline bool A6Dbg() { return A6_DEBUG_LOG && g_isAsphalt6; }
+#define A6Log(msg) do { if (A6Dbg()) _LogToJava(msg); } while(0)
 std::string DumpHexToString(const char* data, int max_len);
 
 struct HLE_Method { const char* name; const char* types; void* imp; };
@@ -110,7 +146,7 @@ extern "C" {
 // -------------------------------
 
 pthread_t g_iosMainThread;
-struct MainQueueItem { void* target; const char* sel; void* arg; void* arg2; };
+struct MainQueueItem { void* target; const char* sel; void* arg; void* arg2; bool isInput; };
 std::vector<MainQueueItem> g_mainQueue;
 pthread_mutex_t g_mainQueueMutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -145,6 +181,7 @@ std::map<std::string, HLEClass*> g_hleClasses;
 
 void* g_displayLinkTarget = nullptr; const char* g_displayLinkSelector = nullptr; bool g_renderingStarted = false;
 bool g_frameHasDraw = false;
+bool g_framePresented = false;
 bool g_onScreenDebugOverlay = false;
 bool g_showPerfOverlay = false;
 int g_esModeOption = 2;
@@ -168,9 +205,60 @@ uint64_t GetRealTimeMs() {
 int g_gameViewportW = 0;
 int g_gameViewportH = 0;
 bool g_isFakeViewport = false;
+
+// Ориентация. Числа те же, что у UIDeviceOrientation, и UIInterfaceOrientation
+// пользуется ими же: 1 портрет, 2 портрет вверх ногами, 3 и 4 — два ландшафта.
+// g_physOrientation — как реально лежит поверхность враппера (активность жёстко
+// в ландшафте, поэтому значение постоянное и служит калибровкой).
+// g_ifaceOrientation — то, что игра сама себе назначила; пока не назначила,
+// совпадает с физической.
+int g_physOrientation  = 4;
+int g_ifaceOrientation = 4;
+
+// Четверти поворота против часовой от портрета: портрет 0, ландшафт-3 1,
+// портрет-вверх-ногами 2, ландшафт-4 3.
+static inline int OriQuarter(int o) {
+    switch (o) { case 3: return 1; case 2: return 2; case 4: return 3; default: return 0; }
+}
+static inline bool OriValid(int o) { return o >= 1 && o <= 4; }
+
+// Сколько четвертей против часовой враппер должен добавить кадру игры.
+// Игра, уложившая ландшафтную картинку в портретный буфер, повернула её сама, и
+// повернула против часовой ровно на свою ориентацию интерфейса. Поверхность
+// враппера уже лежит в ориентации 4, доворачивать её не надо — значит кадр надо
+// довернуть до неё, то есть на OriQuarter(ориентация игры) четвертей.
+static inline int FrameRotQuarters(int targetW, int targetH) {
+    if (!(g_gameViewportH > g_gameViewportW && targetW > targetH)) return 0;
+    return OriQuarter(g_ifaceOrientation);
+}
+
+// Акселерометр отдаёт оси портретного устройства — так, как телефон реально лежит.
+// Игра сама довернёт их под ориентацию, которую себе назначила, поэтому заранее
+// снимаем расхождение между этой ориентацией и физической.
+static inline void OrientAccel(double& x, double& y) {
+    switch ((OriQuarter(g_physOrientation) - OriQuarter(g_ifaceOrientation)) & 3) {
+        case 1: { double t = x; x = -y; y =  t; break; }
+        case 2: { x = -x; y = -y;              break; }
+        case 3: { double t = x; x =  y; y = -t; break; }
+    }
+}
+
+// Тач приходит в координатах поверхности. Раз кадру добавлен поворот, точку надо
+// повернуть на столько же в обратную сторону, иначе палец и картинка разъедутся.
+static inline void MapTouchToGameView(float x, float y, float& rx, float& ry) {
+    switch (FrameRotQuarters(g_surfaceWidth, g_surfaceHeight)) {
+        case 1:  rx = (float)g_surfaceHeight - y; ry = x;                          break;
+        case 2:  rx = (float)g_surfaceWidth  - x; ry = (float)g_surfaceHeight - y; break;
+        case 3:  rx = y;                          ry = (float)g_surfaceWidth  - x; break;
+        default: rx = x;                          ry = y;                          break;
+    }
+}
 int g_activeESVersion = 2;
 int g_debugHeartbeat = 0;
 int g_lastActiveFBO = 0;
+std::set<GLuint> g_texCreatedEmpty;   // ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6
+bool g_isAsphalt6 = false;            // диагностика A6 лезет по абсолютным адресам её образа
+int g_a6FrameNo = 0;   // ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6: номер кадра для выборочных дампов
 std::map<GLuint, GLuint> g_fboColorTex;
 std::map<GLuint, std::vector<float>> g_fboDepthBuf;
 std::map<GLuint, bool> g_fboTextures;
@@ -203,6 +291,14 @@ VertexAttribState g_vertexAttribs[16];
 std::vector<float> g_cpuDepthBuffer;
 float g_cpuClearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 std::map<GLuint, std::map<std::string, GLuint>> g_attribLocations;
+
+// Программный растеризатор шейдеры не исполняет, поэтому цвет он собирает сам.
+// Чтобы не угадывать, участвует ли uniform-тинт в выходном цвете, исходники
+// шейдеров разбираются один раз на линковке и программе присваивается модель.
+enum SWColorModel { SWCM_DEFAULT = 0, SWCM_TINT = 1, SWCM_SKYMIX = 2 };
+std::map<GLuint, std::string> g_shaderSrc;
+std::map<GLuint, int> g_progColorModel;
+std::map<GLuint, bool> g_progSamplesTex1;
 
 extern std::map<GLuint, std::vector<uint32_t>> g_cpuTextures;
 extern std::map<GLuint, int> g_cpuTexW;
@@ -241,7 +337,10 @@ GLsizei g_pointSizeStride = 0;
 GLenum g_matrixMode = GL_MODELVIEW;
 std::vector<std::vector<float>> g_modelViewStack = {{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
 std::vector<std::vector<float>> g_projectionStack = {{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
-std::vector<std::vector<float>> g_textureStack = {{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
+// Текстурная матрица в ES 1.1 тоже своя у каждого юнита: общий стек уводил UV
+// нулевого юнита туда, куда игра сдвигала лишь верхний.
+std::vector<std::vector<std::vector<float>>> g_textureStacks(
+    8, std::vector<std::vector<float>>(1, {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}));
 std::vector<std::vector<std::vector<float>>> g_paletteStacks(32, std::vector<std::vector<float>>(1, {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}));
 
 GLenum g_alphaFunc = GL_ALWAYS;
@@ -252,10 +351,14 @@ bool g_blendEnabled = false;
 GLenum g_depthFunc = 0x0201; // GL_LESS
 GLenum g_blendSrc = GL_ONE;
 GLenum g_blendDst = GL_ZERO;
+std::set<uint64_t> g_a6SeenTexEnv;   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+std::set<uint64_t> g_a6SeenBlend;    // ВРЕМЕННАЯ ДИАГНОСТИКА A6
 bool g_depthTestEnabled = false;
 bool g_depthMask = true;
 bool g_colorMask[4] = {true, true, true, true};
-bool g_texture2DEnabled = false;
+// В ES 1.1 GL_TEXTURE_2D — состояние текстурного юнита, а не всего контекста:
+// игра гасит его на верхних юнитах, и общий флаг обнулял текстуру нулевого юнита.
+bool g_texture2DUnitEnabled[8] = {false};
 bool g_cullFaceEnabled = false;
 GLenum g_cullFaceMode = 0x0405; // GL_BACK
 GLenum g_frontFace = 0x0901; // GL_CCW
@@ -264,9 +367,44 @@ bool g_matrixIndexEnabled = false;
 bool g_weightEnabled = false;
 float g_pointSize = 1.0f;
 
+// --- Фиксированный конвейер освещения ES 1.1 ---
+// При включённом GL_LIGHTING цвет вершины по спеке берётся не из glColor/COLOR_ARRAY,
+// а из уравнения освещения с материалом. Игра вправе выставить чёрный glColor.
+struct SWLight {
+    float ambient[4]  = {0.0f, 0.0f, 0.0f, 1.0f};
+    float diffuse[4]  = {0.0f, 0.0f, 0.0f, 1.0f};
+    float specular[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float position[4] = {0.0f, 0.0f, 1.0f, 0.0f};   // в координатах глаза
+    float spotDir[3]  = {0.0f, 0.0f, -1.0f};        // в координатах глаза
+    float spotExponent = 0.0f;
+    float spotCutoff = 180.0f;
+    float attenuation[3] = {1.0f, 0.0f, 0.0f};      // constant, linear, quadratic
+};
+bool g_lightingEnabled = false;
+bool g_colorMaterialEnabled = false;
+bool g_normalizeEnabled = false;
+bool g_lightEnabled[8] = {false};
+SWLight g_lights[8];
+float g_matAmbient[4]  = {0.2f, 0.2f, 0.2f, 1.0f};
+float g_matDiffuse[4]  = {0.8f, 0.8f, 0.8f, 1.0f};
+float g_matSpecular[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+float g_matEmission[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+float g_matShininess = 0.0f;
+float g_lightModelAmbient[4] = {0.2f, 0.2f, 0.2f, 1.0f};
+// По спеке только у GL_LIGHT0 diffuse и specular белые, у остальных чёрные.
+static struct SWLight0Defaults {
+    SWLight0Defaults() {
+        for (int i = 0; i < 3; i++) { g_lights[0].diffuse[i] = 1.0f; g_lights[0].specular[i] = 1.0f; }
+        // Текущая нормаль по умолчанию в ES 1.1 — (0,0,1), а не белый цвет.
+        g_vertexAttribs[5].constantValue[0] = 0.0f;
+        g_vertexAttribs[5].constantValue[1] = 0.0f;
+        g_vertexAttribs[5].constantValue[2] = 1.0f;
+    }
+} g_swLight0Defaults;
+
 std::vector<std::vector<float>>& GetCurrentMatrixStack() {
     if (g_matrixMode == GL_PROJECTION) return g_projectionStack;
-    if (g_matrixMode == GL_TEXTURE) return g_textureStack;
+    if (g_matrixMode == GL_TEXTURE) return g_textureStacks[g_cpuTextureUnit & 7];
     if (g_matrixMode == GL_MATRIX_PALETTE_OES) {
         if (g_currentPaletteMatrix < 32) return g_paletteStacks[g_currentPaletteMatrix];
     }
@@ -315,10 +453,13 @@ struct HLE_CGContext {
 struct HLE_CGImage { int width; int height; int bpp; void* data; };
 struct HLE_CGColor { float components[4]; };
 
+bool g_cpuBufferDirty = false;
+
 void CPUDrawPixel(int x, int y, uint32_t color) {
     if (x >= 0 && x < g_surfaceWidth && y >= 0 && y < g_surfaceHeight) {
         if (g_cpuColorBuffer.size() == (size_t)(g_surfaceWidth * g_surfaceHeight)) {
             g_cpuColorBuffer[y * g_surfaceWidth + x] = color;
+            g_cpuBufferDirty = true;
         }
     }
 }
@@ -336,6 +477,7 @@ void CPUDrawLine(int x0, int y0, int x1, int y1, uint32_t color) {
 }
 void CPUDrawText(float rx, float ry, float rw, float rh, float r, float g, float b, const UITextCache& cache) {
     if (cache.bitmap.empty() || g_cpuColorBuffer.size() != (size_t)(g_surfaceWidth * g_surfaceHeight)) return;
+    g_cpuBufferDirty = true;
     uint8_t cr = (uint8_t)(r * 255.0f); uint8_t cg = (uint8_t)(g * 255.0f); uint8_t cb = (uint8_t)(b * 255.0f);
     float scaleX = 1.0f;
     float scaleY = 1.0f;
@@ -371,6 +513,7 @@ void CPUDrawImage(float rx, float ry, float rw, float rh, void* imgPtr, float al
     if (!imgPtr || g_cpuColorBuffer.size() != (size_t)(g_surfaceWidth * g_surfaceHeight)) return;
     HLE_CGImage* img = (HLE_CGImage*)imgPtr;
     if (!img->data) return;
+    g_cpuBufferDirty = true;
     int px0 = (int)rx; int py0 = (int)ry;
     int px1 = (int)(rx + rw); int py1 = (int)(ry + rh);
     for (int y = py0; y < py1; y++) {
@@ -400,6 +543,7 @@ void CPUDrawImage(float rx, float ry, float rw, float rh, void* imgPtr, float al
 
 void CPUDrawSolidRect(float rx, float ry, float rw, float rh, float r, float g, float b, float a, float cornerRadius = 0.0f) {
     if (g_cpuColorBuffer.size() != (size_t)(g_surfaceWidth * g_surfaceHeight)) return;
+    g_cpuBufferDirty = true;
     float scaleX = 1.0f;
     float scaleY = 1.0f;
     int px0 = (int)(rx * scaleX); int py0 = (int)(ry * scaleY);
@@ -474,7 +618,8 @@ std::map<void*, HLEUIView> g_views;
 // Дерево видов строит игровой поток, а рисует его поток GL — без этого замка
 // обход в рендере наталкивается на реаллокацию children посреди reloadData.
 std::recursive_mutex g_uiTreeMutex;
-volatile int g_dbgReloadCount = 0, g_dbgSections = 0, g_dbgRows = 0, g_dbgCellsAdded = 0, g_dbgRawSections = -1, g_dbgHasSecIMP = -1;   // ВРЕМЕННЫЕ
+// Счётчики reloadData для внутренней диагностики (печатает RenderHLEUI под A6_DEBUG_LOG).
+volatile int g_dbgReloadCount = 0, g_dbgSections = 0, g_dbgRows = 0, g_dbgCellsAdded = 0, g_dbgRawSections = -1, g_dbgHasSecIMP = -1;
 void* g_dbgReloadSelf = nullptr; void* g_dbgReloadDs = nullptr; void* g_dbgLastCell = nullptr;
 struct HLESlider { float minValue = 0.0f, maxValue = 1.0f, value = 0.0f; };
 std::map<void*, HLESlider> g_sliders;
@@ -509,6 +654,11 @@ static bool MakeDirsRecursive(const std::string& path) {
     if (!ok) _LogToJava("ОШИБКА MKDIR: " + path + " errno=" + std::to_string(errno));
     return ok;
 }
+static int VfsStatAny(const std::string& p, struct stat* st) {
+    if (IpaIsVirtualPath(p.c_str())) return IpaStat(p, st) ? 0 : -1;
+    return stat(p.c_str(), st);
+}
+
 std::string g_appBundlePath;
 std::string g_execPath;
 std::map<void*, std::string> g_bundlePaths;   // NSBundle -> корень бандла
@@ -669,31 +819,145 @@ std::vector<std::string> g_logHistory;
 int g_spamCount = 0;
 pthread_t g_lastLoggedThread = 0;
 
-bool g_logRender = false;
-bool g_logSound = false;
-bool g_logFs = false;
-bool g_logNet = false;
-bool g_logTodo = false;
-bool g_logRenderDebug = false;
-bool g_logFuncList = false;
-bool g_logHiddenClasses = false;
-bool g_logOther = false;
+uint32_t g_logMask = 0;
+uint32_t g_spamMask = 0;
 bool g_nativeRootMmap = false;
 bool g_disableLogging = true;
+bool g_logUiVisible = true;   // пока игра рисует, лог-вью не на экране и JNI-мост не нужен
 
-void InternalWriteLog(const std::string& msg) {
-    LOGI("%s", msg.c_str());
-    if (!g_workDir.empty()) {
-        std::string logPath = g_workDir + "damn32_log.txt";
-        int fd = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666);
-        if (fd >= 0) {
-            std::string out = msg + "\n";
-            write(fd, out.c_str(), out.length());
-            fsync(fd);
-            close(fd);
+// Категория определяется по тегу в начале сообщения. Порядок важен: частные теги идут
+// раньше общих (OBJC-TODO раньше OBJC-), иначе частный никогда не сработает.
+static const struct { const char* tag; uint8_t cat; } kCatRules[] = {
+    {"[GL-TRACE]", LOG_RENDER}, {"[GL-UNIFORM]", LOG_RENDER}, {"[GL-TEX]", LOG_RENDER},
+    {"[RENDER]", LOG_RENDER}, {"[SHADER-DUMP]", LOG_RENDER}, {"Render:", LOG_RENDER},
+    {"GL_ERROR", LOG_RENDER}, {"GL_VALIDATE", LOG_RENDER}, {"onSurfaceCreated", LOG_RENDER},
+    {"EGL", LOG_RENDER},
+
+    {"[ABSOLUTE-DEBUG]", LOG_RENDER_DUMP}, {"[MEGA-DEBUG]", LOG_RENDER_DUMP},
+    {"[DRAW-DEBUG]", LOG_RENDER_DUMP}, {"[ABSOLUTE-IDLE-LOOP]", LOG_RENDER_DUMP},
+    {"[MAIN-LOOP]", LOG_RENDER_DUMP}, {"[SIZE-TRACE]", LOG_RENDER_DUMP},
+    {"[SIZE-CRITICAL]", LOG_RENDER_DUMP}, {"[SUPER-STRET-DEBUG]", LOG_RENDER_DUMP},
+    {"[SUPER-MSG-DEBUG]", LOG_RENDER_DUMP}, {"ENTER MegaDebug", LOG_RENDER_DUMP},
+
+    {"HLE_AUDIO", LOG_SOUND}, {"HLE Audio", LOG_SOUND}, {"OpenAL", LOG_SOUND}, {"AL-", LOG_SOUND},
+
+    {"C-API-IO", LOG_FS}, {"IPA:", LOG_FS}, {"HLE-PLIST", LOG_FS}, {"HLE-NIB", LOG_FS},
+    {"[NSBundle pathForResource]", LOG_FS}, {"[NSBundle bundleWithPath]", LOG_FS},
+
+    {"C-API-MEM", LOG_MEM}, {"[ALLOC]", LOG_MEM},
+
+    {"OBJC-TODO", LOG_TODO}, {"OBJC-STRET-TODO", LOG_TODO}, {"OBJC-SUPER-STRET-TODO", LOG_TODO},
+    {"C-API-STUB", LOG_TODO}, {"Unimplemented", LOG_TODO},
+
+    {"OBJC-CALL", LOG_OBJC}, {"OBJC-NATIVE-FORWARD", LOG_OBJC}, {"OBJC-STRET-CALL", LOG_OBJC},
+    {"OBJC-SUPER-STRET-CALL", LOG_OBJC}, {"OBJC-HIJACKED", LOG_OBJC}, {"OBJC-TRACE", LOG_OBJC},
+    {"OBJC-DEBUG", LOG_OBJC},
+
+    {"[REACH-DEBUG]", LOG_NET}, {"Reachability", LOG_NET}, {"HLE-NET", LOG_NET},
+
+    {"C-API-IMPLEMENTED", LOG_DIAG}, {"=== РЕАЛИЗОВАННЫЕ", LOG_DIAG}, {"=== C-API ЗАГЛУШКИ", LOG_DIAG},
+    {"OBJC-CLASS-FOUND", LOG_DIAG}, {"DW32DIAG", LOG_DIAG}, {"REBASE-TRACE", LOG_DIAG},
+
+    {"GAME-LOG", LOG_GAME}, {"GAME-COUT", LOG_GAME}, {"NSLog:", LOG_GAME},
+};
+
+// Теги ищем только в начале сообщения (у многострочных дампов — в первой строке),
+// иначе слово из текста вроде "state" утаскивало сообщение в чужую категорию.
+static uint8_t ClassifyLog(const std::string& msg) {
+    size_t start = msg.find_first_not_of(" \t\r\n>=*-");   // дампы начинаются с перевода строки и рамки
+    if (start == std::string::npos) return LOG_OTHER;
+    size_t head = msg.find('\n', start);
+    if (head == std::string::npos || head > start + 120) head = std::min(msg.size(), start + 120);
+    for (const auto& r : kCatRules) {
+        size_t p = msg.find(r.tag, start);
+        if (p != std::string::npos && p < head) return r.cat;
+    }
+    return LOG_OTHER;
+}
+
+static pthread_mutex_t g_filterMutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_logFd = -1;
+static char g_logBuf[65536];
+static size_t g_logBufLen = 0;
+static size_t g_logWritten = 0;
+static bool g_logTruncated = false;
+// Потолок файла: при включённом спаме лог рос быстрее 20 МБ/мин и топил и игру, и телефон.
+static const size_t kLogSizeLimit = 64u * 1024 * 1024;
+static pthread_mutex_t g_logMutex = PTHREAD_MUTEX_INITIALIZER;
+static double g_logLastFlushMs = 0;
+
+static void LogFlushLocked() {
+    if (g_logFd >= 0 && g_logBufLen > 0) {
+        size_t off = 0;
+        while (off < g_logBufLen) {
+            ssize_t w = write(g_logFd, g_logBuf + off, g_logBufLen - off);
+            if (w <= 0) {
+                LOGI("LOG-FLUSH: запись в файл не удалась (fd=%d, errno=%d/%s), потеряно %zu байт",
+                     g_logFd, errno, strerror(errno), g_logBufLen - off);
+                break;
+            }
+            off += (size_t)w;
         }
     }
-    if (g_jvm && g_mainActivity) {
+    g_logBufLen = 0;
+}
+
+// Зовётся из обработчика сигнала, поэтому без мьютекса и без аллокаций.
+void FlushLogForCrash() {
+    LogFlushLocked();
+    if (g_logFd >= 0) fsync(g_logFd);
+}
+
+void ResetLogFile() {
+    pthread_mutex_lock(&g_logMutex);
+    LogFlushLocked();
+    if (g_logFd >= 0) { close(g_logFd); g_logFd = -1; }
+    pthread_mutex_unlock(&g_logMutex);
+}
+
+void InternalWriteLog(const std::string& raw) {
+    // Многие вызовы приносят свой '\n' на конце, а writer добавляет ещё один:
+    // так прогон набирал 8 тыс. пустых строк.
+    size_t end = raw.find_last_not_of("\r\n");
+    std::string trimmed;
+    if (end + 1 != raw.size()) trimmed.assign(raw, 0, end == std::string::npos ? 0 : end + 1);
+    const std::string& msg = (end + 1 == raw.size()) ? raw : trimmed;
+    LOGI("%s", msg.c_str());
+    if (!g_workDir.empty()) {
+        pthread_mutex_lock(&g_logMutex);
+        if (g_logFd < 0) {
+            std::string logPath = g_workDir + "damn32_log.txt";
+            g_logFd = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666);
+        }
+        if (g_logFd >= 0 && !g_logTruncated) {
+            if (g_logWritten > kLogSizeLimit) {
+                const char* tail = "\n=== ЛОГ ОБРЕЗАН: достигнут потолок 64 МБ, дальше пишется только logcat ===\n";
+                LogFlushLocked();
+                write(g_logFd, tail, strlen(tail));
+                fsync(g_logFd);
+                g_logTruncated = true;
+            }
+            size_t need = msg.size() + 1;
+            g_logWritten += need;
+            if (need >= sizeof(g_logBuf)) {
+                LogFlushLocked();
+                write(g_logFd, msg.data(), msg.size());
+                write(g_logFd, "\n", 1);
+            } else {
+                if (g_logBufLen + need > sizeof(g_logBuf)) LogFlushLocked();
+                memcpy(g_logBuf + g_logBufLen, msg.data(), msg.size());
+                g_logBufLen += msg.size();
+                g_logBuf[g_logBufLen++] = '\n';
+            }
+            // Досбрасываем по времени: dw_log читает файл на живой игре и должен видеть свежий хвост.
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            double nowMs = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+            if (nowMs - g_logLastFlushMs >= 200.0) { LogFlushLocked(); g_logLastFlushMs = nowMs; }
+        }
+        pthread_mutex_unlock(&g_logMutex);
+    }
+    // Пока идёт рендер, лог-вью не на экране: JNI-мост тогда только жёг такты (NewStringUTF на строку).
+    if (g_logUiVisible && g_jvm && g_mainActivity) {
         JNIEnv* env; if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) g_jvm->AttachCurrentThread(&env, nullptr);
         jclass clazz = env->GetObjectClass(g_mainActivity); jmethodID method = env->GetMethodID(clazz, "addLogFromNative", "(Ljava/lang/String;)V");
         if (method) { jstring jmsg = env->NewStringUTF(msg.c_str()); env->CallVoidMethod(g_mainActivity, method, jmsg); env->DeleteLocalRef(jmsg); }
@@ -718,81 +982,45 @@ void _LogToBlackBox(const std::string& msg) {
     _LogToJava(msg);
 }
 
-void _LogToJava(const std::string& msg) {
-    bool keep = false;
-    
-    bool isRender = msg.find("[RENDER]") != std::string::npos || msg.find("[GL-TRACE]") != std::string::npos || msg.find("[SHADER-DUMP]") != std::string::npos || msg.find("EGL") != std::string::npos;
-    bool isSound = msg.find("HLE_AUDIO") != std::string::npos || msg.find("AL-") != std::string::npos || msg.find("OpenAL") != std::string::npos || msg.find("Audio") != std::string::npos;
-    bool isFs = msg.find("C-API-IO") != std::string::npos || msg.find("FOPEN") != std::string::npos || msg.find("fopen") != std::string::npos || msg.find("stat") != std::string::npos;
-    bool isNet = msg.find("Reachability") != std::string::npos || msg.find("socket") != std::string::npos || msg.find("bind") != std::string::npos || msg.find("connect") != std::string::npos || msg.find("gethostbyname") != std::string::npos;
-    bool isTodo = msg.find("TODO") != std::string::npos || msg.find("Unimplemented") != std::string::npos || msg.find("STUBBED") != std::string::npos || msg.find("STUB") != std::string::npos;
-    bool isRenderDebug = msg.find("[ABSOLUTE-DEBUG]") != std::string::npos || msg.find("[MEGA-DEBUG]") != std::string::npos || msg.find("[DRAW-DEBUG]") != std::string::npos || msg.find("DumpGLState") != std::string::npos;
-    bool isFuncList = msg.find("C-API-IMPLEMENTED") != std::string::npos || msg.find("=== РЕАЛИЗОВАННЫЕ") != std::string::npos || msg.find("=== C-API ЗАГЛУШКИ") != std::string::npos || msg.find("==================================") != std::string::npos;
-    bool isHiddenClass = msg.find("OBJC-CLASS-FOUND") != std::string::npos;
-    bool isOther = !(isRender || isSound || isFs || isNet || isTodo || isRenderDebug || isFuncList || isHiddenClass);
-    
-    if (isRenderDebug && g_logRenderDebug) keep = true;
-    else if (isRender && g_logRender) keep = true;
-    else if (isSound && g_logSound) keep = true;
-    else if (isFs && g_logFs) keep = true;
-    else if (isNet && g_logNet) keep = true;
-    else if (isTodo && g_logTodo) keep = true;
-    else if (isFuncList && g_logFuncList) keep = true;
-    else if (isHiddenClass && g_logHiddenClasses) keep = true;
-    else if (g_logOther) keep = true;
-    
-    if (msg.find("FATAL") != std::string::npos || (msg.find("CRITICAL") != std::string::npos && msg.find("[SIZE-CRITICAL]") == std::string::npos) || msg.find("ERROR") != std::string::npos || msg.find("ОШИБКА") != std::string::npos || msg.find("ASSERT") != std::string::npos) {
-        keep = true; // Always log fatals/errors if logging is enabled at all
-    }
-    
-    if (!keep) return;
+// Признак ошибки ищем только в начале: на выключенной категории это единственная работа,
+// которую делает логгер, и гонять её по всему дампу в 8 КБ незачем.
+static bool LooksLikeError(const std::string& m) {
+    const size_t n = std::min<size_t>(m.size(), 256);
+    if (m.find("FATAL") < n || m.find("ERROR") < n || m.find("ОШИБКА") < n || m.find("ASSERT") < n) return true;
+    return m.find("CRITICAL") < n && m.find("[SIZE-CRITICAL]") >= n;
+}
 
-    std::string masked = MaskPointers(msg);
-    bool isRepeat = false;
-    
-    bool hideSpam = false;
-    if (isRender && (g_spamFiltersMask & (1 << 0))) hideSpam = true;
-    else if (isSound && (g_spamFiltersMask & (1 << 1))) hideSpam = true;
-    else if (isFs && (g_spamFiltersMask & (1 << 2))) hideSpam = true;
-    else if (isNet && (g_spamFiltersMask & (1 << 3))) hideSpam = true;
-    else if (isTodo && (g_spamFiltersMask & (1 << 4))) hideSpam = true;
-    else if (isRenderDebug && (g_spamFiltersMask & (1 << 5))) hideSpam = true;
-    else if (isFuncList && (g_spamFiltersMask & (1 << 6))) hideSpam = true;
-    else if (isHiddenClass && (g_spamFiltersMask & (1 << 7))) hideSpam = true;
-    else if (isOther && (g_spamFiltersMask & (1 << 8))) hideSpam = true;
-                             
-    if (hideSpam) {
+void _LogToJava(const std::string& msg) {
+    LogCat cat = (LogCat)ClassifyLog(msg);
+    if (!LogCatOn(cat) && !LooksLikeError(msg)) return;
+
+    pthread_mutex_lock(&g_filterMutex);
+    if (g_spamMask & (1u << cat)) {
+        std::string masked = MaskPointers(msg);
         for (const auto& hist : g_logHistory) {
             if (hist == masked) {
-                isRepeat = true;
-                break;
+                g_spamCount++;
+                pthread_mutex_unlock(&g_filterMutex);
+                return;
             }
         }
+        g_logHistory.push_back(masked);
+        if (g_logHistory.size() > 32) g_logHistory.erase(g_logHistory.begin());
     }
 
-    if (isRepeat) {
-        g_spamCount++;
-        return;
-    }
-
-    if (g_spamCount > 0) {
-        InternalWriteLog("...");
-        g_spamCount = 0;
-    }
-
-    g_logHistory.push_back(masked);
-    if (g_logHistory.size() > 32) { // 32 строк должно хватить для перекрытия цикла рендера
-        g_logHistory.erase(g_logHistory.begin());
-    }
-
+    bool needEllipsis = g_spamCount > 0;
+    g_spamCount = 0;
     pthread_t currentThread = pthread_self();
-    if (currentThread != g_lastLoggedThread) {
+    bool threadChanged = currentThread != g_lastLoggedThread;
+    g_lastLoggedThread = currentThread;
+    pthread_mutex_unlock(&g_filterMutex);
+
+    if (needEllipsis) InternalWriteLog("...");
+    if (threadChanged) {
         char tid_buf[64];
         snprintf(tid_buf, sizeof(tid_buf), "\n=== [СМЕНА ПОТОКА: T:%ld] ===", (long)currentThread);
         InternalWriteLog(std::string(tid_buf));
-        g_lastLoggedThread = currentThread;
     }
-
     InternalWriteLog(msg);
 }
 
@@ -1066,6 +1294,9 @@ void CrashHandler(int sig, siginfo_t *info, void *context) {
         raise(sig);
         return;
     }
+
+    // Досбрасываем буфер лога до открытия краш-fd, иначе краш ляжет в файл раньше своих причин.
+    FlushLogForCrash();
 
     off_t start_pos = -1;
     int fd = -1;
@@ -1426,7 +1657,28 @@ void CallJNI_V_IS(const char* m, void* ptr, const std::string& s) { JNIEnv* env 
 float CallJNI_F_I(const char* m, void* ptr) { JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity) return 0.0f; jclass c = env->GetObjectClass(g_mainActivity); jmethodID id = env->GetMethodID(c, m, "(I)F"); float res = id ? env->CallFloatMethod(g_mainActivity, id, (jint)(uintptr_t)ptr) : 0.0f; env->DeleteLocalRef(c); return res; }
 bool CallJNI_Z_I(const char* m, void* ptr) { JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity) return false; jclass c = env->GetObjectClass(g_mainActivity); jmethodID id = env->GetMethodID(c, m, "(I)Z"); bool res = id ? env->CallBooleanMethod(g_mainActivity, id, (jint)(uintptr_t)ptr) : false; env->DeleteLocalRef(c); return res; }
 
-void AudioInitToJava(void* ptr, const std::string& path) { CallJNI_V_IS("audioInit", ptr, path); }
+// MediaPlayer/VideoView не умеют читать из архива, поэтому медиа из .ipa выкладываем
+// во временный файл. Кэш держим внутри песочницы игры и имя берём из всего пути:
+// по одному basename два бандла (да и два каталога внутри одного) склеивались бы.
+static std::string MaterializeForJava(const std::string& path) {
+    if (!IpaIsVirtualPath(path.c_str())) return path;
+    std::string dir = (g_sandboxDir.empty() ? g_workDir : g_sandboxDir) + "ipacache/";
+    std::string flat = path.substr(sizeof(IPA_MOUNT_PREFIX) - 1);
+    for (char& c : flat) if (c == '/') c = '_';
+    std::string out = dir + flat;
+    struct stat st;
+    if (stat(out.c_str(), &st) == 0 && st.st_size > 0) return out;
+    std::vector<unsigned char> raw;
+    if (!IpaReadAll(path, raw)) return path;
+    MakeDirsRecursive(dir);
+    FILE* f = fopen(out.c_str(), "wb");
+    if (!f) return path;
+    fwrite(raw.data(), 1, raw.size(), f);
+    fclose(f);
+    return out;
+}
+
+void AudioInitToJava(void* ptr, const std::string& path) { CallJNI_V_IS("audioInit", ptr, MaterializeForJava(path)); }
 void AudioPlayToJava(void* ptr) { CallJNI_V_I("audioPlay", ptr); }
 void AudioPauseToJava(void* ptr) { CallJNI_V_I("audioPause", ptr); }
 void AudioSetLoopingToJava(void* ptr, bool looping) { CallJNI_V_IZ("audioSetLooping", ptr, looping); }
@@ -1438,7 +1690,7 @@ float AudioGetDurationToJava(void* ptr) { return CallJNI_F_I("audioGetDuration",
 float AudioGetCurrentTimeToJava(void* ptr) { return CallJNI_F_I("audioGetCurrentTime", ptr); }
 void AudioSetCurrentTimeToJava(void* ptr, float time) { CallJNI_V_IF("audioSetCurrentTime", ptr, time); }
 
-void VideoInitToJava(void* ptr, const std::string& path) { CallJNI_V_IS("videoInit", ptr, path); }
+void VideoInitToJava(void* ptr, const std::string& path) { CallJNI_V_IS("videoInit", ptr, MaterializeForJava(path)); }
 void VideoPlayToJava(void* ptr) { CallJNI_V_I("videoPlay", ptr); }
 void VideoStopToJava(void* ptr) { CallJNI_V_I("videoStop", ptr); }
 
@@ -1474,12 +1726,12 @@ void AudioUnitStreamWriteToJava(const uint8_t* data, int size) {
 // ABSOLUTE MEGA DEBUGGER FOR 0x8 CRASH
 // ==========================================
 void _SyncLog(const std::string& msg) {
-    if (!g_logRenderDebug) return;
+    if (!LogCatOn(LOG_RENDER_DUMP)) return;
     _LogToJava(msg);
 }
 
 void DumpGLState(const std::string& prefix) {
-    if (!g_logRenderDebug) return;
+    if (!LogCatOn(LOG_RENDER_DUMP)) return;
 
     char buf[8192];
     int offset = 0;
@@ -1513,8 +1765,24 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
     // ФИКС ВЫЛЕТА (Signal 11 в драйвере): Очищаем мусорные биты расширений iOS (например 0x16640),
     // от которых Android-драйвер крашится при аппаратном рендере
     mask &= (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    if (A6Dbg()) {
+        LogToJava("[A6-RTT] glClear mask=" + std::to_string((unsigned)mask) + " fbo=" + std::to_string(g_lastActiveFBO) +
+                  " depthMask=" + std::to_string((int)g_depthMask) +
+                  " colorMask=" + std::to_string((int)g_colorMask[0]) + std::to_string((int)g_colorMask[1]) +
+                  std::to_string((int)g_colorMask[2]) + std::to_string((int)g_colorMask[3]));
+        static int a6DepthClears = 0;
+        if (mask & GL_COLOR_BUFFER_BIT) a6DepthClears = 0;
+        if (mask & GL_DEPTH_BUFFER_BIT) a6DepthClears++;
+        if ((g_a6FrameNo % 300) == 0 && g_a6FrameNo > 0 && !g_cpuColorBuffer.empty()) {
+            char p[192];
+            snprintf(p, sizeof(p), "%sa6_p%d_%dx%d.raw", g_workDir.c_str(), a6DepthClears, g_surfaceWidth, g_surfaceHeight);
+            FILE* fd = fopen(p, "wb");
+            if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
+            LogToJava(std::string("[A6-RTT] дамп прохода -> ") + p);
+        }
+    }
 
-    bool isSpamOn = (g_spamFiltersMask & (1 << 5)) != 0;
+    bool isSpamOn = (g_spamMask & (1u << LOG_RENDER_DUMP)) != 0;
     static int clear_cnt = 0; clear_cnt++;
     if (!isSpamOn || clear_cnt <= 30 || clear_cnt % 120 == 0) {
         SyncLog("ENTER MegaDebug_glClear(0x" + std::to_string(mask) + ")");
@@ -1568,15 +1836,28 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
             targetDepthBuf->resize(targetW * targetH, 1.0f);
         }
         
+        // По спеке GL очистка проходит через маски записи: выключенные каналы и
+        // выключенная запись глубины делают соответствующий glClear пустышкой.
         if (mask & GL_COLOR_BUFFER_BIT) {
             uint8_t cr = (uint8_t)(g_cpuClearColor[0] * 255.0f);
             uint8_t cg = (uint8_t)(g_cpuClearColor[1] * 255.0f);
             uint8_t cb = (uint8_t)(g_cpuClearColor[2] * 255.0f);
             uint8_t ca = (uint8_t)(g_cpuClearColor[3] * 255.0f);
             uint32_t baseColor = (ca << 24) | (cb << 16) | (cg << 8) | cr;
-            std::fill(targetColorBuf->begin(), targetColorBuf->end(), baseColor);
+            uint32_t keep = 0;
+            if (!g_colorMask[0]) keep |= 0x000000FF;
+            if (!g_colorMask[1]) keep |= 0x0000FF00;
+            if (!g_colorMask[2]) keep |= 0x00FF0000;
+            if (!g_colorMask[3]) keep |= 0xFF000000;
+            if (keep == 0) {
+                std::fill(targetColorBuf->begin(), targetColorBuf->end(), baseColor);
+            } else if (keep != 0xFFFFFFFF) {
+                uint32_t write = ~keep;
+                uint32_t masked = baseColor & write;
+                for (uint32_t& px : *targetColorBuf) px = (px & keep) | masked;
+            }
         }
-        if (mask & GL_DEPTH_BUFFER_BIT) {
+        if ((mask & GL_DEPTH_BUFFER_BIT) && g_depthMask) {
             std::fill(targetDepthBuf->begin(), targetDepthBuf->end(), 1.0f);
         }
     }
@@ -1590,7 +1871,7 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
 
 
 extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
-    bool isSpamOn = (g_spamFiltersMask & (1 << 5)) != 0;
+    bool isSpamOn = (g_spamMask & (1u << LOG_RENDER_DUMP)) != 0;
     static int swap_cnt = 0; swap_cnt++;
     if (!isSpamOn || swap_cnt <= 30 || swap_cnt % 120 == 0) {
         SyncLog("ENTER MegaDebug_eglSwapBuffers");
@@ -1765,7 +2046,7 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         // --- GPU ОВЕРЛЕИ ---
         // Модальные экраны UIKit живут только в CPU-буфере. Без этой заливки
         // они не попадают на экран вообще, пока не включён debug/FPS-оверлей.
-        if (g_onScreenDebugOverlay || g_showPerfOverlay || g_presentedView) {
+        if (g_onScreenDebugOverlay || g_showPerfOverlay || g_presentedView || g_cpuBufferDirty) {
             static GLuint overlayTex = 0;
             static GLuint overlayProg = 0;
             if (overlayTex == 0) {
@@ -1796,16 +2077,35 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             GLboolean blendEnabled = glIsEnabled(GL_BLEND);
             GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
             GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
-            
+            GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
+            // Игра может оставить нулевой или урезанный viewport (Wolf3D в меню держит 0x0),
+            // и тогда полноэкранный квад оверлея срезается целиком.
+            GLint oldViewport[4]; glGetIntegerv(GL_VIEWPORT, oldViewport);
+            // При offload игра держит привязанным собственный FBO из createFramebuffer:
+            // без переключения на экранный буфер оверлей уходит в него и на экран не попадает.
+            GLint oldFbo = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &oldFbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
+            glDisable(GL_SCISSOR_TEST);
+            glViewport(0, 0, g_surfaceWidth, g_surfaceHeight);
             
             glUseProgram(overlayProg);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, overlayTex);
             
+            if (A6Dbg() && (g_a6FrameNo % 300) == 0 && g_a6FrameNo > 0) {
+                char p[160]; snprintf(p, sizeof(p), "%sdump_999_%dx%d.raw", g_workDir.c_str(), g_surfaceWidth, g_surfaceHeight);
+                FILE* fd = fopen(p, "wb");
+                if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
+                int aMin = 255, aMax = 0; long aSum = 0;
+                for (size_t i = 0; i < g_cpuColorBuffer.size(); i += 97) { int a = (int)(g_cpuColorBuffer[i] >> 24); if (a < aMin) aMin = a; if (a > aMax) aMax = a; aSum += a; }
+                LogToJava("[A6-BIG] финальный буфер альфа min=" + std::to_string(aMin) + " max=" + std::to_string(aMax) +
+                          " avg=" + std::to_string(aSum / (long)(g_cpuColorBuffer.size() / 97 + 1)));
+            }
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
             glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
             
@@ -1840,13 +2140,17 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             glActiveTexture(oldActiveTex);
             glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
             glBlendFunc(g_blendSrc, g_blendDst);
+            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+            glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)oldFbo);
             if (!blendEnabled) glDisable(GL_BLEND);
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
+            if (scissorTest) glEnable(GL_SCISSOR_TEST);
         }
         
         // Очищаем буфер прозрачным цветом, чтобы в следующем кадре оверлеи рисовались на чистом фоне
         std::fill(g_cpuColorBuffer.begin(), g_cpuColorBuffer.end(), 0x00000000);
+        g_cpuBufferDirty = false;
 
         SyncLog("[RENDER] Отправка буфера на экран (GPU eglSwapBuffers)...");
         res = eglSwapBuffers(g_eglDisplay, g_eglSurface);
@@ -1856,10 +2160,23 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         if (ANativeWindow_lock(g_nativeWindow, &buffer, nullptr) == 0) {
             int copyW = (buffer.width < (int32_t)g_surfaceWidth) ? buffer.width : g_surfaceWidth;
             int copyH = (buffer.height < (int32_t)g_surfaceHeight) ? buffer.height : g_surfaceHeight;
+            if (A6Dbg()) {
+                static int once = 0;
+                if ((once++ % 300) == 0) {
+                    char path[192];
+                    snprintf(path, sizeof(path), "%sframe_%dx%d.raw", g_workDir.c_str(), g_surfaceWidth, g_surfaceHeight);
+                    FILE* f = fopen(path, "wb");
+                    if (f) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, f); fclose(f); }
+                    LogToJava(std::string("[A6-WIN] кадр сброшен в ") + path);
+                }
+            }
+            // Экранный кадр всегда непрозрачен: альфа в цветовом буфере — побочный продукт
+            // блендинга, и если отдать её SurfaceFlinger, он подмешает фон окна и кадр
+            // выцветет. Гасим альфу при выводе.
             for (int y = 0; y < copyH; y++) {
                 uint32_t* dst = (uint32_t*)((uint8_t*)buffer.bits + y * buffer.stride * 4);
                 uint32_t* src = &g_cpuColorBuffer[y * g_surfaceWidth];
-                memcpy(dst, src, copyW * 4);
+                for (int x = 0; x < copyW; x++) dst[x] = src[x] | 0xFF000000u;
             }
             ANativeWindow_unlockAndPost(g_nativeWindow);
         } else {
@@ -1880,7 +2197,34 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
 
 // OPENGL FBO REDIRECTORS
 // ==========================================
-extern "C" void Stub_glBindFramebuffer(GLenum target, GLuint framebuffer) { 
+static int g_a6FboTrace = 0;
+
+extern "C" void Stub_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, GLvoid* pix) {
+    if (A6Dbg())
+        LogToJava("[A6-RTT] glReadPixels " + std::to_string(w) + "x" + std::to_string(h) +
+                  " fmt=" + std::to_string((unsigned)fmt) + " buf=" + std::to_string(pix != nullptr));
+    glReadPixels(x, y, w, h, fmt, type, pix);
+}
+
+extern "C" void Stub_glGenFramebuffers(GLsizei n, GLuint* fb) {
+    glGenFramebuffers(n, fb);
+    if (A6Dbg() && g_a6FboTrace < 120 && fb && n > 0) {
+        g_a6FboTrace++;
+        LogToJava("[A6-RTT] glGenFramebuffers n=" + std::to_string(n) + " -> " + std::to_string(fb[0]));
+    }
+}
+extern "C" void Stub_glGenRenderbuffers(GLsizei n, GLuint* rb) {
+    glGenRenderbuffers(n, rb);
+    if (A6Dbg() && g_a6FboTrace < 120 && rb && n > 0) {
+        g_a6FboTrace++;
+        LogToJava("[A6-RTT] glGenRenderbuffers n=" + std::to_string(n) + " -> " + std::to_string(rb[0]));
+    }
+}
+
+extern "C" void Stub_glBindFramebuffer(GLenum target, GLuint framebuffer) {
+    if (A6Dbg() && framebuffer != g_lastActiveFBO) {
+        LogToJava("[A6-RTT] FBO " + std::to_string(g_lastActiveFBO) + " -> " + std::to_string(framebuffer));
+    }
     g_lastActiveFBO = framebuffer;
     if (g_gpuOffloadMask & 64) {
         if (framebuffer == 1) glBindFramebuffer(target, 0); else glBindFramebuffer(target, framebuffer); 
@@ -1891,7 +2235,12 @@ extern "C" void Stub_glBindRenderbuffer(GLenum target, GLuint renderbuffer) {
         if (renderbuffer == 1 || renderbuffer == 2) glBindRenderbuffer(target, 0); else glBindRenderbuffer(target, renderbuffer); 
     }
 }
-extern "C" void Stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) { 
+extern "C" void Stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
+    if (A6Dbg() && g_a6FboTrace < 120) {
+        g_a6FboTrace++;
+        LogToJava("[A6-RTT] glFramebufferRenderbuffer fbo=" + std::to_string(g_lastActiveFBO) +
+                  " attachment=0x" + std::to_string((unsigned)attachment) + " rb=" + std::to_string(renderbuffer));
+    }
     if (g_gpuOffloadMask & 64) {
         if (renderbuffer == 1 || renderbuffer == 2) return; glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); 
     }
@@ -1928,9 +2277,13 @@ extern "C" void Stub_glBindAttribLocation(GLuint program, GLuint index, const GL
 }
 
 extern "C" void Stub_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
-    GLint bound_fbo = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound_fbo);
-    if (bound_fbo != 0 && attachment == 0x8CE0) {
-        g_fboColorTex[bound_fbo] = texture;
+    // Биндинг берём из своего состояния: при выключенном офлоаде glBindFramebuffer
+    // до реального GL не доходит, и GL_FRAMEBUFFER_BINDING всегда отдаёт 0.
+    A6Log("[A6-RTT] glFramebufferTexture2D fbo=" + std::to_string(g_lastActiveFBO) +
+          " attachment=" + std::to_string((unsigned)attachment) + " tex=" + std::to_string(texture));
+    if (g_lastActiveFBO != 0 && attachment == 0x8CE0) {
+        g_fboColorTex[g_lastActiveFBO] = texture;
+        A6Log("[A6-RTT] FBO " + std::to_string(g_lastActiveFBO) + " рисует в tex=" + std::to_string(texture));
     }
     if (texture != 0) {
         g_fboTextures[texture] = true;
@@ -1939,7 +2292,6 @@ extern "C" void Stub_glFramebufferTexture2D(GLenum target, GLenum attachment, GL
 }
 
 extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) { 
-    LogToJava("[GL-TRACE] glViewport(" + std::to_string(x) + ", " + std::to_string(y) + ", " + std::to_string(width) + ", " + std::to_string(height) + ")");
     if (width == 0 && height == 0) {
         g_isFakeViewport = true;
         width = 480;
@@ -2171,18 +2523,74 @@ extern "C" void Stub_glShaderSource(GLuint shader, GLsizei count, const GLchar *
         } else {
             patched = wrapper + patched;
         }
-        patched += "\n#undef main\nvoid main() {\n  damn_main();\n  if (u_damn_rot > 0.5) gl_Position.xy = vec2(-gl_Position.y, gl_Position.x);\n}\n";
+        // u_damn_rot — число четвертей поворота против часовой, 0..3
+        patched += "\n#undef main\nvoid main() {\n  damn_main();\n"
+                   "  if (u_damn_rot > 0.5) {\n"
+                   "    if (u_damn_rot < 1.5) gl_Position.xy = vec2(-gl_Position.y, gl_Position.x);\n"
+                   "    else if (u_damn_rot < 2.5) gl_Position.xy = -gl_Position.xy;\n"
+                   "    else gl_Position.xy = vec2(gl_Position.y, -gl_Position.x);\n"
+                   "  }\n}\n";
     }
     
     LogToJava("[SHADER-DUMP] Compiling Shader ID " + std::to_string(shader) + "\n=== CODE ===\n" + patched + "\n============");
 
-    const GLchar* p = patched.c_str(); 
+    g_shaderSrc[shader] = fullSrc;
+
+    const GLchar* p = patched.c_str();
     GLint l = patched.length();
     glShaderSource(shader, 1, &p, &l); 
 }
 
 extern "C" void Stub_glCompileShader(GLuint shader) { glCompileShader(shader); GLint status = 0; glGetShaderiv(shader, GL_COMPILE_STATUS, &status); if (status == GL_FALSE) { GLint logLength = 0; glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetShaderInfoLog(shader, logLength, nullptr, log.data()); LogToJava(std::string("[SHADER-DUMP] ОШИБКА КОМПИЛЯЦИИ: ") + log.data()); } } }
-extern "C" void Stub_glLinkProgram(GLuint program) { glLinkProgram(program); GLint status = 0; glGetProgramiv(program, GL_LINK_STATUS, &status); if (status == GL_FALSE) { GLint logLength = 0; glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetProgramInfoLog(program, logLength, nullptr, log.data()); LogToJava(std::string("[SHADER-DUMP] ОШИБКА ЛИНКОВКИ: ") + log.data()); } } }
+// Определяет, как программа собирает выходной цвет, по исходникам её шейдеров.
+// Проверять именно присваивания обязательно: в renderchunk CURRENT_COLOR — это
+// скалярное смещение тумана (len += CURRENT_COLOR.r), а не тинт, и умножать
+// на него геометрию нельзя.
+static int DetectSWColorModel(const std::string& src) {
+    std::string s;
+    s.reserve(src.size());
+    for (size_t i = 0; i < src.size(); i++) {
+        if (!isspace((unsigned char)src[i])) s += src[i];
+    }
+
+    if (s.find("mix(CURRENT_COLOR,FOG_COLOR,") != std::string::npos) return SWCM_SKYMIX;
+
+    static const char* kTargets[] = {"gl_FragColor=", "color=", "diffuse="};
+    for (size_t t = 0; t < sizeof(kTargets) / sizeof(kTargets[0]); t++) {
+        const std::string lhs = kTargets[t];
+        size_t p = 0;
+        while ((p = s.find(lhs, p)) != std::string::npos) {
+            size_t start = p + lhs.size();
+            size_t end = s.find(';', start);
+            if (end == std::string::npos) break;
+            if (s.substr(start, end - start).find("CURRENT_COLOR") != std::string::npos) return SWCM_TINT;
+            p = start;
+        }
+    }
+    return SWCM_DEFAULT;
+}
+
+extern "C" void Stub_glLinkProgram(GLuint program) {
+    glLinkProgram(program);
+    GLint status = 0; glGetProgramiv(program, GL_LINK_STATUS, &status);
+    if (status == GL_FALSE) { GLint logLength = 0; glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetProgramInfoLog(program, logLength, nullptr, log.data()); LogToJava(std::string("[SHADER-DUMP] ОШИБКА ЛИНКОВКИ: ") + log.data()); } }
+
+    GLuint attached[8] = {0};
+    GLsizei nAttached = 0;
+    glGetAttachedShaders(program, 8, &nAttached, attached);
+    int model = SWCM_DEFAULT;
+    bool samplesTex1 = false;
+    for (GLsizei i = 0; i < nAttached; i++) {
+        if (!g_shaderSrc.count(attached[i])) continue;
+        const std::string& src = g_shaderSrc[attached[i]];
+        int m = DetectSWColorModel(src);
+        if (m > model) model = m;
+        if (src.find("TEXTURE_1") != std::string::npos) samplesTex1 = true;
+    }
+    g_progColorModel[program] = model;
+    g_progSamplesTex1[program] = samplesTex1;
+    LogToJava("[SHADER-DUMP] Программа " + std::to_string(program) + ": модель цвета CPU = " + std::to_string(model) + " tex1=" + std::to_string((int)samplesTex1));
+}
 
 extern GLuint g_uiProgram;
 extern GLuint g_textProgram;
@@ -2195,6 +2603,160 @@ std::map<GLuint, int> g_cpuTexH;
 GLuint g_cpuActiveTexture = 0;
 int g_cpuTextureUnit = 0;
 GLuint g_cpuUnitTexture[8] = {0};
+// Константы текстурного окружения есть только в ES 1.1, а собираемся мы по заголовкам ES 2.0.
+#ifndef GL_TEXTURE_ENV
+#define GL_TEXTURE_ENV      0x2300
+#endif
+#ifndef GL_TEXTURE_ENV_MODE
+#define GL_TEXTURE_ENV_MODE 0x2200
+#endif
+#ifndef GL_MODULATE
+#define GL_MODULATE         0x2100
+#endif
+#ifndef GL_DECAL
+#define GL_DECAL            0x2101
+#endif
+#ifndef GL_ADD
+#define GL_ADD              0x0104
+#endif
+#ifndef GL_COMBINE
+#define GL_COMBINE          0x8570
+#endif
+// GL_TEXTURE_ENV_MODE каждого юнита. Растеризатор раньше всегда модулировал текстуру
+// на цвет вершины, из-за чего GL_REPLACE-геометрия чернела там, где цвет вершины тёмный.
+GLenum g_texEnvMode[8] = {GL_MODULATE, GL_MODULATE, GL_MODULATE, GL_MODULATE,
+                          GL_MODULATE, GL_MODULATE, GL_MODULATE, GL_MODULATE};
+// Настройка GL_COMBINE каждого юнита. Asphalt 6 собирает на первом юните
+// отражение кузова именно комбайнером, и без него машина остаётся плоской.
+// Выгрузка загруженных текстур в .raw, чтобы глазами сверить, ту ли картинку
+// враппер натягивает на кузов.
+static void A6DumpTexture(GLuint tex, const std::vector<uint32_t>& buf, int w, int h) {
+    if (!A6Dbg() || w <= 0 || h <= 0 || buf.empty()) return;
+    static std::set<GLuint> dumped;
+    if (tex > 64 || !dumped.insert(tex).second) return;
+    char p[192];
+    snprintf(p, sizeof(p), "%sa6tex_%02u_%dx%d.raw", g_workDir.c_str(), (unsigned)tex, w, h);
+    FILE* f = fopen(p, "wb");
+    if (f) { fwrite(buf.data(), 4, (size_t)w * h, f); fclose(f); }
+}
+
+struct SWTexCombine {
+    GLenum combineRGB = GL_MODULATE;
+    GLenum combineAlpha = GL_MODULATE;
+    GLenum srcRGB[3]     = {GL_TEXTURE, 0x8578 /*GL_PREVIOUS*/, 0x8576 /*GL_CONSTANT*/};
+    GLenum srcAlpha[3]   = {GL_TEXTURE, 0x8578, 0x8576};
+    GLenum operandRGB[3] = {GL_SRC_COLOR, GL_SRC_COLOR, GL_SRC_ALPHA};
+    GLenum operandAlpha[3] = {GL_SRC_ALPHA, GL_SRC_ALPHA, GL_SRC_ALPHA};
+    float rgbScale = 1.0f;
+    float alphaScale = 1.0f;
+    float envColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+SWTexCombine g_texCombine[8];
+
+// Одна ступень текстурного окружения ES 1.1. i* — выход предыдущей ступени
+// (для нулевого юнита это цвет вершины), t* — тексель ступени, v* — цвет вершины.
+static inline void SWApplyTexEnv(GLenum envMode, const SWTexCombine& C,
+                                 int& ir, int& ig, int& ib, int& ia,
+                                 int tr, int tg, int tb, int ta,
+                                 int vr, int vg, int vb, int va) {
+    switch (envMode) {
+        case GL_REPLACE: ir = tr; ig = tg; ib = tb; ia = ta; return;
+        case GL_DECAL: {
+            int inv = 255 - ta;
+            ir = (ir * inv + tr * ta) / 255;
+            ig = (ig * inv + tg * ta) / 255;
+            ib = (ib * inv + tb * ta) / 255;
+            return;   // альфа фрагмента при GL_DECAL не меняется
+        }
+        case GL_ADD: ir += tr; ig += tg; ib += tb; ia = (ia * ta) / 255; return;
+        case 0x0BE2: { // GL_BLEND — смешивание с цветом окружения по цвету текселя
+            int cr = (int)(C.envColor[0] * 255.0f);
+            int cg = (int)(C.envColor[1] * 255.0f);
+            int cb = (int)(C.envColor[2] * 255.0f);
+            ir = (ir * (255 - tr) + cr * tr) / 255;
+            ig = (ig * (255 - tg) + cg * tg) / 255;
+            ib = (ib * (255 - tb) + cb * tb) / 255;
+            ia = (ia * ta) / 255;
+            return;
+        }
+        case 0x8570: break; // GL_COMBINE — считаем ниже
+        default: // GL_MODULATE
+            ir = (ir * tr) / 255; ig = (ig * tg) / 255; ib = (ib * tb) / 255; ia = (ia * ta) / 255;
+            return;
+    }
+
+    const int pr = ir, pg = ig, pb = ib, pa = ia;
+    int cr = (int)(C.envColor[0] * 255.0f), cg = (int)(C.envColor[1] * 255.0f);
+    int cb = (int)(C.envColor[2] * 255.0f), ca = (int)(C.envColor[3] * 255.0f);
+
+    int argR[3], argG[3], argB[3], argA[3];
+    for (int n = 0; n < 3; n++) {
+        int sr, sg, sb, sa;
+        switch (C.srcRGB[n]) {
+            case GL_TEXTURE:  sr = tr; sg = tg; sb = tb; sa = ta; break;
+            case 0x8576:      sr = cr; sg = cg; sb = cb; sa = ca; break; // GL_CONSTANT
+            case 0x8577:      sr = vr; sg = vg; sb = vb; sa = va; break; // GL_PRIMARY_COLOR
+            default:          sr = pr; sg = pg; sb = pb; sa = pa; break; // GL_PREVIOUS
+        }
+        switch (C.operandRGB[n]) {
+            case 0x0301: argR[n] = 255 - sr; argG[n] = 255 - sg; argB[n] = 255 - sb; break; // ONE_MINUS_SRC_COLOR
+            case GL_SRC_ALPHA: argR[n] = argG[n] = argB[n] = sa; break;
+            case 0x0303: argR[n] = argG[n] = argB[n] = 255 - sa; break;                     // ONE_MINUS_SRC_ALPHA
+            default: argR[n] = sr; argG[n] = sg; argB[n] = sb; break;                       // SRC_COLOR
+        }
+        switch (C.srcAlpha[n]) {
+            case GL_TEXTURE: sa = ta; break;
+            case 0x8576:     sa = ca; break;
+            case 0x8577:     sa = va; break;
+            default:         sa = pa; break;
+        }
+        argA[n] = (C.operandAlpha[n] == 0x0303) ? (255 - sa) : sa; // ONE_MINUS_SRC_ALPHA
+    }
+
+    auto combine3 = [](GLenum func, int a0, int a1, int a2) -> int {
+        switch (func) {
+            case GL_REPLACE:  return a0;
+            case GL_ADD:      return a0 + a1;
+            case 0x8574:      return a0 + a1 - 128;                      // GL_ADD_SIGNED
+            case 0x84E7:      return a0 - a1;                            // GL_SUBTRACT
+            case 0x8575:      return (a0 * a2 + a1 * (255 - a2)) / 255;  // GL_INTERPOLATE
+            default:          return (a0 * a1) / 255;                    // GL_MODULATE
+        }
+    };
+
+    if (C.combineRGB == 0x86AE || C.combineRGB == 0x86AF) { // GL_DOT3_RGB / GL_DOT3_RGBA
+        int dot = 4 * ((argR[0] - 128) * (argR[1] - 128) +
+                       (argG[0] - 128) * (argG[1] - 128) +
+                       (argB[0] - 128) * (argB[1] - 128)) / 255;
+        if (dot < 0) dot = 0; else if (dot > 255) dot = 255;
+        ir = ig = ib = dot;
+        ia = (C.combineRGB == 0x86AF) ? dot : combine3(C.combineAlpha, argA[0], argA[1], argA[2]);
+    } else {
+        ir = combine3(C.combineRGB, argR[0], argR[1], argR[2]);
+        ig = combine3(C.combineRGB, argG[0], argG[1], argG[2]);
+        ib = combine3(C.combineRGB, argB[0], argB[1], argB[2]);
+        ia = combine3(C.combineAlpha, argA[0], argA[1], argA[2]);
+    }
+
+    if (C.rgbScale != 1.0f) { ir = (int)(ir * C.rgbScale); ig = (int)(ig * C.rgbScale); ib = (int)(ib * C.rgbScale); }
+    if (C.alphaScale != 1.0f) ia = (int)(ia * C.alphaScale);
+    if (ir < 0) ir = 0; else if (ir > 255) ir = 255;
+    if (ig < 0) ig = 0; else if (ig > 255) ig = 255;
+    if (ib < 0) ib = 0; else if (ib > 255) ib = 255;
+    if (ia < 0) ia = 0; else if (ia > 255) ia = 255;
+}
+float g_a6RawC0[4] = {0};   // цвет первой вершины до освещения
+float g_a6UV[4] = {0};      // umin,vmin,umax,vmax за отрисовку
+bool g_a6TintByTexture = false;
+static long g_dbgPixels = 0, g_dbgSkipA0 = 0;
+// куда деваются пиксели draw'а
+static long g_dbgCovered = 0, g_dbgRejDepth = 0, g_dbgRejW = 0, g_dbgRejAT = 0;
+static double g_dbgZfMin = 0, g_dbgZfMax = 0, g_dbgZbMin = 0, g_dbgZbMax = 0;
+// сырые позиции первых вершин и параметры массива
+static float g_dbgRawPos[6][4];
+static int g_dbgRawN = 0, g_dbgPosSize = 0, g_dbgPosStride = 0;
+static unsigned g_dbgPosType = 0;
+static float g_dbgMvp[16];
 extern int g_clientActiveTexture;
 
 // Вспомогательная функция для вычисления точного размера текстуры в байтах
@@ -2223,10 +2785,67 @@ extern "C" void Stub_glActiveTexture(GLenum texture) {
 
 extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
     if (target == GL_TEXTURE_2D) {
+        if (A6Dbg() && g_texCreatedEmpty.count(texture))
+            LogToJava("[A6-RTT] bind пустой tex=" + std::to_string(texture));
         g_cpuActiveTexture = texture;
         g_cpuUnitTexture[g_cpuTextureUnit] = texture;
     }
     if (g_gpuOffloadMask & 8) glBindTexture(target, texture);
+}
+
+// Фильтр увеличения каждой текстуры. Растеризатор раньше всегда брал ближайший
+// тексель, из-за чего мелкий шрифт и отражения рассыпались в квадраты.
+std::map<GLuint, GLenum> g_cpuTexMagFilter;
+
+static void RememberTexFilter(GLenum target, GLenum pname, GLint param) {
+    if (target != GL_TEXTURE_2D || pname != GL_TEXTURE_MAG_FILTER) return;
+    g_cpuTexMagFilter[g_cpuActiveTexture] = (GLenum)param;
+}
+
+// ES1 строит мипмапы через параметр текстуры, в ES2 такого параметра нет:
+// без перевода в glGenerateMipmap текстура с мип-фильтром остаётся неполной
+// и драйвер рисует ею чёрное.
+#define DW_GL_GENERATE_MIPMAP 0x8191
+static std::set<GLuint> g_texAutoMipmap;
+// Мип-фильтр без залитых уровней делает текстуру неполной, и драйвер отдаёт чёрное.
+// Игры для PowerVR так делают (Wolf3D грузит один уровень PVRTC), поэтому уровни
+// достраиваем сами — программный растеризатор мипмапы всё равно игнорирует.
+static std::map<GLuint, GLenum> g_cpuTexMinFilter;
+
+static bool MinFilterNeedsMipmaps(GLenum f) {
+    return f == GL_NEAREST_MIPMAP_NEAREST || f == GL_LINEAR_MIPMAP_NEAREST ||
+           f == GL_NEAREST_MIPMAP_LINEAR  || f == GL_LINEAR_MIPMAP_LINEAR;
+}
+
+static bool HandleTexParameter(GLenum target, GLenum pname, GLint param) {
+    if (target != GL_TEXTURE_2D) return false;
+    if (pname == DW_GL_GENERATE_MIPMAP) {
+        if (param) g_texAutoMipmap.insert(g_cpuActiveTexture);
+        else g_texAutoMipmap.erase(g_cpuActiveTexture);
+        return true;
+    }
+    if (pname == GL_TEXTURE_MIN_FILTER) g_cpuTexMinFilter[g_cpuActiveTexture] = (GLenum)param;
+    return false;
+}
+
+static void ApplyAutoMipmap(GLenum target, GLint level) {
+    if (!(g_gpuOffloadMask & 8) || target != GL_TEXTURE_2D || level != 0) return;
+    GLenum minF = GL_NEAREST_MIPMAP_LINEAR; // умолчание GL
+    auto it = g_cpuTexMinFilter.find(g_cpuActiveTexture);
+    if (it != g_cpuTexMinFilter.end()) minF = it->second;
+    if (g_texAutoMipmap.count(g_cpuActiveTexture) || MinFilterNeedsMipmaps(minF)) glGenerateMipmap(target);
+}
+
+extern "C" void Stub_glTexParameteri(GLenum target, GLenum pname, GLint param) {
+    RememberTexFilter(target, pname, param);
+    if (HandleTexParameter(target, pname, param)) return;
+    if (g_gpuOffloadMask & 8) glTexParameteri(target, pname, param);
+}
+
+extern "C" void Stub_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
+    RememberTexFilter(target, pname, (GLint)param);
+    if (HandleTexParameter(target, pname, (GLint)param)) return;
+    if (g_gpuOffloadMask & 8) glTexParameterf(target, pname, param);
 }
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
@@ -2236,13 +2855,27 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
         g_cpuActiveTexture, width, height, (unsigned)internalformat, (unsigned)format, (unsigned)type, pixels != nullptr);
     LogToJava(logbuf);
     if (target == GL_TEXTURE_2D && level == 0) {
+        if (width <= 0 || height <= 0 || (int64_t)width * (int64_t)height > 4096LL * 4096LL) {
+            char eb[192];
+            snprintf(eb, sizeof(eb), "GL-ERROR: glTexImage2D невменяемые размеры w=%d h=%d intFmt=0x%X fmt=0x%X type=0x%X pixels=%d",
+                width, height, (unsigned)internalformat, (unsigned)format, (unsigned)type, pixels != nullptr);
+            LogToJava(eb);
+            return;
+        }
         g_cpuTexW[g_cpuActiveTexture] = width;
         g_cpuTexH[g_cpuActiveTexture] = height;
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
-        texBuf.resize(width * height);
-        
+        texBuf.resize((size_t)width * (size_t)height);
+
         if (!pixels) {
-            std::fill(texBuf.begin(), texBuf.end(), 0xFF000000);
+            // GL оставляет содержимое неопределённым, на железе это нули. Непрозрачный
+            // чёрный тут заливал бы кадр, если игра так и не наполнит текстуру.
+            std::fill(texBuf.begin(), texBuf.end(), 0x00000000);
+            g_texCreatedEmpty.insert(g_cpuActiveTexture);
+            A6Log("[A6-RTT] текстура без данных tex=" + std::to_string(g_cpuActiveTexture) +
+                  " " + std::to_string(width) + "x" + std::to_string(height) +
+                  " intFmt=0x" + std::to_string((unsigned)internalformat) +
+                  " создал " + GetModuleInfoForAddress((uint32_t)(uintptr_t)__builtin_return_address(0)));
         } else {
             // Намеренно не вызываем glGetIntegerv(GL_UNPACK_ALIGNMENT) — может крашить MTK.
             // Используем alignment=4 (дефолт OpenGL ES; Wolf3D не меняет glPixelStorei).
@@ -2346,6 +2979,7 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
                 std::fill(texBuf.begin(), texBuf.end(), 0xFFFF00FF);
             }
         }
+        A6DumpTexture(g_cpuActiveTexture, texBuf, width, height);   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
     }
 
     // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО (ИСПРАВЛЕНИЕ КРАША MTK) ---
@@ -2397,10 +3031,66 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
             safe_pixels = converted_buf.data();
         }
     }
-    if (g_gpuOffloadMask & 8) glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    if (g_gpuOffloadMask & 8) {
+        glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+        ApplyAutoMipmap(target, level);
+    }
+}
+
+// Текущий цветовой буфер CPU-растеризатора: экран либо текстура, привязанная к FBO.
+static std::vector<uint32_t>* CPUCurrentColorTarget(int* outW, int* outH) {
+    if (g_lastActiveFBO != 0 && g_fboColorTex.count(g_lastActiveFBO)) {
+        GLuint tex = g_fboColorTex[g_lastActiveFBO];
+        if (tex != 0 && g_cpuTexW.count(tex) && g_cpuTexW[tex] > 0) {
+            *outW = g_cpuTexW[tex]; *outH = g_cpuTexH[tex];
+            return &g_cpuTextures[tex];
+        }
+    }
+    *outW = g_surfaceWidth; *outH = g_surfaceHeight;
+    return &g_cpuColorBuffer;
+}
+
+// GL кладёт начало координат кадра внизу, а CPU-буферы тут хранятся сверху вниз.
+static void CPUCopyFramebufferToTexture(GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
+    if (!g_cpuTextures.count(g_cpuActiveTexture)) return;
+    int srcW = 0, srcH = 0;
+    std::vector<uint32_t>* src = CPUCurrentColorTarget(&srcW, &srcH);
+    std::vector<uint32_t>& dst = g_cpuTextures[g_cpuActiveTexture];
+    int dstW = g_cpuTexW[g_cpuActiveTexture], dstH = g_cpuTexH[g_cpuActiveTexture];
+    if (srcW <= 0 || dstW <= 0) return;
+    for (int row = 0; row < height; row++) {
+        int dy = yoffset + row;
+        int sy = srcH - 1 - (y + row);
+        if (dy < 0 || dy >= dstH || sy < 0 || sy >= srcH) continue;
+        for (int col = 0; col < width; col++) {
+            int dx = xoffset + col, sx = x + col;
+            if (dx < 0 || dx >= dstW || sx < 0 || sx >= srcW) continue;
+            dst[(size_t)dy * dstW + dx] = (*src)[(size_t)sy * srcW + sx] | 0xFF000000u;
+        }
+    }
+}
+
+extern "C" void Stub_glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border) {
+    A6Log("[A6-RTT] glCopyTexImage2D tex=" + std::to_string(g_cpuActiveTexture) + " " + std::to_string(width) + "x" + std::to_string(height));
+    if (target == GL_TEXTURE_2D && level == 0 && width > 0 && height > 0) {
+        g_cpuTexW[g_cpuActiveTexture] = width;
+        g_cpuTexH[g_cpuActiveTexture] = height;
+        g_cpuTextures[g_cpuActiveTexture].assign((size_t)width * height, 0xFF000000u);
+        CPUCopyFramebufferToTexture(0, 0, x, y, width, height);
+    }
+    if (g_gpuOffloadMask & 8) glCopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+}
+
+extern "C" void Stub_glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
+    A6Log("[A6-RTT] glCopyTexSubImage2D tex=" + std::to_string(g_cpuActiveTexture) + " " + std::to_string(width) + "x" + std::to_string(height));
+    if (target == GL_TEXTURE_2D && level == 0) CPUCopyFramebufferToTexture(xoffset, yoffset, x, y, width, height);
+    if (g_gpuOffloadMask & 8) glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
 }
 
 extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
+    if (A6Dbg() && g_texCreatedEmpty.count(g_cpuActiveTexture))
+        LogToJava("[A6-RTT] glTexSubImage2D наполняет пустую tex=" + std::to_string(g_cpuActiveTexture) +
+                  " " + std::to_string(width) + "x" + std::to_string(height) + " pixels=" + std::to_string(pixels != nullptr));
     if (target == GL_TEXTURE_2D && level == 0 && pixels && g_cpuTextures.count(g_cpuActiveTexture)) {
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
         int texW = g_cpuTexW[g_cpuActiveTexture];
@@ -2472,6 +3162,41 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
                         texBuf[(yoffset + y) * texW + (xoffset + x)] = (a<<24) | (b<<16) | (g<<8) | r;
                     }
                 }
+            } else if (format == 0x80E1 && type == GL_UNSIGNED_BYTE) { // GL_BGRA_EXT
+                int rowLength = width * 4;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y = 0; y < height; y++) {
+                    const uint32_t* row = (const uint32_t*)(src + y * stride);
+                    for (int x = 0; x < width; x++) {
+                        uint32_t px = row[x];
+                        uint8_t b = px & 0xFF; uint8_t g = (px >> 8) & 0xFF;
+                        uint8_t r = (px >> 16) & 0xFF; uint8_t a = (px >> 24) & 0xFF;
+                        texBuf[(yoffset + y) * texW + (xoffset + x)] = (a<<24) | (b<<16) | (g<<8) | r;
+                    }
+                }
+            } else if (format == 0x1909 && type == GL_UNSIGNED_BYTE) { // GL_LUMINANCE
+                int rowLength = width * 1;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y = 0; y < height; y++) {
+                    const uint8_t* row = src + y * stride;
+                    for (int x = 0; x < width; x++) {
+                        uint8_t l = row[x];
+                        texBuf[(yoffset + y) * texW + (xoffset + x)] = 0xFF000000 | (l<<16) | (l<<8) | l;
+                    }
+                }
+            } else if (format == 0x190A && type == GL_UNSIGNED_BYTE) { // GL_LUMINANCE_ALPHA
+                int rowLength = width * 2;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y = 0; y < height; y++) {
+                    const uint8_t* row = src + y * stride;
+                    for (int x = 0; x < width; x++) {
+                        uint8_t l = row[x*2]; uint8_t a = row[x*2+1];
+                        texBuf[(yoffset + y) * texW + (xoffset + x)] = (a<<24) | (l<<16) | (l<<8) | l;
+                    }
+                }
             } else if (format == GL_ALPHA && type == GL_UNSIGNED_BYTE) {
                 int rowLength = width * 1;
                 int stride = rowLength + ((align - (rowLength % align)) % align);
@@ -2482,6 +3207,9 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
                         texBuf[(yoffset + y) * texW + (xoffset + x)] = (row[x]<<24) | 0x00FFFFFF;
                     }
                 }
+            } else {
+                LogToJava("[GL-TRACE][GL-TEX] glTexSubImage2D: формат не поддержан fmt=0x" +
+                          std::to_string(format) + " type=0x" + std::to_string(type));
             }
         }
     }
@@ -2493,6 +3221,249 @@ extern "C" void Stub_glCompressedTexSubImage2D(GLenum target, GLint level, GLint
     if (g_gpuOffloadMask & 8) glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 }
 
+// ---- Программный декодер PVRTC v1 (2bpp/4bpp) ----
+// Алгоритм PowerVR: слово 8 байт = две «якорные» точки + модуляция; итоговый пиксель —
+// билинейная смесь якорей соседних 2x2 слов. Слова лежат в порядке Мортона (twiddled).
+namespace pvrtc {
+
+struct Word { uint32_t modulation; uint32_t color; };
+struct PixelS { int32_t r, g, b, a; };
+
+static void ColorA(uint32_t c, PixelS& o) {
+    if (c & 0x8000) {                                   // непрозрачный, RGB 554
+        o.r = (c & 0x7c00) >> 10;
+        o.g = (c & 0x03e0) >> 5;
+        o.b = (c & 0x001e) | ((c & 0x001e) >> 4);
+        o.a = 0xf;
+    } else {                                            // с альфой, ARGB 3443
+        o.r = ((c & 0x0f00) >> 7) | ((c & 0x0f00) >> 11);
+        o.g = ((c & 0x00f0) >> 3) | ((c & 0x00f0) >> 7);
+        o.b = ((c & 0x000e) << 1) | ((c & 0x000e) >> 2);
+        o.a = (c & 0x7000) >> 11;
+    }
+}
+
+static void ColorB(uint32_t c, PixelS& o) {
+    if (c & 0x80000000) {                               // непрозрачный, RGB 555
+        o.r = (c & 0x7c000000) >> 26;
+        o.g = (c & 0x03e00000) >> 21;
+        o.b = (c & 0x001f0000) >> 16;
+        o.a = 0xf;
+    } else {                                            // с альфой, ARGB 4443
+        o.r = ((c & 0x0f000000) >> 23) | ((c & 0x0f000000) >> 27);
+        o.g = ((c & 0x00f00000) >> 19) | ((c & 0x00f00000) >> 23);
+        o.b = ((c & 0x000f0000) >> 15) | ((c & 0x000f0000) >> 19);
+        o.a = (c & 0x70000000) >> 27;
+    }
+}
+
+static void Interpolate(const PixelS& P, const PixelS& Q, const PixelS& R, const PixelS& S, PixelS* out, int bpp) {
+    const int wordW = (bpp == 2) ? 8 : 4;
+    const int wordH = 4;
+    PixelS hP = P, hQ = Q, hR = R, hS = S;
+    PixelS dQP = { hQ.r - hP.r, hQ.g - hP.g, hQ.b - hP.b, hQ.a - hP.a };
+    PixelS dSR = { hS.r - hR.r, hS.g - hR.g, hS.b - hR.b, hS.a - hR.a };
+    hP.r *= wordW; hP.g *= wordW; hP.b *= wordW; hP.a *= wordW;
+    hR.r *= wordW; hR.g *= wordW; hR.b *= wordW; hR.a *= wordW;
+    for (int x = 0; x < wordW; x++) {
+        PixelS acc = { 4 * hP.r, 4 * hP.g, 4 * hP.b, 4 * hP.a };
+        PixelS dY = { hR.r - hP.r, hR.g - hP.g, hR.b - hP.b, hR.a - hP.a };
+        for (int y = 0; y < wordH; y++) {
+            PixelS& px = out[y * wordW + x];
+            if (bpp == 2) {
+                px.r = (acc.r >> 7) + (acc.r >> 2);
+                px.g = (acc.g >> 7) + (acc.g >> 2);
+                px.b = (acc.b >> 7) + (acc.b >> 2);
+                px.a = (acc.a >> 5) + (acc.a >> 1);
+            } else {
+                px.r = (acc.r >> 6) + (acc.r >> 1);
+                px.g = (acc.g >> 6) + (acc.g >> 1);
+                px.b = (acc.b >> 6) + (acc.b >> 1);
+                px.a = (acc.a >> 4) + acc.a;
+            }
+            acc.r += dY.r; acc.g += dY.g; acc.b += dY.b; acc.a += dY.a;
+        }
+        hP.r += dQP.r; hP.g += dQP.g; hP.b += dQP.b; hP.a += dQP.a;
+        hR.r += dSR.r; hR.g += dSR.g; hR.b += dSR.b; hR.a += dSR.a;
+    }
+}
+
+static void UnpackModulation(const Word& w, int offX, int offY, int32_t values[8][16], int32_t modes[8][16], int bpp) {
+    uint32_t mode = w.color & 1;
+    uint32_t bits = w.modulation;
+    if (bpp == 2) {
+        if (mode) {
+            if (bits & 1) {
+                // Центральный тексель (y=2,x=4) отдаёт свой младший бит под выбор H/V-режима,
+                // поэтому его значение достраивается вручную до полноценных двух бит.
+                mode = (bits & (1u << 20)) ? 3 : 2;
+                if (bits & (1u << 21)) bits |= (1u << 20); else bits &= ~(1u << 20);
+            }
+            if (bits & 2) bits |= 1; else bits &= ~1u;
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 8; x++) {
+                    modes[y + offY][x + offX] = (int32_t)mode;
+                    if (((x ^ y) & 1) == 0) { values[y + offY][x + offX] = (int32_t)(bits & 3); bits >>= 2; }
+                }
+            }
+        } else {
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 8; x++) {
+                    modes[y + offY][x + offX] = 0;
+                    values[y + offY][x + offX] = (bits & 1) ? 3 : 0;
+                    bits >>= 1;
+                }
+            }
+        }
+    } else {
+        for (int y = 0; y < 4; y++) {
+            for (int x = 0; x < 4; x++) {
+                int32_t v = (int32_t)(bits & 3);
+                if (mode) {
+                    if (v == 1) v = 4; else if (v == 2) v = 14; else if (v == 3) v = 8;
+                } else {
+                    v *= 3; if (v > 3) v -= 1;
+                }
+                values[y + offY][x + offX] = v;
+                bits >>= 2;
+            }
+        }
+    }
+}
+
+static int32_t ModulationAt(int32_t values[8][16], int32_t modes[8][16], int x, int y, int bpp) {
+    if (bpp != 2) return values[y][x];
+    static const int rep[4] = { 0, 3, 5, 8 };
+    if (modes[y][x] == 0 || ((x ^ y) & 1) == 0) return rep[values[y][x]];
+    if (modes[y][x] == 1) return (rep[values[y - 1][x]] + rep[values[y + 1][x]] + rep[values[y][x - 1]] + rep[values[y][x + 1]] + 2) / 4;
+    if (modes[y][x] == 2) return (rep[values[y][x - 1]] + rep[values[y][x + 1]] + 1) / 2;
+    return (rep[values[y - 1][x]] + rep[values[y + 1][x]] + 1) / 2;
+}
+
+static uint32_t Twiddle(uint32_t sizeA, uint32_t sizeB, uint32_t posA, uint32_t posB) {
+    uint32_t minDim = sizeA, maxVal = posB;
+    if (sizeB < sizeA) { minDim = sizeB; maxVal = posA; }
+    uint32_t twiddled = 0, src = 1, dst = 1; int shift = 0;
+    while (src < minDim) {
+        if (posB & src) twiddled |= dst;
+        if (posA & src) twiddled |= (dst << 1);
+        src <<= 1; dst <<= 2; shift++;
+    }
+    return twiddled | ((maxVal >> shift) << (2 * shift));
+}
+
+static inline uint32_t WrapWord(uint32_t count, int idx) { return (uint32_t)((idx + (int)count) % (int)count); }
+
+// Пишет в out (ширина width) пиксели 0xAABBGGRR.
+static bool Decompress(const uint8_t* src, size_t srcSize, int width, int height, int bpp, bool hasAlpha, uint32_t* out) {
+    const int wordW = (bpp == 2) ? 8 : 4;
+    const int wordH = 4;
+    if (width < wordW || height < wordH || (width % wordW) || (height % wordH)) return false;
+    const uint32_t numWordsX = (uint32_t)(width / wordW);
+    const uint32_t numWordsY = (uint32_t)(height / wordH);
+    if (srcSize < (size_t)numWordsX * numWordsY * 8) return false;
+    const uint32_t* members = (const uint32_t*)src;
+
+    int32_t values[8][16], modes[8][16];
+    PixelS colA[32], colB[32], block[32];
+    memset(values, 0, sizeof(values));
+    memset(modes, 0, sizeof(modes));
+
+    for (int wy = -1; wy < (int)numWordsY - 1; wy++) {
+        for (int wx = -1; wx < (int)numWordsX - 1; wx++) {
+            uint32_t px = WrapWord(numWordsX, wx),     py = WrapWord(numWordsY, wy);
+            uint32_t qx = WrapWord(numWordsX, wx + 1), qy = py;
+            uint32_t rx = px,                          ry = WrapWord(numWordsY, wy + 1);
+            uint32_t sx = qx,                          sy = ry;
+            uint32_t off[4] = {
+                Twiddle(numWordsY, numWordsX, py, px) * 2,
+                Twiddle(numWordsY, numWordsX, qy, qx) * 2,
+                Twiddle(numWordsY, numWordsX, ry, rx) * 2,
+                Twiddle(numWordsY, numWordsX, sy, sx) * 2,
+            };
+            Word P = { members[off[0]], members[off[0] + 1] };
+            Word Q = { members[off[1]], members[off[1] + 1] };
+            Word R = { members[off[2]], members[off[2] + 1] };
+            Word S = { members[off[3]], members[off[3] + 1] };
+
+            UnpackModulation(P, 0,     0,     values, modes, bpp);
+            UnpackModulation(Q, wordW, 0,     values, modes, bpp);
+            UnpackModulation(R, 0,     wordH, values, modes, bpp);
+            UnpackModulation(S, wordW, wordH, values, modes, bpp);
+
+            PixelS a0, a1, a2, a3, b0, b1, b2, b3;
+            ColorA(P.color, a0); ColorA(Q.color, a1); ColorA(R.color, a2); ColorA(S.color, a3);
+            ColorB(P.color, b0); ColorB(Q.color, b1); ColorB(R.color, b2); ColorB(S.color, b3);
+            Interpolate(a0, a1, a2, a3, colA, bpp);
+            Interpolate(b0, b1, b2, b3, colB, bpp);
+
+            for (int y = 0; y < wordH; y++) {
+                for (int x = 0; x < wordW; x++) {
+                    int32_t mod = ModulationAt(values, modes, x + wordW / 2, y + wordH / 2, bpp);
+                    bool punch = false;
+                    if (mod > 10) { punch = true; mod -= 10; }
+                    const PixelS& A = colA[y * wordW + x];
+                    const PixelS& B = colB[y * wordW + x];
+                    PixelS& d = block[y * wordW + x];
+                    d.r = (A.r * (8 - mod) + B.r * mod) / 8;
+                    d.g = (A.g * (8 - mod) + B.g * mod) / 8;
+                    d.b = (A.b * (8 - mod) + B.b * mod) / 8;
+                    d.a = punch ? 0 : (A.a * (8 - mod) + B.a * mod) / 8;
+                }
+            }
+
+            const uint32_t dstW[4][2] = { { px, py }, { qx, qy }, { rx, ry }, { sx, sy } };
+            for (int y = 0; y < wordH / 2; y++) {
+                for (int x = 0; x < wordW / 2; x++) {
+                    const int srcIdx[4] = {
+                        y * wordW + x,
+                        y * wordW + x + wordW / 2,
+                        (y + wordH / 2) * wordW + x,
+                        (y + wordH / 2) * wordW + x + wordW / 2,
+                    };
+                    const int dstX[4] = { (int)(dstW[0][0] * wordW) + x + wordW / 2, (int)(dstW[1][0] * wordW) + x,
+                                          (int)(dstW[2][0] * wordW) + x + wordW / 2, (int)(dstW[3][0] * wordW) + x };
+                    const int dstY[4] = { (int)(dstW[0][1] * wordH) + y + wordH / 2, (int)(dstW[1][1] * wordH) + y + wordH / 2,
+                                          (int)(dstW[2][1] * wordH) + y, (int)(dstW[3][1] * wordH) + y };
+                    for (int k = 0; k < 4; k++) {
+                        const PixelS& s = block[srcIdx[k]];
+                        uint32_t r = (uint32_t)(s.r < 0 ? 0 : (s.r > 255 ? 255 : s.r));
+                        uint32_t g = (uint32_t)(s.g < 0 ? 0 : (s.g > 255 ? 255 : s.g));
+                        uint32_t b = (uint32_t)(s.b < 0 ? 0 : (s.b > 255 ? 255 : s.b));
+                        uint32_t a = hasAlpha ? (uint32_t)(s.a < 0 ? 0 : (s.a > 255 ? 255 : s.a)) : 255u;
+                        out[dstY[k] * width + dstX[k]] = (a << 24) | (b << 16) | (g << 8) | r;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace pvrtc
+
+static bool PvrtcFormatInfo(GLenum internalformat, int& bpp, bool& alpha) {
+    switch (internalformat) {
+        case 0x8C00: bpp = 4; alpha = false; return true; // GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+        case 0x8C01: bpp = 2; alpha = false; return true; // GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+        case 0x8C02: bpp = 4; alpha = true;  return true; // GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+        case 0x8C03: bpp = 2; alpha = true;  return true; // GL_COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
+        default: return false;
+    }
+}
+
+// PVRTC умеют только чипы PowerVR, на остальных драйвер отвергает формат
+// и текстура остаётся неопределённой — отсюда чёрная геометрия при offload.
+static bool DeviceSupportsPVRTC() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* ext = (const char*)glGetString(GL_EXTENSIONS);
+        cached = (ext && strstr(ext, "GL_IMG_texture_compression_pvrtc")) ? 1 : 0;
+        LogToJava("[GL-TEX] Поддержка PVRTC драйвером: " + std::string(cached ? "есть" : "нет"));
+    }
+    return cached == 1;
+}
+
 extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid *data) {
     LogToJava("[GL-TRACE][GL-TEX] glCompressedTexImage2D: tex=" + std::to_string(g_cpuActiveTexture) + " w=" + std::to_string(width) + " h=" + std::to_string(height) + " intFmt=0x" + std::to_string(internalformat) + " size=" + std::to_string(imageSize));
     if (target == GL_TEXTURE_2D && level == 0) {
@@ -2501,16 +3472,38 @@ extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum i
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
         texBuf.resize(width * height);
         
-        // PVRTC не реализован на CPU. Рисуем серую шахматку.
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                bool isDark = ((x / 8) % 2) == ((y / 8) % 2);
-                texBuf[y * width + x] = isDark ? 0xFF888888 : 0xFFCCCCCC; 
+        int pvrBpp = 0; bool pvrAlpha = false;
+        struct A6DumpOnExit {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            GLuint t; const std::vector<uint32_t>* b; int w, h;
+            ~A6DumpOnExit() { A6DumpTexture(t, *b, w, h); }
+        } a6dump{g_cpuActiveTexture, &texBuf, width, height};
+        PvrtcFormatInfo(internalformat, pvrBpp, pvrAlpha);
+        bool decoded = pvrBpp && data &&
+            pvrtc::Decompress((const uint8_t*)data, (size_t)imageSize, width, height, pvrBpp, pvrAlpha, texBuf.data());
+        if (!decoded) {
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    bool isDark = ((x / 8) % 2) == ((y / 8) % 2);
+                    texBuf[y * width + x] = isDark ? 0xFF888888 : 0xFFCCCCCC;
+                }
+            }
+            LogToJava("HLE_WARNING: Stub_glCompressedTexImage2D: формат 0x" + std::to_string(internalformat) + " не распакован, шахматка");
+        }
+    }
+    if (g_gpuOffloadMask & 8) {
+        int bpp = 0; bool alpha = false;
+        std::vector<uint32_t> rgba;
+        if (PvrtcFormatInfo(internalformat, bpp, alpha) && !DeviceSupportsPVRTC() && data && width > 0 && height > 0) {
+            rgba.resize((size_t)width * height);
+            if (pvrtc::Decompress((const uint8_t*)data, (size_t)imageSize, width, height, bpp, alpha, rgba.data())) {
+                glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                ApplyAutoMipmap(target, level);
+                return;
             }
         }
-        LogToJava("HLE_WARNING: Stub_glCompressedTexImage2D PVRTC перехвачен! Заменено на шахматку.");
+        glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+        ApplyAutoMipmap(target, level);
     }
-    if (g_gpuOffloadMask & 8) glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 }
 
 // Ключ обязан включать программу: glGetUniformLocation уникален только внутри неё,
@@ -2519,7 +3512,26 @@ std::map<uint64_t, std::vector<float>> g_uniformShadowFloat;
 GLuint g_currentProgram = 0;
 static inline uint64_t UniShadowKey(GLuint prog, GLint loc) { return ((uint64_t)prog << 32) | (uint32_t)loc; }
 
-struct SWVertex { float x, y, z, w, invW, r, g, b, a, u, v; };
+struct SWVertex { float x, y, z, w, invW, r, g, b, a, u, v, u2, v2; };
+
+// Один канал коэффициента блендинга по спеке GL. sc/sa — канал и альфа источника,
+// dc/da — приёмника. Неизвестный фактор трактуем как GL_ONE, чтобы не гасить кадр в ноль.
+static inline int BlendFactorComp(GLenum f, int sc, int sa, int dc, int da) {
+    switch (f) {
+        case GL_ZERO:                     return 0;
+        case GL_ONE:                      return 255;
+        case GL_SRC_COLOR:                return sc;
+        case GL_ONE_MINUS_SRC_COLOR:      return 255 - sc;
+        case GL_SRC_ALPHA:                return sa;
+        case GL_ONE_MINUS_SRC_ALPHA:      return 255 - sa;
+        case GL_DST_ALPHA:                return da;
+        case GL_ONE_MINUS_DST_ALPHA:      return 255 - da;
+        case GL_DST_COLOR:                return dc;
+        case GL_ONE_MINUS_DST_COLOR:      return 255 - dc;
+        case GL_SRC_ALPHA_SATURATE:       return sa < (255 - da) ? sa : (255 - da);
+        default:                          return 255;
+    }
+}
 
 void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid* indices, GLenum type) {
     std::vector<uint32_t>* targetColorBuf = &g_cpuColorBuffer;
@@ -2544,6 +3556,10 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         targetDepthBuf->assign(targetColorBuf->size(), 1.0f);
     }
     SyncLog("[RENDER] Анализ вызова отрисовки...");
+    g_dbgPixels = 0; g_dbgSkipA0 = 0;
+    g_dbgCovered = 0; g_dbgRejDepth = 0; g_dbgRejW = 0; g_dbgRejAT = 0;
+    g_dbgZfMin = 1e30; g_dbgZfMax = -1e30; g_dbgZbMin = 1e30; g_dbgZbMax = -1e30;
+    g_dbgRawN = 0;
     
     GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
 
@@ -2553,8 +3569,9 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         if (g_vboShadow.count(ibo)) iboPtr = g_vboShadow[ibo].data();
     }
 
-    GLint posLoc = -1, colorLoc = -1, texLoc = -1, idxLoc = -1, weightLoc = -1;
+    GLint posLoc = -1, colorLoc = -1, texLoc = -1, tex2Loc = -1, idxLoc = -1, weightLoc = -1;
     char texName[256] = {0};
+    char tex2Name[256] = {0};
     if (prog > 0) {
         GLint numActiveAttrs = 0;
         glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTES, &numActiveAttrs);
@@ -2573,7 +3590,12 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             // Растеризатор однотекстурный: из TEXCOORD_0/TEXCOORD_1 нужен нулевой набор
             // (атлас), иначе UV берутся от карты освещения и геометрия выходит белой.
             else if (strstr(up, "TEX") || strstr(up, "UV")) {
-                if (texLoc == -1 || strcmp(up, texName) < 0) { texLoc = loc; strncpy(texName, up, sizeof(texName) - 1); }
+                if (texLoc == -1 || strcmp(up, texName) < 0) {
+                    tex2Loc = texLoc; strncpy(tex2Name, texName, sizeof(tex2Name) - 1);
+                    texLoc = loc; strncpy(texName, up, sizeof(texName) - 1);
+                } else if (tex2Loc == -1 || strcmp(up, tex2Name) < 0) {
+                    tex2Loc = loc; strncpy(tex2Name, up, sizeof(tex2Name) - 1);
+                }
             }
             else if (strstr(up, "WEIG") || strstr(up, "WT")) weightLoc = loc;
             else if (strstr(up, "IND") || strstr(up, "IDX") || strstr(up, "BONE") || strstr(up, "MAT")) idxLoc = loc;
@@ -2584,7 +3606,9 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     if (prog == 0) {
         if (posLoc == -1) posLoc = 0;
         if (colorLoc == -1) colorLoc = 1;
-        if (texLoc == -1) texLoc = 2 + g_clientActiveTexture;
+        // glClientActiveTexture выбирает массив только при настройке; на отрисовке
+        // нулевой юнит ES 1.1 всегда читает нулевой набор координат.
+        if (texLoc == -1) texLoc = 2;
     } else {
         if (posLoc == -1) posLoc = 0;
     }
@@ -2595,6 +3619,9 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
 
             float mvp[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             float diffuseUniform[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            float currentColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            float fogColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            int colorModel = (prog > 0 && g_progColorModel.count(prog)) ? g_progColorModel[prog] : SWCM_DEFAULT;
             float texMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             bool hasTexMat = false;
             GLint paletteLoc = -1;
@@ -2615,6 +3642,14 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                 if (u_type == GL_FLOAT_VEC4 && (strstr(name, "Diffuse") || strstr(name, "Color"))) {
                     GLint loc = glGetUniformLocation(prog, name);
                     if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 4) memcpy(diffuseUniform, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 4 * sizeof(float));
+                }
+                if (u_type == GL_FLOAT_VEC4 && !strcmp(up, "CURRENT_COLOR")) {
+                    GLint loc = glGetUniformLocation(prog, name);
+                    if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 4) memcpy(currentColor, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 4 * sizeof(float));
+                }
+                if (u_type == GL_FLOAT_VEC4 && !strcmp(up, "FOG_COLOR")) {
+                    GLint loc = glGetUniformLocation(prog, name);
+                    if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 4) memcpy(fogColor, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 4 * sizeof(float));
                 }
                 if (u_type == GL_FLOAT_MAT4 && (strstr(name, "Texture") || strstr(name, "TexMatrix"))) {
                     GLint loc = glGetUniformLocation(prog, name);
@@ -2663,8 +3698,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                 }
             }
         }
+    memcpy(g_dbgMvp, mvp, sizeof(g_dbgMvp));   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
 
-    
     auto getTypeSize = [](GLenum t) -> int {
         if (t == GL_FLOAT || t == 0x140C || t == GL_INT || t == GL_UNSIGNED_INT) return 4;
         if (t == GL_SHORT || t == GL_UNSIGNED_SHORT || t == 0x8D61) return 2;
@@ -2709,7 +3744,52 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
-    GLvoid* iPtr = nullptr; GLint iSize=0, iStride=0, iType=0; GLint iVBO = 0; GLint iEnabled = 0; 
+    // Второй набор UV (TEXCOORD_1) нужен терраину Minecraft: renderchunk.fragment
+    // перемножает атлас с картой освещения, и без неё все грани блоков одинаково яркие.
+    GLvoid* t2Ptr = nullptr; GLint t2Size=0, t2Stride=0, t2Type=0; GLint t2VBO = 0; GLint t2Enabled = 0; bool t2Norm = false;
+    // В ES 1.1 координаты первого юнита лежат в фиксированном слоте 2+1, шейдерного
+    // имени для них нет; tex2Loc там всегда -1.
+    const int t2Idx = (prog == 0) ? 3 : tex2Loc;
+    if (t2Idx != -1 && t2Idx < 16) {
+        t2Enabled = g_vertexAttribs[t2Idx].enabled;
+        if (t2Enabled) {
+            t2Ptr = (GLvoid*)g_vertexAttribs[t2Idx].pointer;
+            t2Size = g_vertexAttribs[t2Idx].size;
+            t2Stride = g_vertexAttribs[t2Idx].stride;
+            t2Type = g_vertexAttribs[t2Idx].type;
+            t2VBO = g_vertexAttribs[t2Idx].vbo;
+            t2Norm = g_vertexAttribs[t2Idx].normalized != GL_FALSE;
+            if (t2Stride == 0) t2Stride = t2Size * getTypeSize(t2Type);
+        }
+    }
+
+    // Нормали читает только фиксированный конвейер, и только когда включено освещение.
+    const bool swLighting = (prog == 0 && g_lightingEnabled);
+    GLvoid* nPtr = nullptr; GLint nStride = 0, nType = 0; GLint nVBO = 0; GLint nEnabled = 0;
+    if (swLighting) {
+        nEnabled = g_vertexAttribs[5].enabled;
+        if (nEnabled) {
+            nPtr = (GLvoid*)g_vertexAttribs[5].pointer;
+            nStride = g_vertexAttribs[5].stride;
+            nType = g_vertexAttribs[5].type;
+            nVBO = g_vertexAttribs[5].vbo;
+            if (nStride == 0) nStride = 3 * getTypeSize(nType);
+        }
+    }
+
+    if (A6Dbg()) {   // почему геометрия выходит белой
+        static int a6d = 0;
+        if (a6d < 8) {
+            char b[256];
+            snprintf(b, sizeof(b), "[A6-DIAG] draw#%d prog=%d posLoc=%d(sz%d t0x%x) colLoc=%d(en%d t0x%x) texLoc=%d(en%d) cm=%d mvp=[%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]",
+                     a6d, (int)prog, (int)posLoc, (int)pSize, (unsigned)pType, (int)colorLoc, (int)cEnabled, (unsigned)cType,
+                     (int)texLoc, (int)tEnabled, colorModel, mvp[0], mvp[1], mvp[2], mvp[3], mvp[12], mvp[13], mvp[14], mvp[15]);
+            LogToJava(b);
+            a6d++;
+        }
+    }
+
+    GLvoid* iPtr = nullptr; GLint iSize=0, iStride=0, iType=0; GLint iVBO = 0; GLint iEnabled = 0;
     if (idxLoc != -1 && idxLoc < 16) {
         iEnabled = g_vertexAttribs[idxLoc].enabled;
         if (iEnabled) {
@@ -2738,6 +3818,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     uint8_t* pBase = (pVBO != 0 && g_vboShadow.count(pVBO)) ? (g_vboShadow[pVBO].data() + (uintptr_t)pPtr) : (uint8_t*)pPtr;
     uint8_t* cBase = (cVBO != 0 && g_vboShadow.count(cVBO)) ? (g_vboShadow[cVBO].data() + (uintptr_t)cPtr) : (uint8_t*)cPtr;
     uint8_t* tBase = (tVBO != 0 && g_vboShadow.count(tVBO)) ? (g_vboShadow[tVBO].data() + (uintptr_t)tPtr) : (uint8_t*)tPtr;
+    uint8_t* t2Base = (t2VBO != 0 && g_vboShadow.count(t2VBO)) ? (g_vboShadow[t2VBO].data() + (uintptr_t)t2Ptr) : (uint8_t*)t2Ptr;
+    uint8_t* nBase = (nVBO != 0 && g_vboShadow.count(nVBO)) ? (g_vboShadow[nVBO].data() + (uintptr_t)nPtr) : (uint8_t*)nPtr;
     uint8_t* iBase = (iVBO != 0 && g_vboShadow.count(iVBO)) ? (g_vboShadow[iVBO].data() + (uintptr_t)iPtr) : (uint8_t*)iPtr;
     uint8_t* wBaseES2 = (wVBO != 0 && g_vboShadow.count(wVBO)) ? (g_vboShadow[wVBO].data() + (uintptr_t)wPtr) : (uint8_t*)wPtr;
 
@@ -2766,7 +3848,11 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     int validVertsCount = 0;
     for (int i = 0; i < count; i++) {
         int idx = first + i;
-        if (ibo != 0) {
+        // type==0 — это glDrawArrays: вершины идут подряд. Привязанный GL_ELEMENT_ARRAY_BUFFER
+        // трогать нельзя, иначе индексы прошлого glDrawElements подменяют порядок вершин.
+        if (type == 0) {
+            // индексов нет
+        } else if (ibo != 0) {
             if (iboPtr) {
                 size_t offset = (uintptr_t)indices + i * (type == GL_UNSIGNED_BYTE ? 1 : 2);
                 if (offset + (type == GL_UNSIGNED_BYTE ? 1 : 2) <= iboSize) {
@@ -2806,6 +3892,17 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             return 1.0f;
         };
 
+        // Компоненты нормали типов byte/short в ES 1.1 всегда нормализованные.
+        auto readN = [&halfToFloat](uint8_t* p, GLenum t, int o) -> float {
+            if (!p) return 0.0f;
+            if (t == GL_FLOAT) { float v; memcpy(&v, p + o * 4, 4); return v; }
+            if (t == 0x140C) { int32_t v; memcpy(&v, p + o * 4, 4); return v * (1.0f / 65536.0f); }
+            if (t == GL_SHORT) { int16_t v; memcpy(&v, p + o * 2, 2); return v * (1.0f / 32767.0f); }
+            if (t == 0x1400) { return (float)(int8_t)p[o] * (1.0f / 127.0f); }
+            if (t == 0x8D61) { uint16_t v; memcpy(&v, p + o * 2, 2); return halfToFloat(v); }
+            return 0.0f;
+        };
+
         float px = 0, py = 0, pz = 0, pw = 1;
         if (posLoc != -1 && posLoc < 16) {
             px = g_vertexAttribs[posLoc].constantValue[0];
@@ -2816,6 +3913,12 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         if (pBase) {
             uint8_t* v = pBase + idx * pStride;
             px = readG(v, pType, 0, pNorm); if (pSize > 1) py = readG(v, pType, 1, pNorm); if (pSize > 2) pz = readG(v, pType, 2, pNorm); if (pSize > 3) pw = readG(v, pType, 3, pNorm);
+        }
+        if (A6Dbg() && g_dbgRawN < 6) {
+            g_dbgRawPos[g_dbgRawN][0] = px; g_dbgRawPos[g_dbgRawN][1] = py;
+            g_dbgRawPos[g_dbgRawN][2] = pz; g_dbgRawPos[g_dbgRawN][3] = pw;
+            g_dbgRawN++;
+            g_dbgPosSize = pSize; g_dbgPosStride = pStride; g_dbgPosType = (unsigned)pType;
         }
         
         float cr = 1, cg = 1, cb = 1, ca = 1;
@@ -2832,7 +3935,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
 
         float tu = 0, tv = 0;
-        int activeTexLoc = (texLoc != -1) ? texLoc : (2 + g_clientActiveTexture);
+        int activeTexLoc = (texLoc != -1) ? texLoc : 2;
         if (activeTexLoc < 16) {
             tu = g_vertexAttribs[activeTexLoc].constantValue[0];
             tv = g_vertexAttribs[activeTexLoc].constantValue[1];
@@ -2842,15 +3945,34 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             tu = readG(v, tType, 0, tNorm); if (tSize > 1) tv = readG(v, tType, 1, tNorm);
         }
 
+        float tu2 = 0, tv2 = 0;
+        if (t2Base && t2Enabled) {
+            uint8_t* v = t2Base + idx * t2Stride;
+            tu2 = readG(v, t2Type, 0, t2Norm); if (t2Size > 1) tv2 = readG(v, t2Type, 1, t2Norm);
+        }
+        if (prog == 0) {
+            const float* tm1 = g_textureStacks[1].back().data();
+            float tmpU = tu2 * tm1[0] + tv2 * tm1[4] + tm1[12];
+            float tmpV = tu2 * tm1[1] + tv2 * tm1[5] + tm1[13];
+            tu2 = tmpU; tv2 = tmpV;
+        }
+
         if (prog > 0 && hasTexMat) {
             float tempU = tu * texMat[0] + tv * texMat[4] + texMat[12];
             float tempV = tu * texMat[1] + tv * texMat[5] + texMat[13];
             tu = tempU; tv = tempV;
         } else if (prog == 0) {
-            const float* tm = g_textureStack.back().data();
+            const float* tm = g_textureStacks[0].back().data();
             float tempU = tu * tm[0] + tv * tm[4] + tm[12];
             float tempV = tu * tm[1] + tv * tm[5] + tm[13];
             tu = tempU; tv = tempV;
+        }
+        if (A6Dbg()) {
+            if (i == 0) { g_a6UV[0] = g_a6UV[2] = tu; g_a6UV[1] = g_a6UV[3] = tv; }
+            else {
+                if (tu < g_a6UV[0]) g_a6UV[0] = tu; if (tu > g_a6UV[2]) g_a6UV[2] = tu;
+                if (tv < g_a6UV[1]) g_a6UV[1] = tv; if (tv > g_a6UV[3]) g_a6UV[3] = tv;
+            }
         }
 
         // --- ES 2.0 SKINNING ---
@@ -2934,6 +4056,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
 
         float v_mvp[16];
+        float effMV[16];   // модельно-видовая матрица этой вершины — нужна освещению
+        memcpy(effMV, g_modelViewStack.back().data(), 16 * sizeof(float));
         if (prog == 0 && g_matrixPaletteEnabled) {
             int num_matrices = g_matrixIndexSize > 0 ? g_matrixIndexSize : 1; 
             if (num_matrices > 4) num_matrices = 4;
@@ -2993,7 +4117,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             }
             
             blended_m[3] = 0.0f; blended_m[7] = 0.0f; blended_m[11] = 0.0f; blended_m[15] = 1.0f;
-            
+            memcpy(effMV, blended_m, 16 * sizeof(float));
+
             const float* p = g_projectionStack.back().data();
             for (int c = 0; c < 4; c++) {
                 for (int r = 0; r < 4; r++) {
@@ -3020,14 +4145,142 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         outV.invW = 0.0f; // Вычислим после клиппинга
         
         if (prog > 0) {
-            outV.r = cr * diffuseUniform[0] * 255.0f;
-            outV.g = cg * diffuseUniform[1] * 255.0f;
-            outV.b = cb * diffuseUniform[2] * 255.0f;
-            outV.a = ca * diffuseUniform[3] * 255.0f;
+            if (colorModel == SWCM_SKYMIX) {
+                // sky.vertex: color = mix(CURRENT_COLOR, FOG_COLOR, COLOR.r)
+                outV.r = (currentColor[0] + (fogColor[0] - currentColor[0]) * cr) * 255.0f;
+                outV.g = (currentColor[1] + (fogColor[1] - currentColor[1]) * cr) * 255.0f;
+                outV.b = (currentColor[2] + (fogColor[2] - currentColor[2]) * cr) * 255.0f;
+                outV.a = (currentColor[3] + (fogColor[3] - currentColor[3]) * cr) * 255.0f;
+            } else if (colorModel == SWCM_TINT) {
+                outV.r = cr * diffuseUniform[0] * currentColor[0] * 255.0f;
+                outV.g = cg * diffuseUniform[1] * currentColor[1] * 255.0f;
+                outV.b = cb * diffuseUniform[2] * currentColor[2] * 255.0f;
+                outV.a = ca * diffuseUniform[3] * currentColor[3] * 255.0f;
+            } else {
+                outV.r = cr * diffuseUniform[0] * 255.0f;
+                outV.g = cg * diffuseUniform[1] * 255.0f;
+                outV.b = cb * diffuseUniform[2] * 255.0f;
+                outV.a = ca * diffuseUniform[3] * 255.0f;
+            }
         } else {
+            if (A6Dbg() && i == 0) { g_a6RawC0[0] = cr; g_a6RawC0[1] = cg; g_a6RawC0[2] = cb; g_a6RawC0[3] = ca; }
+            if (swLighting) {
+                float nx = 0.0f, ny = 0.0f, nz = 1.0f;
+                if (nBase && nEnabled) {
+                    uint8_t* v = nBase + idx * nStride;
+                    nx = readN(v, nType, 0); ny = readN(v, nType, 1); nz = readN(v, nType, 2);
+                } else {
+                    nx = g_vertexAttribs[5].constantValue[0];
+                    ny = g_vertexAttribs[5].constantValue[1];
+                    nz = g_vertexAttribs[5].constantValue[2];
+                }
+                // Нормаль переводится в координаты глаза обратно-транспонированной
+                // матрицей; для матриц с неравномерным масштабом обычная не годится.
+                float a = effMV[0], b = effMV[4], c = effMV[8];
+                float d = effMV[1], e = effMV[5], f = effMV[9];
+                float g = effMV[2], h = effMV[6], i2 = effMV[10];
+                float det = a * (e * i2 - f * h) - b * (d * i2 - f * g) + c * (d * h - e * g);
+                float enx, eny, enz;
+                if (std::abs(det) > 1e-12f) {
+                    float invDet = 1.0f / det;
+                    // Обратно-транспонированная 3x3 = кофакторная матрица / det
+                    float c00 = (e * i2 - f * h) * invDet, c01 = (f * g - d * i2) * invDet, c02 = (d * h - e * g) * invDet;
+                    float c10 = (c * h - b * i2) * invDet, c11 = (a * i2 - c * g) * invDet, c12 = (b * g - a * h) * invDet;
+                    float c20 = (b * f - c * e) * invDet, c21 = (c * d - a * f) * invDet, c22 = (a * e - b * d) * invDet;
+                    enx = nx * c00 + ny * c10 + nz * c20;
+                    eny = nx * c01 + ny * c11 + nz * c21;
+                    enz = nx * c02 + ny * c12 + nz * c22;
+                } else {
+                    enx = nx * a + ny * b + nz * c;
+                    eny = nx * d + ny * e + nz * f;
+                    enz = nx * g + ny * h + nz * i2;
+                }
+                float nlen = std::sqrt(enx * enx + eny * eny + enz * enz);
+                if (nlen > 1e-8f) { enx /= nlen; eny /= nlen; enz /= nlen; }
+
+                float ex = px * effMV[0] + py * effMV[4] + pz * effMV[8]  + pw * effMV[12];
+                float ey = px * effMV[1] + py * effMV[5] + pz * effMV[9]  + pw * effMV[13];
+                float ez = px * effMV[2] + py * effMV[6] + pz * effMV[10] + pw * effMV[14];
+                float ew = px * effMV[3] + py * effMV[7] + pz * effMV[11] + pw * effMV[15];
+                if (std::abs(ew) > 1e-8f && std::abs(ew - 1.0f) > 1e-6f) { ex /= ew; ey /= ew; ez /= ew; }
+
+                const float* mAmb = g_colorMaterialEnabled ? nullptr : g_matAmbient;
+                const float* mDif = g_colorMaterialEnabled ? nullptr : g_matDiffuse;
+                float cmColor[4] = {cr, cg, cb, ca};
+                if (!mAmb) mAmb = cmColor;
+                if (!mDif) mDif = cmColor;
+
+                float acc[3];
+                for (int k = 0; k < 3; k++) acc[k] = g_matEmission[k] + mAmb[k] * g_lightModelAmbient[k];
+
+                for (int li = 0; li < 8; li++) {
+                    if (!g_lightEnabled[li]) continue;
+                    const SWLight& L = g_lights[li];
+                    float vpx, vpy, vpz, att = 1.0f;
+                    if (std::abs(L.position[3]) < 1e-8f) {
+                        vpx = L.position[0]; vpy = L.position[1]; vpz = L.position[2];
+                        float l = std::sqrt(vpx * vpx + vpy * vpy + vpz * vpz);
+                        if (l > 1e-8f) { vpx /= l; vpy /= l; vpz /= l; }
+                    } else {
+                        float lx = L.position[0] / L.position[3] - ex;
+                        float ly = L.position[1] / L.position[3] - ey;
+                        float lz = L.position[2] / L.position[3] - ez;
+                        float dist = std::sqrt(lx * lx + ly * ly + lz * lz);
+                        if (dist > 1e-8f) { vpx = lx / dist; vpy = ly / dist; vpz = lz / dist; }
+                        else { vpx = 0.0f; vpy = 0.0f; vpz = 1.0f; }
+                        float denom = L.attenuation[0] + L.attenuation[1] * dist + L.attenuation[2] * dist * dist;
+                        att = (denom > 1e-8f) ? (1.0f / denom) : 1.0f;
+                    }
+
+                    if (L.spotCutoff < 179.999f) {
+                        float sdx = L.spotDir[0], sdy = L.spotDir[1], sdz = L.spotDir[2];
+                        float sl = std::sqrt(sdx * sdx + sdy * sdy + sdz * sdz);
+                        if (sl > 1e-8f) { sdx /= sl; sdy /= sl; sdz /= sl; }
+                        float sdot = -vpx * sdx - vpy * sdy - vpz * sdz;
+                        if (sdot < std::cos(L.spotCutoff * 3.14159265f / 180.0f)) att = 0.0f;
+                        else att *= std::pow(sdot > 0.0f ? sdot : 0.0f, L.spotExponent);
+                    }
+                    if (att <= 0.0f) continue;
+
+                    float ndotl = enx * vpx + eny * vpy + enz * vpz;
+                    if (ndotl < 0.0f) ndotl = 0.0f;
+
+                    float spec = 0.0f;
+                    if (ndotl > 0.0f && g_matShininess >= 0.0f &&
+                        (g_matSpecular[0] > 0.0f || g_matSpecular[1] > 0.0f || g_matSpecular[2] > 0.0f)) {
+                        // Наблюдатель по умолчанию в бесконечности: половинный вектор от (0,0,1).
+                        float hx = vpx, hy = vpy, hz = vpz + 1.0f;
+                        float hl = std::sqrt(hx * hx + hy * hy + hz * hz);
+                        if (hl > 1e-8f) { hx /= hl; hy /= hl; hz /= hl; }
+                        float ndoth = enx * hx + eny * hy + enz * hz;
+                        if (ndoth > 0.0f) spec = std::pow(ndoth, g_matShininess);
+                    }
+
+                    for (int k = 0; k < 3; k++) {
+                        acc[k] += att * (mAmb[k] * L.ambient[k]
+                                       + ndotl * mDif[k] * L.diffuse[k]
+                                       + spec * g_matSpecular[k] * L.specular[k]);
+                    }
+                }
+
+                cr = acc[0] > 1.0f ? 1.0f : (acc[0] < 0.0f ? 0.0f : acc[0]);
+                cg = acc[1] > 1.0f ? 1.0f : (acc[1] < 0.0f ? 0.0f : acc[1]);
+                cb = acc[2] > 1.0f ? 1.0f : (acc[2] < 0.0f ? 0.0f : acc[2]);
+                ca = mDif[3] > 1.0f ? 1.0f : (mDif[3] < 0.0f ? 0.0f : mDif[3]);
+            }
             outV.r = cr * 255.0f; outV.g = cg * 255.0f; outV.b = cb * 255.0f; outV.a = ca * 255.0f;
+            // окраска отрисовок по id текстуры
+            if (A6Dbg() && g_a6TintByTexture) {
+                GLuint t0 = g_cpuUnitTexture[0];
+                if (t0 == 20)      { outV.r = 255.0f; outV.g = 0.0f;   outV.b = 0.0f; }
+                else if (t0 == 22) { outV.r = 0.0f;   outV.g = 255.0f; outV.b = 0.0f; }
+                else if (t0 == 24) { outV.r = 0.0f;   outV.g = 0.0f;   outV.b = 255.0f; }
+                else if (t0 == 9)  { outV.r = 255.0f; outV.g = 255.0f; outV.b = 0.0f; }
+                else if (t0 == 17) { outV.r = 255.0f; outV.g = 0.0f;   outV.b = 255.0f; }
+            }
         }
         outV.u = tu; outV.v = tv;
+        outV.u2 = tu2; outV.v2 = tv2;
         extractedVerts[validVertsCount++] = outV;
     }
     extractedVerts.resize(validVertsCount);
@@ -3064,7 +4317,11 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             SWVertex v = extractedVerts[i];
             if (v.w <= 0.0001f) continue;
             float cx = v.x / v.w, cy = v.y / v.w, cz = v.z / v.w;
-            if (g_gameViewportH > g_gameViewportW && targetW > targetH) { float t = cx; cx = -cy; cy = t; }
+            switch (FrameRotQuarters(targetW, targetH)) {
+                case 1: { float t = cx; cx = -cy; cy =  t; break; }
+                case 2: { cx = -cx; cy = -cy;            break; }
+                case 3: { float t = cx; cx =  cy; cy = -t; break; }
+            }
             v.x = (cx + 1.0f) * 0.5f * targetW;
             v.y = (1.0f - cy) * 0.5f * targetH;
             v.z = (cz + 1.0f) * 0.5f;
@@ -3103,7 +4360,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     // Мы рисуем одним сэмплером, а игра может держать привязки на нескольких юнитах,
     // поэтому берём текстуру нулевого юнита, а не просто последнюю привязанную.
     GLuint drawTex = g_cpuUnitTexture[0] ? g_cpuUnitTexture[0] : g_cpuActiveTexture;
-    bool useTex = (g_texture2DEnabled || prog > 0) && tEnabled && drawTex != 0;
+    bool useTex = (g_texture2DUnitEnabled[0] || prog > 0) && tEnabled && drawTex != 0;
     const uint32_t* activeTexPtr = nullptr;
     int activeTexW = 0, activeTexH = 0;
     bool isFboTexture = false;
@@ -3119,8 +4376,53 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
-    if (g_logRenderDebug) {
-        bool isSpamOn = (g_spamFiltersMask & (1 << 5)) != 0;
+    GLuint drawTex1 = g_cpuUnitTexture[1];
+    const uint32_t* activeTex2Ptr = nullptr;
+    int activeTex2W = 0, activeTex2H = 0;
+    // В ES 1.1 ступень второго юнита включает glEnable(GL_TEXTURE_2D), а не массив координат:
+    // без массива координата берётся постоянной, и COMBINE вида GL_PREVIOUS×GL_PREVIOUS
+    // (премультипликация альфы) обязан отработать. Шейдерный путь координаты по-прежнему требует.
+    bool useTex2 = useTex && drawTex1 != 0 &&
+                   (prog > 0 ? (t2Enabled && drawTex1 != drawTex && g_progSamplesTex1.count(prog) && g_progSamplesTex1[prog])
+                             : g_texture2DUnitEnabled[1]);
+    if (useTex2) {
+        auto it2 = g_cpuTextures.find(drawTex1);
+        if (it2 != g_cpuTextures.end() && !it2->second.empty() && g_cpuTexW[drawTex1] > 0) {
+            activeTex2Ptr = it2->second.data();
+            activeTex2W = g_cpuTexW[drawTex1];
+            activeTex2H = g_cpuTexH[drawTex1];
+        } else {
+            useTex2 = false;
+        }
+    }
+
+    // Ступень без выборки: COMBINE на втором юните может не читать текстуру вовсе
+    // (например GL_PREVIOUS × GL_PREVIOUS — премультипликация альфы). Текстуры там нет,
+    // но саму ступень выполнить обязаны, иначе цвет уходит в блендинг непомноженным.
+    bool useEnv2Only = false;
+    if (useTex && !useTex2 && prog == 0 && g_texture2DUnitEnabled[1] && g_texEnvMode[1] == 0x8570) {
+        const SWTexCombine& c1 = g_texCombine[1];
+        useEnv2Only = true;
+        for (int n = 0; n < 3; n++) {
+            if (c1.srcRGB[n] == GL_TEXTURE || c1.srcAlpha[n] == GL_TEXTURE) { useEnv2Only = false; break; }
+        }
+    }
+
+    if (A6Dbg()) {   // применяется ли текстура
+        static int a6t = 0;
+        if (a6t < 8) {
+            char b[224];
+            snprintf(b, sizeof(b), "[A6-DIAG] tex#%d useTex=%d tex2Denab=%d drawTex=%u unit0=%u active=%u %dx%d texel0=0x%08x",
+                     a6t, (int)useTex, (int)g_texture2DUnitEnabled[0], (unsigned)drawTex, (unsigned)g_cpuUnitTexture[0],
+                     (unsigned)g_cpuActiveTexture, activeTexW, activeTexH,
+                     activeTexPtr ? activeTexPtr[0] : 0u);
+            LogToJava(b);
+            a6t++;
+        }
+    }
+
+    if (LogCatOn(LOG_RENDER_DUMP)) {
+        bool isSpamOn = (g_spamMask & (1u << LOG_RENDER_DUMP)) != 0;
         static int draw_cnt = 0; draw_cnt++;
         if (!isSpamOn || draw_cnt <= 30 || draw_cnt % 120 == 0) {
             // Всё в одну строку со счётчиком: повторяющиеся строки лог схлопывает в «...»,
@@ -3138,7 +4440,9 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
 
             if (!extractedVerts.empty()) {
                 char dbg2[256];
-                snprintf(dbg2, sizeof(dbg2), "[DRAW-DEBUG] #%d Vert0 Raw: x=%g y=%g u=%g v=%g", draw_cnt, (double)extractedVerts[0].x, (double)extractedVerts[0].y, (double)extractedVerts[0].u, (double)extractedVerts[0].v);
+                snprintf(dbg2, sizeof(dbg2), "[DRAW-DEBUG] #%d Vert0 Raw: x=%g y=%g u=%g v=%g rgba=%g,%g,%g,%g cc=%g,%g,%g,%g", draw_cnt, (double)extractedVerts[0].x, (double)extractedVerts[0].y, (double)extractedVerts[0].u, (double)extractedVerts[0].v,
+                    (double)extractedVerts[0].r, (double)extractedVerts[0].g, (double)extractedVerts[0].b, (double)extractedVerts[0].a,
+                    (double)g_vertexAttribs[1].constantValue[0], (double)g_vertexAttribs[1].constantValue[1], (double)g_vertexAttribs[1].constantValue[2], (double)g_vertexAttribs[1].constantValue[3]);
                 SyncLog(dbg2);
             }
         }
@@ -3147,12 +4451,17 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     auto toScreen = [targetW, targetH](SWVertex& v) {
         float w = v.w; if (w < 0.0001f) w = 0.0001f;
         float cx = v.x / w, cy = v.y / w, cz = v.z / w;
-        if (g_gameViewportH > g_gameViewportW && targetW > targetH) { float t = cx; cx = -cy; cy = t; }
+        switch (FrameRotQuarters(targetW, targetH)) {
+            case 1: { float t = cx; cx = -cy; cy =  t; break; }
+            case 2: { cx = -cx; cy = -cy;            break; }
+            case 3: { float t = cx; cx =  cy; cy = -t; break; }
+        }
         v.x = (cx + 1.0f) * 0.5f * targetW;
         v.y = (1.0f - cy) * 0.5f * targetH;
         v.z = (cz + 1.0f) * 0.5f;
         v.invW = 1.0f / w;
         v.u *= v.invW; v.v *= v.invW;
+        v.u2 *= v.invW; v.v2 *= v.invW;
     };
     
     auto clipEdge = [](const SWVertex& a, const SWVertex& b, SWVertex& out) {
@@ -3160,6 +4469,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         out.x = a.x + t * (b.x - a.x); out.y = a.y + t * (b.y - a.y);
         out.z = a.z + t * (b.z - a.z); out.w = 0.01f;
         out.u = a.u + t * (b.u - a.u); out.v = a.v + t * (b.v - a.v);
+        out.u2 = a.u2 + t * (b.u2 - a.u2); out.v2 = a.v2 + t * (b.v2 - a.v2);
         out.r = a.r + t * (b.r - a.r); out.g = a.g + t * (b.g - a.g);
         out.b = a.b + t * (b.b - a.b); out.a = a.a + t * (b.a - a.a);
     };
@@ -3209,6 +4519,129 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
+    if (A6Dbg()) {   // перечень реально встречающихся режимов блендинга
+        uint64_t key = ((uint64_t)g_blendSrc << 32) | ((uint64_t)g_blendDst << 8) |
+                       ((uint64_t)(g_blendEnabled ? 1 : 0) << 2) | (uint64_t)(g_alphaTestEnabled ? 2 : 0) | (uint64_t)(prog > 0 ? 1 : 0);
+        if (g_a6SeenBlend.insert(key).second) {
+            char b[256];
+            snprintf(b, sizeof(b), "[A6-BLEND] blend=%d src=0x%x dst=0x%x alphaTest=%d func=0x%x ref=%.2f prog=%d useTex=%d",
+                     (int)g_blendEnabled, (unsigned)g_blendSrc, (unsigned)g_blendDst,
+                     (int)g_alphaTestEnabled, (unsigned)g_alphaFunc, (double)g_alphaRef, (int)prog, (int)useTex);
+            LogToJava(b);
+        }
+    }
+
+    // ловим draw, который заливает заданную область экрана
+    char a6info[A6_DEBUG_LOG ? 1800 : 1]; a6info[0] = 0;
+    int a6LumBefore = -1;
+    float a6rx0 = 0.0f, a6rx1 = (float)targetW;
+    float a6ry0 = 0.0f, a6ry1 = (float)targetH;
+    {
+        static int a6big = 0, a6lastFrame = -1, a6drawIdx = 0;
+        if (A6Dbg() && (g_a6FrameNo % 60) == 0 && !clippedPolys.empty()) {
+            if (a6lastFrame != g_a6FrameNo) { a6lastFrame = g_a6FrameNo; a6big = 0; a6drawIdx = 0; }
+            a6drawIdx++;
+            float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+            for (auto& v : clippedPolys) { bx0 = std::min(bx0, v.x); bx1 = std::max(bx1, v.x); by0 = std::min(by0, v.y); by1 = std::max(by1, v.y); }
+            bx0 = std::max(bx0, 0.0f); by0 = std::max(by0, 0.0f);
+            bx1 = std::min(bx1, (float)targetW); by1 = std::min(by1, (float)targetH);
+            float cover = std::max(0.0f, bx1 - bx0) * std::max(0.0f, by1 - by0) / (float)(targetW * targetH);
+            float rx0 = a6rx0, rx1 = a6rx1, ry0 = a6ry0, ry1 = a6ry1;
+            float ov = std::max(0.0f, std::min(bx1, rx1) - std::max(bx0, rx0)) *
+                       std::max(0.0f, std::min(by1, ry1) - std::max(by0, ry0)) / ((rx1 - rx0) * (ry1 - ry0));
+            bool a6IsCar = useTex && (drawTex == 20 || drawTex == 22 || drawTex == 24);
+            if ((ov > 0.0f || a6IsCar) && a6big < 150) {
+                rx0 = std::min(rx0, (float)targetW - 1); rx1 = std::min(rx1, (float)targetW);
+                ry0 = std::min(ry0, (float)targetH - 1); ry1 = std::min(ry1, (float)targetH);
+                long lum = 0; int n = 0;
+                for (int yy = (int)ry0; yy < (int)ry1; yy += 8) for (int xx = (int)rx0; xx < (int)rx1; xx += 8) {
+                    uint32_t p = (*targetColorBuf)[yy * targetW + xx];
+                    lum += (p & 0xFF) + ((p >> 8) & 0xFF) + ((p >> 16) & 0xFF); n++;
+                }
+                a6LumBefore = n ? (int)(lum / (3 * n)) : -1;
+                int texNZ = -1, texMaxA = -1;   // сколько в текстуре вообще непрозрачных текселей
+                if (activeTexPtr && activeTexW > 0 && activeTexH > 0) {
+                    texNZ = 0; texMaxA = 0;
+                    for (int ty2 = 0; ty2 < activeTexH; ty2 += 4) for (int tx2 = 0; tx2 < activeTexW; tx2 += 4) {
+                        int av = (int)(activeTexPtr[ty2 * activeTexW + tx2] >> 24);
+                        if (av > 0) texNZ++;
+                        if (av > texMaxA) texMaxA = av;
+                    }
+                }
+                char b[320];
+                snprintf(b, sizeof(b), "[A6-BIG] #%d ov=%.2f box=%.0f,%.0f..%.0f,%.0f fbo=%d fboTex=%d useTex=%d tex=%u %dx%d texNZ=%d maxA=%d env=0x%x texel0=0x%08x blend=%d src=0x%x dst=0x%x c0=%.2f,%.2f,%.2f,%.2f",
+                         a6big, (double)ov, (double)bx0, (double)by0, (double)bx1, (double)by1,
+                         (int)g_lastActiveFBO, (int)(g_fboTextures.count(drawTex) ? 1 : 0),
+                         (int)useTex, (unsigned)drawTex, activeTexW, activeTexH,
+                         texNZ, texMaxA, (unsigned)g_texEnvMode[0],
+                         activeTexPtr ? activeTexPtr[0] : 0u, (int)g_blendEnabled, (unsigned)g_blendSrc, (unsigned)g_blendDst,
+                         (double)clippedPolys[0].r, (double)clippedPolys[0].g, (double)clippedPolys[0].b, (double)clippedPolys[0].a);
+                int a6LightMask = 0;
+                for (int li = 0; li < 8; li++) if (g_lightEnabled[li]) a6LightMask |= (1 << li);
+                char bl[1400];
+                snprintf(bl, sizeof(bl), "%s U1[tex=%u en=%d env=0x%x uv=%d] U2[tex=%u en=%d env=0x%x uv=%d] U3[tex=%u en=%d] raw=%.2f,%.2f,%.2f,%.2f lit=%d cm=%d lmask=0x%x nrm=%d uv0=%.3f,%.3f..%.3f,%.3f dif=%.2f,%.2f,%.2f,%.2f amb=%.2f,%.2f,%.2f spc=%.2f shin=%.1f",
+                         b, (unsigned)g_cpuUnitTexture[1], (int)g_texture2DUnitEnabled[1],
+                         (unsigned)g_texEnvMode[1], (int)g_vertexAttribs[3].enabled,
+                         (unsigned)g_cpuUnitTexture[2], (int)g_texture2DUnitEnabled[2],
+                         (unsigned)g_texEnvMode[2], (int)g_vertexAttribs[4].enabled,
+                         (unsigned)g_cpuUnitTexture[3], (int)g_texture2DUnitEnabled[3],
+                         (double)g_a6RawC0[0], (double)g_a6RawC0[1], (double)g_a6RawC0[2], (double)g_a6RawC0[3],
+                         (int)g_lightingEnabled, (int)g_colorMaterialEnabled, a6LightMask,
+                         (int)g_vertexAttribs[5].enabled,
+                         (double)g_a6UV[0], (double)g_a6UV[1], (double)g_a6UV[2], (double)g_a6UV[3],
+                         (double)g_matDiffuse[0], (double)g_matDiffuse[1], (double)g_matDiffuse[2], (double)g_matDiffuse[3],
+                         (double)g_matAmbient[0], (double)g_matAmbient[1], (double)g_matAmbient[2],
+                         (double)g_matSpecular[0], (double)g_matShininess);
+                for (int u = 0; u < 2; u++) {
+                    const SWTexCombine& C = g_texCombine[u];
+                    char cb2[320];
+                    snprintf(cb2, sizeof(cb2), " C%d[rgb=0x%x a=0x%x s=0x%x/0x%x/0x%x op=0x%x/0x%x/0x%x scl=%.1f col=%.2f,%.2f,%.2f,%.2f]",
+                             u, (unsigned)C.combineRGB, (unsigned)C.combineAlpha,
+                             (unsigned)C.srcRGB[0], (unsigned)C.srcRGB[1], (unsigned)C.srcRGB[2],
+                             (unsigned)C.operandRGB[0], (unsigned)C.operandRGB[1], (unsigned)C.operandRGB[2],
+                             (double)C.rgbScale,
+                             (double)C.envColor[0], (double)C.envColor[1], (double)C.envColor[2], (double)C.envColor[3]);
+                    strncat(bl, cb2, sizeof(bl) - strlen(bl) - 1);
+                }
+                snprintf(a6info, sizeof(a6info), "%s mode=0x%x cnt=%d tri=%d v0=%.1f,%.1f v1=%.1f,%.1f v2=%.1f,%.1f",
+                         bl, (unsigned)drawMode, (int)count, (int)(clippedPolys.size() / 3),
+                         (double)clippedPolys[0].x, (double)clippedPolys[0].y,
+                         (double)clippedPolys[1].x, (double)clippedPolys[1].y,
+                         (double)clippedPolys[2].x, (double)clippedPolys[2].y);
+                // кнопки идут постоянным цветом 166 и 120
+                int cr = (int)lroundf(clippedPolys[0].r);
+                if (cr == 166 || cr == 120) {
+                    char pb[256];
+                    snprintf(pb, sizeof(pb), "[A6-VTX] c=%d posSize=%d posType=0x%x stride=%d palette=%d raw0=%.3f,%.3f,%.3f,%.3f raw1=%.3f,%.3f,%.3f,%.3f raw2=%.3f,%.3f,%.3f,%.3f",
+                             cr, g_dbgPosSize, g_dbgPosType, g_dbgPosStride, (int)g_matrixPaletteEnabled,
+                             g_dbgRawPos[0][0], g_dbgRawPos[0][1], g_dbgRawPos[0][2], g_dbgRawPos[0][3],
+                             g_dbgRawPos[1][0], g_dbgRawPos[1][1], g_dbgRawPos[1][2], g_dbgRawPos[1][3],
+                             g_dbgRawPos[2][0], g_dbgRawPos[2][1], g_dbgRawPos[2][2], g_dbgRawPos[2][3]);
+                    LogToJava(pb);
+                    snprintf(pb, sizeof(pb), "[A6-VTX] c=%d mvp col0=%.4f,%.4f,%.4f,%.4f col1=%.4f,%.4f,%.4f,%.4f col3=%.4f,%.4f,%.4f,%.4f",
+                             cr, g_dbgMvp[0], g_dbgMvp[1], g_dbgMvp[2], g_dbgMvp[3],
+                             g_dbgMvp[4], g_dbgMvp[5], g_dbgMvp[6], g_dbgMvp[7],
+                             g_dbgMvp[12], g_dbgMvp[13], g_dbgMvp[14], g_dbgMvp[15]);
+                    LogToJava(pb);
+                    size_t nTri = clippedPolys.size() / 3;
+                    for (size_t t = 0; t < nTri && t < 4; t++) {
+                        const SWVertex& p0 = clippedPolys[t * 3];
+                        const SWVertex& p1 = clippedPolys[t * 3 + 1];
+                        const SWVertex& p2 = clippedPolys[t * 3 + 2];
+                        char vb[224];
+                        snprintf(vb, sizeof(vb), "[A6-VTX] c=%d t%d/%d (%.1f,%.1f w%.3f) (%.1f,%.1f w%.3f) (%.1f,%.1f w%.3f)",
+                                 cr, (int)t, (int)nTri,
+                                 (double)p0.x, (double)p0.y, (double)p0.w,
+                                 (double)p1.x, (double)p1.y, (double)p1.w,
+                                 (double)p2.x, (double)p2.y, (double)p2.w);
+                        LogToJava(vb);
+                    }
+                }
+                a6big++;
+            }
+        }
+    }
+
     for (size_t polyIdx = 0; polyIdx < clippedPolys.size(); polyIdx += 3) {
         SWVertex v0 = clippedPolys[polyIdx];
         SWVertex v1 = clippedPolys[polyIdx + 1];
@@ -3252,6 +4685,11 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         float dv_dx = v0.v * stepW0_x + v1.v * stepW1_x + v2.v * stepW2_x;
         float dv_dy = v0.v * stepW0_y + v1.v * stepW1_y + v2.v * stepW2_y;
 
+        float du2_dx = v0.u2 * stepW0_x + v1.u2 * stepW1_x + v2.u2 * stepW2_x;
+        float du2_dy = v0.u2 * stepW0_y + v1.u2 * stepW1_y + v2.u2 * stepW2_y;
+        float dv2_dx = v0.v2 * stepW0_x + v1.v2 * stepW1_x + v2.v2 * stepW2_x;
+        float dv2_dy = v0.v2 * stepW0_y + v1.v2 * stepW1_y + v2.v2 * stepW2_y;
+
         // Стартовые значения атрибутов для начала цикла (угол minX, minY)
         double w0_start = e0_row * invArea, w1_start = e1_row * invArea, w2_start = e2_row * invArea;
         double z_row = (double)v0.z * w0_start + (double)v1.z * w1_start + (double)v2.z * w2_start;
@@ -3262,6 +4700,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         float a_row = v0.a * w0_start + v1.a * w1_start + v2.a * w2_start;
         float u_row = v0.u * w0_start + v1.u * w1_start + v2.u * w2_start;
         float v_row = v0.v * w0_start + v1.v * w1_start + v2.v * w2_start;
+        float u2_row = v0.u2 * w0_start + v1.u2 * w1_start + v2.u2 * w2_start;
+        float v2_row = v0.v2 * w0_start + v1.v2 * w1_start + v2.v2 * w2_start;
 
         // Переводим шаги градиентов цветов в Fixed-Point 16.16
         int dr_dx_fixed = (int)(dr_dx * 65536.0f);
@@ -3275,6 +4715,13 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
 
         // --- HOISTING (Вынос логики и флагов из цикла) ---
         bool opt_tex = useTex;
+        bool opt_tex2 = useTex2;
+        bool opt_env2Only = useEnv2Only;
+        int tex2MaskW = activeTex2W - 1;
+        int tex2MaskH = activeTex2H - 1;
+        bool isPOT2 = (activeTex2W > 0 && (activeTex2W & tex2MaskW) == 0) && (activeTex2H > 0 && (activeTex2H & tex2MaskH) == 0);
+        float fTex2W = (float)activeTex2W;
+        float fTex2H = (float)activeTex2H;
         bool opt_isFboTex = isFboTexture;
         int texMaskW = activeTexW - 1;
         int texMaskH = activeTexH - 1;
@@ -3287,7 +4734,15 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         GLenum opt_depthFunc = g_depthFunc;
         bool opt_fullmask = (!g_blendEnabled && g_colorMask[0] && g_colorMask[1] && g_colorMask[2] && g_colorMask[3]);
         bool opt_prog = prog > 0;
-        GLenum opt_alphaFunc = g_alphaFunc;
+        // В ES 2.0 текстурное окружение не существует — там всё решает шейдер.
+        GLenum opt_envMode = opt_prog ? (GLenum)GL_MODULATE : g_texEnvMode[0];
+        GLenum opt_envMode1 = g_texEnvMode[1];
+        const SWTexCombine* opt_env0 = &g_texCombine[0];
+        const SWTexCombine* opt_env1 = &g_texCombine[1];
+        // glAlphaFunc задаёт порог независимо от того, включён ли сам тест: MCPE ставит
+        // GL_GREATER для террейна и выключает GL_ALPHA_TEST перед HUD, не сбрасывая порог.
+        // Без проверки флага полупрозрачные кнопки управления отсекались целиком.
+        GLenum opt_alphaFunc = g_alphaTestEnabled ? g_alphaFunc : GL_ALWAYS;
         int opt_iAlphaRef = (int)(g_alphaRef * 255.0f); // Вынесли умножение альфы из горячего цикла!
         float fTexW = (float)activeTexW;
         float fTexH = (float)activeTexH;
@@ -3298,9 +4753,9 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             else if (g_blendSrc == GL_SRC_ALPHA && g_blendDst == GL_ONE) fastBlendMode = 2; // Additive
         }
 
-        for (int y = minY; y <= maxY; y++, e0_row += stepY0, e1_row += stepY1, e2_row += stepY2, z_row += dz_dy, invW_row += dinvW_dy, r_row += dr_dy, g_row += dg_dy, b_row += db_dy, a_row += da_dy, u_row += du_dy, v_row += dv_dy) {
+        for (int y = minY; y <= maxY; y++, e0_row += stepY0, e1_row += stepY1, e2_row += stepY2, z_row += dz_dy, invW_row += dinvW_dy, r_row += dr_dy, g_row += dg_dy, b_row += db_dy, a_row += da_dy, u_row += du_dy, v_row += dv_dy, u2_row += du2_dy, v2_row += dv2_dy) {
             double e0 = e0_row, e1 = e1_row, e2 = e2_row;
-            double z = z_row; float invW = invW_row, u = u_row, v = v_row;
+            double z = z_row; float invW = invW_row, u = u_row, v = v_row, u2 = u2_row, v2 = v2_row;
             
             // Задаем стартовые значения Fixed-Point цветов для текущей строки
             int r_fixed = (int)(r_row * 65536.0f);
@@ -3312,22 +4767,29 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             uint32_t* colorPtr = &(*targetColorBuf)[y * targetW + minX];
             
             bool inside = false;
-            for (int x = minX; x <= maxX; x++, e0 += stepX0, e1 += stepX1, e2 += stepX2, z += dz_dx, invW += dinvW_dx, r_fixed += dr_dx_fixed, g_fixed += dg_dx_fixed, b_fixed += db_dx_fixed, a_fixed += da_dx_fixed, u += du_dx, v += dv_dx, depthPtr++, colorPtr++) {
+            for (int x = minX; x <= maxX; x++, e0 += stepX0, e1 += stepX1, e2 += stepX2, z += dz_dx, invW += dinvW_dx, r_fixed += dr_dx_fixed, g_fixed += dg_dx_fixed, b_fixed += db_dx_fixed, a_fixed += da_dx_fixed, u += du_dx, v += dv_dx, u2 += du2_dx, v2 += dv2_dx, depthPtr++, colorPtr++) {
                 if ((e0 > 0.0 || (e0 == 0.0 && bias0)) && 
                     (e1 > 0.0 || (e1 == 0.0 && bias1)) && 
                     (e2 > 0.0 || (e2 == 0.0 && bias2))) {
                     inside = true;
+                    g_dbgCovered++;
+                    if (z < g_dbgZfMin) g_dbgZfMin = z;
+                    if (z > g_dbgZfMax) g_dbgZfMax = z;
+                    if (*depthPtr < g_dbgZbMin) g_dbgZbMin = *depthPtr;
+                    if (*depthPtr > g_dbgZbMax) g_dbgZbMax = *depthPtr;
                     if (opt_depth) {
-                        if (opt_depthFunc == 0x0201) { if (z >= *depthPtr) continue; } // GL_LESS
-                        else if (opt_depthFunc == 0x0203) { if (z > *depthPtr) continue; } // GL_LEQUAL
-                        else if (opt_depthFunc == 0x0202) { if (std::abs(z - *depthPtr) >= 0.00001) continue; } // GL_EQUAL
-                        else if (opt_depthFunc == 0x0200) continue; // GL_NEVER
-                        else if (opt_depthFunc == 0x0204) { if (z <= *depthPtr) continue; } // GL_GREATER
-                        else if (opt_depthFunc == 0x0206) { if (z < *depthPtr) continue; } // GL_GEQUAL
-                        else if (opt_depthFunc == 0x0205) { if (std::abs(z - *depthPtr) < 0.00001) continue; } // GL_NOTEQUAL
+                        if (opt_depthFunc == 0x0201) { if (z >= *depthPtr) { g_dbgRejDepth++; continue; } } // GL_LESS
+                        else if (opt_depthFunc == 0x0203) { if (z > *depthPtr) { g_dbgRejDepth++; continue; } } // GL_LEQUAL
+                        else if (opt_depthFunc == 0x0202) { if (std::abs(z - *depthPtr) >= 0.00001) { g_dbgRejDepth++; continue; } } // GL_EQUAL
+                        else if (opt_depthFunc == 0x0200) { g_dbgRejDepth++; continue; } // GL_NEVER
+                        else if (opt_depthFunc == 0x0204) { if (z <= *depthPtr) { g_dbgRejDepth++; continue; } } // GL_GREATER
+                        else if (opt_depthFunc == 0x0206) { if (z < *depthPtr) { g_dbgRejDepth++; continue; } } // GL_GEQUAL
+                        else if (opt_depthFunc == 0x0205) { if (std::abs(z - *depthPtr) < 0.00001) { g_dbgRejDepth++; continue; } } // GL_NOTEQUAL
                     }
-                    if (invW <= 0.00001f) continue;
-                    if (opt_dmask) *depthPtr = (float)z;
+                    if (invW <= 0.00001f) { g_dbgRejW++; continue; }
+                    // При выключенном GL_DEPTH_TEST буфер глубины не обновляется вовсе (ES 1.1, 4.1.5),
+                    // иначе экранные квады потолка и пола запечатывают глубину и прячут стены.
+                    if (opt_depth && opt_dmask) *depthPtr = (float)z;
                     
                     // Аффинные цвета теперь интерполируются через целочисленную арифметику 16.16
                     int ir = r_fixed >> 16;
@@ -3360,22 +4822,59 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                         if (ty < 0) ty = 0; else if (ty >= activeTexH) ty = activeTexH - 1; // Защита
                         
                         uint32_t texColor = activeTexPtr[ty * activeTexW + tx];
-                        ir = (ir * (texColor & 0xFF)) >> 8;
-                        ig = (ig * ((texColor >> 8) & 0xFF)) >> 8;
-                        ib = (ib * ((texColor >> 16) & 0xFF)) >> 8;
-                        ia = (ia * ((texColor >> 24) & 0xFF)) >> 8;
+                        int tr = texColor & 0xFF;
+                        int tg = (texColor >> 8) & 0xFF;
+                        int tb = (texColor >> 16) & 0xFF;
+                        int ta = (texColor >> 24) & 0xFF;
+                        const int vr0 = ir, vg0 = ig, vb0 = ib, va0 = ia;
+                        if (opt_prog) {
+                            ir = (ir * tr) >> 8; ig = (ig * tg) >> 8;
+                            ib = (ib * tb) >> 8; ia = (ia * ta) >> 8;
+                        } else {
+                            SWApplyTexEnv(opt_envMode, *opt_env0, ir, ig, ib, ia, tr, tg, tb, ta, vr0, vg0, vb0, va0);
+                        }
+
+                        if (opt_tex2) {
+                            int t2x, t2y;
+                            if (isPOT2) {
+                                t2x = (int)(std::floor(u2 * realW * fTex2W)) & tex2MaskW;
+                                t2y = (int)(std::floor(v2 * realW * fTex2H)) & tex2MaskH;
+                            } else {
+                                float r2u = u2 * realW; r2u -= std::floor(r2u);
+                                float r2v = v2 * realW; r2v -= std::floor(r2v);
+                                t2x = (int)(r2u * fTex2W);
+                                t2y = (int)(r2v * fTex2H);
+                            }
+                            if (t2y < 0) t2y = 0; else if (t2y >= activeTex2H) t2y = activeTex2H - 1;
+                            if (t2x < 0) t2x = 0; else if (t2x >= activeTex2W) t2x = activeTex2W - 1;
+
+                            uint32_t lm = activeTex2Ptr[t2y * activeTex2W + t2x];
+                            if (opt_prog) {
+                                ir = (ir * (lm & 0xFF)) >> 8;
+                                ig = (ig * ((lm >> 8) & 0xFF)) >> 8;
+                                ib = (ib * ((lm >> 16) & 0xFF)) >> 8;
+                                ia = (ia * ((lm >> 24) & 0xFF)) >> 8;
+                            } else {
+                                SWApplyTexEnv(opt_envMode1, *opt_env1, ir, ig, ib, ia,
+                                              (int)(lm & 0xFF), (int)((lm >> 8) & 0xFF),
+                                              (int)((lm >> 16) & 0xFF), (int)((lm >> 24) & 0xFF),
+                                              vr0, vg0, vb0, va0);
+                            }
+                        } else if (opt_env2Only) {
+                            SWApplyTexEnv(opt_envMode1, *opt_env1, ir, ig, ib, ia, 0, 0, 0, 0, vr0, vg0, vb0, va0);
+                        }
                     }
 
                     if (opt_prog) {
-                        if (ia <= 0) continue;
+                        if (ia <= 0) { g_dbgRejAT++; continue; }
                     } else if (opt_alphaFunc != GL_ALWAYS) {
-                        if (opt_alphaFunc == GL_GREATER) { if (ia <= opt_iAlphaRef) continue; }
-                        else if (opt_alphaFunc == GL_GEQUAL) { if (ia < opt_iAlphaRef) continue; }
-                        else if (opt_alphaFunc == GL_LESS) { if (ia >= opt_iAlphaRef) continue; }
-                        else if (opt_alphaFunc == GL_LEQUAL) { if (ia > opt_iAlphaRef) continue; }
-                        else if (opt_alphaFunc == GL_EQUAL) { if (ia != opt_iAlphaRef) continue; }
-                        else if (opt_alphaFunc == GL_NOTEQUAL) { if (ia == opt_iAlphaRef) continue; }
-                        else if (opt_alphaFunc == GL_NEVER) continue;
+                        if (opt_alphaFunc == GL_GREATER) { if (ia <= opt_iAlphaRef) { g_dbgRejAT++; continue; } }
+                        else if (opt_alphaFunc == GL_GEQUAL) { if (ia < opt_iAlphaRef) { g_dbgRejAT++; continue; } }
+                        else if (opt_alphaFunc == GL_LESS) { if (ia >= opt_iAlphaRef) { g_dbgRejAT++; continue; } }
+                        else if (opt_alphaFunc == GL_LEQUAL) { if (ia > opt_iAlphaRef) { g_dbgRejAT++; continue; } }
+                        else if (opt_alphaFunc == GL_EQUAL) { if (ia != opt_iAlphaRef) { g_dbgRejAT++; continue; } }
+                        else if (opt_alphaFunc == GL_NOTEQUAL) { if (ia == opt_iAlphaRef) { g_dbgRejAT++; continue; } }
+                        else if (opt_alphaFunc == GL_NEVER) { g_dbgRejAT++; continue; }
                     }
 
                     if (ir > 255) ir = 255; else if (ir < 0) ir = 0;
@@ -3384,10 +4883,11 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                     if (ia > 255) ia = 255; else if (ia < 0) ia = 0;
 
                     // Отсекаем полностью прозрачные пиксели (экономит пропускную способность памяти на чтение/запись)
-                    if (ia == 0 && fastBlendMode > 0) continue;
+                    if (ia == 0 && fastBlendMode > 0) { g_dbgSkipA0++; continue; }
 
                     if (opt_fullmask) {
                         *colorPtr = (ia << 24) | (ib << 16) | (ig << 8) | ir;
+                        g_dbgPixels++;
                         continue;
                     }
 
@@ -3395,45 +4895,55 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                     int br = bg & 0xFF;
                     int bg_g = (bg >> 8) & 0xFF;
                     int bb = (bg >> 16) & 0xFF;
-                    
+                    int ba = (bg >> 24) & 0xFF;
+
                     if (fastBlendMode == 1) { // Standard Alpha (90% случаев)
                         int invA = 255 - ia;
                         ir = (ir * ia + br * invA) >> 8;
                         ig = (ig * ia + bg_g * invA) >> 8;
                         ib = (ib * ia + bb * invA) >> 8;
+                        ia = (ia * ia + ba * invA) >> 8;
                     } else if (fastBlendMode == 2) { // Additive Glow
                         ir = (ir * ia + br * 255) >> 8;
                         ig = (ig * ia + bg_g * 255) >> 8;
                         ib = (ib * ia + bb * 255) >> 8;
+                        ia = (ia * ia + ba * 255) >> 8;
                         if (ir > 255) ir = 255;
                         if (ig > 255) ig = 255;
                         if (ib > 255) ib = 255;
+                        if (ia > 255) ia = 255;
                     } else if (opt_blend) { // Fallback для специфичных блендов
-                        int srcFactor = 255, dstFactor = 0;
-                        if (g_blendSrc == GL_SRC_ALPHA) srcFactor = ia;
-                        else if (g_blendSrc == GL_ONE_MINUS_SRC_ALPHA) srcFactor = 255 - ia;
-                        else if (g_blendSrc == GL_ZERO) srcFactor = 0;
-                        else if (g_blendSrc == GL_DST_COLOR) srcFactor = br;
-                        
-                        if (g_blendDst == GL_ONE_MINUS_SRC_ALPHA) dstFactor = 255 - ia;
-                        else if (g_blendDst == GL_ONE) dstFactor = 255;
-                        else if (g_blendDst == GL_SRC_ALPHA) dstFactor = ia;
-                        
-                        ir = (ir * srcFactor + br * dstFactor) >> 8;
-                        ig = (ig * srcFactor + bg_g * dstFactor) >> 8;
-                        ib = (ib * srcFactor + bb * dstFactor) >> 8;
-                        
+                        // Факторы считаются покомпонентно: GL_ONE_MINUS_SRC_COLOR и родня
+                        // зависят от своего канала, а не от красного, и без них квад ложился
+                        // непрозрачным поверх фона.
+                        int sr = ir, sg = ig, sb = ib, sa = ia;
+                        int sfR = BlendFactorComp(g_blendSrc, sr, sa, br,   ba);
+                        int sfG = BlendFactorComp(g_blendSrc, sg, sa, bg_g, ba);
+                        int sfB = BlendFactorComp(g_blendSrc, sb, sa, bb,   ba);
+                        int sfA = BlendFactorComp(g_blendSrc, sa, sa, ba,   ba);
+                        int dfR = BlendFactorComp(g_blendDst, sr, sa, br,   ba);
+                        int dfG = BlendFactorComp(g_blendDst, sg, sa, bg_g, ba);
+                        int dfB = BlendFactorComp(g_blendDst, sb, sa, bb,   ba);
+                        int dfA = BlendFactorComp(g_blendDst, sa, sa, ba,   ba);
+
+                        ir = (sr * sfR + br   * dfR) >> 8;
+                        ig = (sg * sfG + bg_g * dfG) >> 8;
+                        ib = (sb * sfB + bb   * dfB) >> 8;
+                        ia = (sa * sfA + ba   * dfA) >> 8;
+
                         if (ir > 255) ir = 255;
                         if (ig > 255) ig = 255;
                         if (ib > 255) ib = 255;
+                        if (ia > 255) ia = 255;
                     }
 
                     uint8_t finalR = g_colorMask[0] ? ir : br;
                     uint8_t finalG = g_colorMask[1] ? ig : bg_g;
                     uint8_t finalB = g_colorMask[2] ? ib : bb;
-                    uint8_t finalA = g_colorMask[3] ? ia : ((bg >> 24) & 0xFF);
+                    uint8_t finalA = g_colorMask[3] ? ia : ba;
                     
                     *colorPtr = (finalA << 24) | (finalB << 16) | (finalG << 8) | finalR;
+                    g_dbgPixels++;
                 } else if (inside) {
                     break; // ВАЖНО: Треугольник выпуклый. Раз мы вышли за его границу, дальше по оси X пусто.
                 }
@@ -3441,7 +4951,30 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
-    SyncLog("[RENDER] Отрисовано " + std::to_string(count/3) + " полигонов (Rasterized).");
+    if (A6Dbg() && a6info[0] && a6LumBefore >= 0) {
+        a6rx0 = std::min(a6rx0, (float)targetW - 1); a6rx1 = std::min(a6rx1, (float)targetW);
+        a6ry0 = std::min(a6ry0, (float)targetH - 1); a6ry1 = std::min(a6ry1, (float)targetH);
+        long lum = 0; int n = 0;
+        for (int yy = (int)a6ry0; yy < (int)a6ry1; yy += 8) for (int xx = (int)a6rx0; xx < (int)a6rx1; xx += 8) {
+            uint32_t p = (*targetColorBuf)[yy * targetW + xx];
+            lum += (p & 0xFF) + ((p >> 8) & 0xFF) + ((p >> 16) & 0xFF); n++;
+        }
+        int after = n ? (int)(lum / (3 * n)) : -1;
+        char rej[384];
+        snprintf(rej, sizeof(rej), " после=%d покрыто=%ld записано=%ld |A0=%ld Z=%ld W=%ld AT=%ld| depth=%d zfunc=0x%x afunc=0x%x aref=%.2f",
+                 after, g_dbgCovered, g_dbgPixels, g_dbgSkipA0, g_dbgRejDepth, g_dbgRejW, g_dbgRejAT,
+                 (int)g_depthTestEnabled, (unsigned)g_depthFunc, (unsigned)g_alphaFunc, (double)g_alphaRef);
+        char zb[128];
+        snprintf(zb, sizeof(zb), " zFrag=%.5f..%.5f zBuf=%.5f..%.5f dmask=%d",
+                 g_dbgZfMin, g_dbgZfMax, g_dbgZbMin, g_dbgZbMax, (int)g_depthMask);
+        strncat(rej, zb, sizeof(rej) - strlen(rej) - 1);
+        LogToJava(std::string(a6info) + rej);
+    }
+
+    SyncLog("[RENDER] Отрисовано " + std::to_string(count/3) + " полигонов (Rasterized), после отсечения " + std::to_string(clippedPolys.size()/3) + ", пикселей " + std::to_string(g_dbgPixels) + ", пропущено по alpha=0 " + std::to_string(g_dbgSkipA0) +
+        (clippedPolys.empty() ? std::string(".") :
+         (", экран " + std::to_string((int)clippedPolys[0].x) + "," + std::to_string((int)clippedPolys[0].y) +
+          " - " + std::to_string((int)clippedPolys[1].x) + "," + std::to_string((int)clippedPolys[1].y) + ".")));
 }
 
 
@@ -3483,7 +5016,11 @@ static bool EnsureFixedFunctionProgram() {
         "  v_color = mix(u_constColor, a_color, u_useColorArray);\n"
         "  v_uv = a_uv;\n"
         "  vec4 p = u_mvp * a_pos;\n"
-        "  if (u_rot > 0.5) p.xy = vec2(-p.y, p.x);\n"
+        "  if (u_rot > 0.5) {\n"
+        "    if (u_rot < 1.5) p.xy = vec2(-p.y, p.x);\n"
+        "    else if (u_rot < 2.5) p.xy = -p.xy;\n"
+        "    else p.xy = vec2(p.y, -p.x);\n"
+        "  }\n"
         "  gl_Position = p;\n"
         "  gl_PointSize = u_pointSize;\n"
         "}\n";
@@ -3553,7 +5090,7 @@ static bool EnsureFixedFunctionProgram() {
 }
 
 // Возвращает true, если кадр рисуется нашей fixed-function программой.
-static bool ApplyFixedFunctionState(bool needRot) {
+static bool ApplyFixedFunctionState(int rotQuarters) {
     if (g_activeESVersion != 1) return false;
 
     GLint curProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &curProg);
@@ -3567,7 +5104,7 @@ static bool ApplyFixedFunctionState(bool needRot) {
     MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), mvp);
     glUniformMatrix4fv(g_ffLocMvp, 1, GL_FALSE, mvp);
 
-    bool useTex = g_texture2DEnabled && g_cpuActiveTexture != 0 && g_vertexAttribs[2].enabled;
+    bool useTex = g_texture2DUnitEnabled[0] && g_cpuActiveTexture != 0 && g_vertexAttribs[2].enabled;
     glUniform1f(g_ffLocTexEnable, useTex ? 1.0f : 0.0f);
     glUniform1i(g_ffLocTex, 0);
 
@@ -3580,7 +5117,7 @@ static bool ApplyFixedFunctionState(bool needRot) {
     glUniform1i(g_ffLocAlphaFunc, af);
     glUniform1f(g_ffLocAlphaRef, g_alphaRef);
 
-    glUniform1f(g_ffLocRot, needRot ? 1.0f : 0.0f);
+    glUniform1f(g_ffLocRot, (float)rotQuarters);
     glUniform1f(g_ffLocPointSize, g_pointSize);
     return true;
 }
@@ -3598,12 +5135,12 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
                 targetH = g_cpuTexH[tex];
             }
         }
-        bool needRot = (g_gameViewportH > g_gameViewportW && targetW > targetH);
-        if (!ApplyFixedFunctionState(needRot)) {
+        int rotQuarters = FrameRotQuarters(targetW, targetH);
+        if (!ApplyFixedFunctionState(rotQuarters)) {
             GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
             if (prog > 0) {
                 GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
-                if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+                if (rotLoc != -1) glUniform1f(rotLoc, (float)rotQuarters);
             }
         }
         glDrawArrays(mode, first, count);
@@ -3624,12 +5161,12 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
                 targetH = g_cpuTexH[tex];
             }
         }
-        bool needRot = (g_gameViewportH > g_gameViewportW && targetW > targetH);
-        if (!ApplyFixedFunctionState(needRot)) {
+        int rotQuarters = FrameRotQuarters(targetW, targetH);
+        if (!ApplyFixedFunctionState(rotQuarters)) {
             GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
             if (prog > 0) {
                 GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
-                if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+                if (rotLoc != -1) glUniform1f(rotLoc, (float)rotQuarters);
             }
         }
         glDrawElements(mode, count, type, indices);
@@ -3668,19 +5205,27 @@ static bool IsES1OnlyCap(GLenum cap) {
 extern "C" void MegaDebug_glEnable(GLenum cap) {
     if (cap == GL_BLEND) g_blendEnabled = true;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = true;
-    else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = true;
+    else if (cap == GL_TEXTURE_2D) g_texture2DUnitEnabled[g_cpuTextureUnit] = true;
     else if (cap == 0x0BC0) g_alphaTestEnabled = true; // GL_ALPHA_TEST
     else if (cap == 0x0B44) g_cullFaceEnabled = true; // GL_CULL_FACE
     else if (cap == 0x8840) g_matrixPaletteEnabled = true; // GL_MATRIX_PALETTE_OES
+    else if (cap == 0x0B50) g_lightingEnabled = true; // GL_LIGHTING
+    else if (cap == 0x0B57) g_colorMaterialEnabled = true; // GL_COLOR_MATERIAL
+    else if (cap == 0x0BA1) g_normalizeEnabled = true; // GL_NORMALIZE
+    else if (cap >= 0x4000 && cap <= 0x4007) g_lightEnabled[cap - 0x4000] = true; // GL_LIGHT0..7
     if ((g_gpuOffloadMask & 32) && !IsES1OnlyCap(cap)) glEnable(cap);
 }
 extern "C" void MegaDebug_glDisable(GLenum cap) {
     if (cap == GL_BLEND) g_blendEnabled = false;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = false;
-    else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = false;
+    else if (cap == GL_TEXTURE_2D) g_texture2DUnitEnabled[g_cpuTextureUnit] = false;
     else if (cap == 0x0BC0) g_alphaTestEnabled = false;
     else if (cap == 0x0B44) g_cullFaceEnabled = false;
     else if (cap == 0x8840) g_matrixPaletteEnabled = false;
+    else if (cap == 0x0B50) g_lightingEnabled = false;
+    else if (cap == 0x0B57) g_colorMaterialEnabled = false;
+    else if (cap == 0x0BA1) g_normalizeEnabled = false;
+    else if (cap >= 0x4000 && cap <= 0x4007) g_lightEnabled[cap - 0x4000] = false;
     if ((g_gpuOffloadMask & 32) && !IsES1OnlyCap(cap)) glDisable(cap);
 }
 extern "C" void MegaDebug_glCullFace(GLenum mode) { g_cullFaceMode = mode; if (g_gpuOffloadMask & 32) glCullFace(mode); }
@@ -3707,20 +5252,38 @@ extern "C" void MegaDebug_glDepthFunc(GLenum func) {
     if (g_gpuOffloadMask & 32) glDepthFunc(func);
 }
 extern "C" const GLubyte* MegaDebug_glGetString(GLenum name) {
+    static char s_glStrVersion[64] = "";
+    static char s_glStrRenderer[64] = "PowerVR SGX 535";
+    static char s_glStrVendor[64] = "Apple Inc.";
+    // Набор как у настоящего iPhone 3GS (ES 1.1) — движки разбирают эту строку и по ней
+    // включают целые ветки рендера. GL_OES_element_index_uint добавлен сверх списка:
+    // без него ломаются игры, уже работающие во враппере на 32-битных индексах.
+    static char s_glStrExt[1024] = "GL_APPLE_framebuffer_multisample GL_APPLE_texture_2D_limited_npot GL_APPLE_texture_format_BGRA8888 GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_OES_blend_equation_separate GL_OES_blend_func_separate GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_fbo_render_mipmap GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_stencil8 GL_OES_stencil_wrap GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object GL_OES_element_index_uint";
     if (name == GL_VERSION) {
-        const char* customVer = (g_activeESVersion == 1) ? "OpenGL ES-CM 1.1 Apple" : "OpenGL ES 2.0 Apple";
-        LogToJava(std::string("[GL-TRACE] glGetString(GL_VERSION) intercepted -> ") + customVer);
-        return (const GLubyte*)customVer;
+        snprintf(s_glStrVersion, sizeof(s_glStrVersion), "%s",
+                 (g_activeESVersion == 1) ? "OpenGL ES-CM 1.1 Apple" : "OpenGL ES 2.0 Apple");
+        char dbg[160];
+        snprintf(dbg, sizeof(dbg), "[GL-DIAG] glGetString(GL_VERSION) -> %p '%s'", (void*)s_glStrVersion, s_glStrVersion);
+        LogToJava(dbg);
+        return (const GLubyte*)s_glStrVersion;
     }
     if (name == GL_RENDERER) {
-        const char* customRen = "PowerVR SGX 535";
-        LogToJava(std::string("[GL-TRACE] glGetString(GL_RENDERER) intercepted -> ") + customRen);
-        return (const GLubyte*)customRen;
+        char dbg[160];
+        snprintf(dbg, sizeof(dbg), "[GL-DIAG] glGetString(GL_RENDERER) -> %p", (void*)s_glStrRenderer);
+        LogToJava(dbg);
+        return (const GLubyte*)s_glStrRenderer;
+    }
+    if (name == GL_VENDOR) {
+        char dbg[160];
+        snprintf(dbg, sizeof(dbg), "[GL-DIAG] glGetString(GL_VENDOR) -> %p", (void*)s_glStrVendor);
+        LogToJava(dbg);
+        return (const GLubyte*)s_glStrVendor;
     }
     if (name == GL_EXTENSIONS) {
-        const char* customExt = "GL_OES_matrix_palette GL_OES_draw_texture GL_EXT_texture_filter_anisotropic GL_APPLE_texture_2D_limited_npot GL_OES_framebuffer_object GL_OES_element_index_uint";
-        LogToJava("[GL-TRACE] glGetString(GL_EXTENSIONS) intercepted -> Added ES 1.1 Skinning Extensions (VAO disabled)");
-        return (const GLubyte*)customExt;
+        char dbg[160];
+        snprintf(dbg, sizeof(dbg), "[GL-DIAG] glGetString(GL_EXTENSIONS) -> %p", (void*)s_glStrExt);
+        LogToJava(dbg);
+        return (const GLubyte*)s_glStrExt;
     }
     const GLubyte* res = glGetString(name);
     LogToJava(std::string("[GL-TRACE] glGetString(") + std::to_string(name) + ") -> " + (res ? (const char*)res : "NULL"));
@@ -3754,7 +5317,7 @@ extern "C" void wrap_glGetFloatv(GLenum pname, GLfloat *data) {
     if (data && (pname == 0x0BA6 || pname == 0x0BA7 || pname == 0x0BA8)) {
         const std::vector<float>* src =
             (pname == 0x0BA6) ? &g_modelViewStack.back() :
-            (pname == 0x0BA7) ? &g_projectionStack.back() : &g_textureStack.back();
+            (pname == 0x0BA7) ? &g_projectionStack.back() : &g_textureStacks[g_cpuTextureUnit & 7].back();
         memcpy(data, src->data(), 16 * sizeof(float));
         return;
     }
@@ -3782,12 +5345,18 @@ extern "C" void MegaDebug_glGetIntegerv(GLenum pname, GLint *data) {
     }
     if (pname == 0x0D33) { // GL_MAX_TEXTURE_SIZE
         glGetIntegerv(pname, data);
+        // Мы представляемся PowerVR SGX 535, у него предел 2048. Отдавать предел хоста нельзя:
+        // движки считают по нему размеры своих таблиц и буферов.
+        if (data[0] > 2048) data[0] = 2048;
         LogToJava(">>>>>>>> [SIZE-CRITICAL] glGetIntegerv(GL_MAX_TEXTURE_SIZE) <<<<<<<< Caller: " + GetModuleInfoForAddress(lr) + " | Отдаем: " + std::to_string(data[0]));
         return;
     }
     if (pname == 0x8D42 || pname == 0x8D43) { // GL_RENDERBUFFER_WIDTH / HEIGHT
         LogToJava(">>>>>>>> [SIZE-CRITICAL] ВНИМАНИЕ: glGetIntegerv запросил WIDTH/HEIGHT (вместо glGetRenderbufferParameteriv) <<<<<<<< Caller: " + GetModuleInfoForAddress(lr));
     }
+    // Без офлоада glBindFramebuffer до реального GL не доходит, и драйвер отдаёт 0.
+    // Движок кэширует этот ответ как «экранный» FBO и уводит туда свой рендер.
+    if (pname == 0x8CA6 && !(g_gpuOffloadMask & 64)) { *data = (GLint)g_lastActiveFBO; return; } // GL_FRAMEBUFFER_BINDING
     if (pname == 0x8894) { *data = g_boundBuffers[0x8892]; return; } // GL_ARRAY_BUFFER_BINDING
     if (pname == 0x8895) { *data = g_boundBuffers[0x8893]; return; } // GL_ELEMENT_ARRAY_BUFFER_BINDING
     if (pname == 0x8842) { *data = 32; return; } // GL_MAX_PALETTE_MATRICES_OES
@@ -3924,6 +5493,7 @@ void UpdateTextCache(void* view, const std::string& text, float logicalH) {
 // CUSTOM HLE ES 2.0 UI RENDERER
 // ==========================================
 
+std::string GetObjCClassName(void* obj);   // ВРЕМЕННОЕ: для диагностики Asphalt 6
 void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = false) {
     if (!view || !g_views.count(view)) return;
     auto& v = g_views[view];
@@ -3965,7 +5535,18 @@ void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = f
         CPUDrawSolidRect(x, y, w, h, 0.75f, 0.75f, 0.75f, 1.0f, 3.0f);
         CPUDrawSolidRect(x + 1.0f, y + 1.0f, w - 2.0f, h - 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.5f);
     } else if (type == "UIActivityIndicatorView") {
-        CPUDrawSolidRect(x + w/2.0f - 10, y + h/2.0f - 10, 20, 20, 1.0f, 0.5f, 0.0f, 1.0f, 5.0f);
+        const int kSpokes = 12;
+        float cx = x + w / 2.0f, cy = y + h / 2.0f;
+        float side = (w < h ? w : h); if (side < 8.0f) side = 20.0f;
+        float ring = side * 0.36f, thick = side * 0.12f; if (thick < 1.0f) thick = 1.0f;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        int phase = (int)((ts.tv_sec * 1000 + ts.tv_nsec / 1000000) / 80) % kSpokes;
+        for (int i = 0; i < kSpokes; i++) {
+            float ang = (float)i * 6.2831853f / kSpokes;
+            float fade = 0.15f + 0.85f * ((kSpokes - 1 - ((i - phase + kSpokes) % kSpokes)) / (float)(kSpokes - 1));
+            CPUDrawSolidRect(cx + ring * cosf(ang) - thick / 2.0f, cy + ring * sinf(ang) - thick / 2.0f,
+                             thick, thick, 1.0f, 1.0f, 1.0f, fade * v.alpha, thick / 2.0f);
+        }
     } else if (type == "UIImageView") {
         void* uiImage = g_dictionaries[view][(void*)0x1111];
         if (uiImage) {
@@ -3980,6 +5561,14 @@ void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = f
         // фреймбуфере, при программном — в этом же CPU-буфере; затирается и там, и там.
         bool bgUnderGL = isRoot;
         if (finalAlpha > 0.0f && !bgUnderGL) {
+            if (A6Dbg() && (g_a6FrameNo % 300) == 0) {
+                char b[256];
+                snprintf(b, sizeof(b), "[A6-UI] фон %s(%s) view=%p кадр=%g,%g %gx%g цвет=%.2f,%.2f,%.2f a=%.2f root=%d",
+                         type.c_str(), GetObjCClassName(view).c_str(), view,
+                         (double)v.frame[0], (double)v.frame[1], (double)v.frame[2], (double)v.frame[3],
+                         (double)c.r, (double)c.g, (double)c.b, (double)finalAlpha, (int)isRoot);
+                LogToJava(b);
+            }
             CPUDrawSolidRect(x, y, w, h, c.r, c.g, c.b, finalAlpha, v.cornerRadius);
         }
     }
@@ -4049,7 +5638,7 @@ static int CountSubtree(void* v, int depth) {   // ВРЕМЕННЫЙ
 void RenderHLEUI() {
     std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
     void* activeView = g_presentedView ? g_presentedView : g_mainView;
-    {   // ВРЕМЕННЫЙ
+    if (A6_DEBUG_LOG) {   // счётчики UITableView: меню Asphalt 6 строится на нём
         static int frame = 0;
         if (++frame % 120 == 0)
             __android_log_print(ANDROID_LOG_WARN, "DW32DIAG",
@@ -4147,9 +5736,10 @@ extern "C" uint64_t Stub_objc_msgSend(void* self, const char* op, void* a1, void
 extern "C" uint64_t Stub_objc_msgSendSuper2(void* super_struct, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8);
 extern "C" void* Stub_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7);
 
-// CGRect приезжает в msgSend через регистры VFP, а Stub_objc_msgSend снимает s0-s3
-// с вызывающего кода. Для собственных вызовов setFrame:/initWithFrame: там мусор,
-// поэтому FPU-аргументы выставляем руками и идём мимо Stub.
+// ABI iOS на ARM32 — softfp: CGRect приезжает в целочисленных регистрах, а в s0-s3
+// лежит мусор от предыдущих операций (обычно куски строк от memcpy на NEON).
+// Поэтому обработчики читают рект из a1..a4, а здесь на всякий случай заполняются
+// и FPU-аргументы — часть кода враппера ещё смотрит на них.
 extern float g_fpu_args[4];
 extern float g_fpu_ret[4];
 extern int g_fpu_ret_flag;
@@ -4354,10 +5944,17 @@ static void* PlistParseValue(const std::string& s, size_t& i, const XmlTag& open
 
 // Корневой словарь plist-файла, либо nullptr.
 void* LoadPlistFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) return nullptr;
-    std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (src.compare(0, 6, "bplist") == 0) {
+    std::string src;
+    if (IpaIsVirtualPath(path.c_str())) {
+        std::vector<unsigned char> raw;
+        if (!IpaReadAll(path, raw)) return nullptr;
+        src.assign((const char*)raw.data(), raw.size());
+    } else {
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open()) return nullptr;
+        src.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    if (src.size() >= 6 && src.compare(0, 6, "bplist") == 0) {
         LogToJava("HLE-PLIST: бинарный plist не поддерживается: " + path);
         return nullptr;
     }
@@ -4687,12 +6284,11 @@ static void NibApplyConnections(NibArchive& a, int connArrayIdx) {
 // Разворачивает .nib и возвращает объекты верхнего уровня.
 std::vector<void*> LoadNibArchive(const std::string& path, void* owner) {
     std::vector<void*> topLevel;
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
+    std::vector<uint8_t> d;
+    if (!VfsReadFileAny(path, d)) {
         LogToJava("HLE-NIB: файл не найден: " + path);
         return topLevel;
     }
-    std::vector<uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     NibArchive a; a.owner = owner;
     if (!NibParse(d, a)) {
         LogToJava("HLE-NIB: не разобрался формат: " + path);
@@ -4748,7 +6344,7 @@ std::string ResolveNibPath(const std::string& name) {
     for (const char* sfx : suffixes) {
         std::string p = g_appBundlePath + "/" + base + sfx + ".nib";
         struct stat st;
-        if (stat(p.c_str(), &st) == 0) return p;
+        if (VfsStatAny(p, &st) == 0) return p;
     }
     LogToJava("HLE-NIB: не нашёл .nib с именем " + base);
     return "";
@@ -4803,6 +6399,29 @@ int g_fpu_ret_flag = 0;
 
 uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8) {
     float saved_s[4] = {g_fpu_args[0], g_fpu_args[1], g_fpu_args[2], g_fpu_args[3]};
+    // трассировка кадрового пути EAGLView Asphalt 6 1.0.2 (адреса её образа)
+    if (A6Dbg() && op && (strcmp(op, "drawView") == 0 || strcmp(op, "drawViewEventPump") == 0 ||
+               strcmp(op, "updateKeyboard") == 0 || strcmp(op, "presentRenderbuffer:") == 0)) {
+        static int a6_cnt = 0;
+        if (strcmp(op, "presentRenderbuffer:") == 0) {
+            if ((g_a6FrameNo % 300) == 0 && g_a6FrameNo > 0 && !g_cpuColorBuffer.empty()) {
+                char p[192];
+                snprintf(p, sizeof(p), "%sa6_p9_%dx%d.raw", g_workDir.c_str(), g_surfaceWidth, g_surfaceHeight);
+                FILE* fd = fopen(p, "wb");
+                if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
+            }
+            g_a6FrameNo++; LogToJava("[A6-RTT] ===== PRESENT =====");
+        }
+        if (a6_cnt < 12 || a6_cnt % 200 == 0) {
+            uint32_t st = (strcmp(op, "drawView") == 0 && self) ? *(uint32_t*)((uint8_t*)self + 104) : 0xffffffff;
+            char buf[192];
+            snprintf(buf, sizeof(buf), "[A6-DIAG] frame #%d %s state=%d gate=%u appState7c7630=%u",
+                     a6_cnt, op, (int)st, (unsigned)*(uint8_t*)(0x7C7130 + g_appSlide),
+                     (unsigned)*(uint32_t*)(0x7C7630 + g_appSlide));
+            LogToJava(buf);
+        }
+        a6_cnt++;
+    }
     static void* s_lazyGlView = nullptr;
     static void* s_lastMoviePlayer = nullptr;
     // Диспетчер showDialog в игре после CreateWorld/MainMenuOptions безусловно
@@ -5064,13 +6683,10 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     }
     if (strcmp(op, "setFrame:") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        float x = saved_s[0], y = saved_s[1], w = saved_s[2], h = saved_s[3];
-        uint32_t ix, iy, iw, ih; memcpy(&ix, &x, 4); memcpy(&iy, &y, 4); memcpy(&iw, &w, 4); memcpy(&ih, &h, 4);
+        float x, y, w, h; memcpy(&x, &a1, 4); memcpy(&y, &a2, 4); memcpy(&w, &a3, 4); memcpy(&h, &a4, 4);
         LogToJava(">>>>>>>> [SIZE-CRITICAL] setFrame: вызван для " + GetObjCClassName(self) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
-        LogToJava("  Устанавливают (FPU Floats): x=" + std::to_string(x) + " y=" + std::to_string(y) + " w=" + std::to_string(w) + " h=" + std::to_string(h));
-        char rawBuf[128]; snprintf(rawBuf, sizeof(rawBuf), "  Raw HEX: s0=0x%08X, s1=0x%08X, s2=0x%08X, s3=0x%08X", ix, iy, iw, ih);
-        LogToJava(rawBuf);
+        LogToJava("  Устанавливают: x=" + std::to_string(x) + " y=" + std::to_string(y) + " w=" + std::to_string(w) + " h=" + std::to_string(h));
         g_views[self].frame = {x, y, w, h}; 
         uint32_t isa = 0;
         if (SafeRead32((uintptr_t)self, &isa) && isa > 0x1000 && isa != 0xDEADBEEF && ((uint32_t*)isa)[0] != 0xDEADBEEF) {
@@ -5093,8 +6709,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     }
     if (strcmp(op, "setBounds:") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        float bx = saved_s[0], by = saved_s[1], bw = saved_s[2], bh = saved_s[3];
-        LogToJava("[SIZE-TRACE] setBounds: вызван для " + GetObjCClassName(self) + ". Caller: " + GetModuleInfoForAddress(lr) + " | Устанавливают (FPU): x=" + std::to_string(bx) + " y=" + std::to_string(by) + " w=" + std::to_string(bw) + " h=" + std::to_string(bh));
+        float bx, by, bw, bh; memcpy(&bx, &a1, 4); memcpy(&by, &a2, 4); memcpy(&bw, &a3, 4); memcpy(&bh, &a4, 4);
+        LogToJava("[SIZE-TRACE] setBounds: вызван для " + GetObjCClassName(self) + ". Caller: " + GetModuleInfoForAddress(lr) + " | Устанавливают: x=" + std::to_string(bx) + " y=" + std::to_string(by) + " w=" + std::to_string(bw) + " h=" + std::to_string(bh));
         if (g_views[self].frame.size() >= 4) { g_views[self].frame[2] = bw; g_views[self].frame[3] = bh; }
         else g_views[self].frame = {0, 0, bw, bh};
         uint32_t isa = 0;
@@ -5127,7 +6743,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     if (strcmp(op, "becomeFirstResponder") == 0 || strcmp(op, "resignFirstResponder") == 0) return 0;
     if (strcmp(op, "initWithFrame:") == 0) {
         float x, y, w, h; memcpy(&x, &a1, 4); memcpy(&y, &a2, 4); memcpy(&w, &a3, 4); memcpy(&h, &a4, 4);
-        g_views[self].frame = {x, y, w, h}; 
+        g_views[self].frame = {x, y, w, h};
     }
     if (strcmp(op, "setCenter:") == 0) {
         float cx, cy; memcpy(&cx, &a1, 4); memcpy(&cy, &a2, 4);
@@ -5147,6 +6763,16 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     if (strcmp(op, "setBackgroundColor:") == 0) {
         g_views[self].uiColorObj = a1;
         if (g_uiColors.count(a1)) { g_views[self].bgColor = g_uiColors[a1]; g_views[self].hasBg = true; }
+        if (A6Dbg()) {
+            auto& vv = g_views[self];
+            char b[256];
+            snprintf(b, sizeof(b), "[A6-UI] setBackgroundColor %s view=%p кадр=%g,%g %gx%g цвет=%.2f,%.2f,%.2f,%.2f от %s",
+                     GetObjCClassName(self).c_str(), self, (double)vv.frame[0], (double)vv.frame[1],
+                     (double)vv.frame[2], (double)vv.frame[3], (double)vv.bgColor.r, (double)vv.bgColor.g,
+                     (double)vv.bgColor.b, (double)vv.bgColor.a,
+                     GetModuleInfoForAddress((uint32_t)__builtin_return_address(0)).c_str());
+            LogToJava(b);
+        }
         return 0;
     }
     if (strcmp(op, "backgroundColor") == 0) return (uint64_t)(uintptr_t)g_views[self].uiColorObj;
@@ -5290,15 +6916,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 return (uint64_t)(uintptr_t)inst;
             }
             if (strcmp(op, "colorWithRed:green:blue:alpha:") == 0) {
+                float r = 0.0f, g = 0.0f, b = 0.0f, a = 1.0f;
+                uint32_t vR = (uint32_t)(uintptr_t)a1, vG = (uint32_t)(uintptr_t)a2;
+                uint32_t vB = (uint32_t)(uintptr_t)a3, vA = (uint32_t)(uintptr_t)a4;
+                memcpy(&r, &vR, 4); memcpy(&g, &vG, 4); memcpy(&b, &vB, 4); memcpy(&a, &vA, 4);
                 uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self;
-                static int color_calls = 0;
-                if (color_calls++ == 0) {
-                    // Самый первый вызов - это фон HardUITestViewController
-                    g_uiColors[inst] = {0.1f, 0.1f, 0.15f, 1.0f};
-                } else {
-                    // Все остальные вызовы в этом приложении — это круги мультитача!
-                    g_uiColors[inst] = {(rand()%100)/100.0f, (rand()%100)/100.0f, (rand()%100)/100.0f, 0.7f};
-                }
+                g_uiColors[inst] = {r, g, b, a};
                 return (uint64_t)(uintptr_t)inst;
             }
             if (strcmp(op, "clearColor") == 0) {
@@ -5433,8 +7056,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "NSArray" && strcmp(op, "arrayWithContentsOfFile:") == 0) {
             std::string path = GetNSString(a1);
             uint32_t* arrInst = (uint32_t*)calloc(1, 32); arrInst[0] = (uint32_t)self;
-            std::ifstream in(path);
-            if (in.is_open()) {
+            std::vector<unsigned char> raw;
+            if (VfsReadFileAny(path, raw)) {
+                std::istringstream in(std::string((const char*)raw.data(), raw.size()));
                 std::string line;
                 while (std::getline(in, line)) {
                     size_t start = line.find("<string>"); size_t end = line.find("</string>");
@@ -5479,7 +7103,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "NSBundle" && (strcmp(op, "bundleWithPath:") == 0 || strcmp(op, "bundleWithURL:") == 0)) {
             std::string path = GetNSString(a1);
             struct stat st;
-            if (path.empty() || stat(path.c_str(), &st) != 0) {
+            if (path.empty() || VfsStatAny(path, &st) != 0) {
                 LogToJava("HLE: [NSBundle bundleWithPath:] нет такого бандла: " + path);
                 return 0;
             }
@@ -5565,10 +7189,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         if (clsName == "NSString" && strcmp(op, "stringWithContentsOfFile:encoding:error:") == 0) {
             std::string path = GetNSString(a1);
-            std::ifstream in(path);
-            if (in.is_open()) {
-                std::stringstream buffer; buffer << in.rdbuf();
-                return (uint64_t)(uintptr_t)CreateNSString(buffer.str());
+            std::vector<unsigned char> raw;
+            if (VfsReadFileAny(path, raw)) {
+                return (uint64_t)(uintptr_t)CreateNSString(std::string((const char*)raw.data(), raw.size()));
             }
             return 0;
         }
@@ -5593,6 +7216,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "EAGLContext" && strcmp(op, "setCurrentContext:") == 0) {
             g_currentEAGLContext = a1;
             LogToJava("HLE_DEBUG: [EAGLContext setCurrentContext:] - Игра привязала контекст!");
+            if (A6Dbg()) {   // кто крутит контекст, если кадров нет
+                static int sc_cnt = 0;
+                if (sc_cnt < 5 || sc_cnt % 200 == 0)
+                    LogToJava("[A6-DIAG] setCurrentContext #" + std::to_string(sc_cnt) +
+                              " caller " + GetModuleInfoForAddress((uintptr_t)__builtin_return_address(1)));
+                sc_cnt++;
+            }
             return 1;
         }
         if (clsName == "EAGLContext" && strcmp(op, "currentContext") == 0) {
@@ -5600,6 +7230,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         if (clsName == "EAGLContext" && strcmp(op, "initWithAPI:") == 0) {
             LogToJava("HLE_DEBUG: [EAGLContext initWithAPI:] - Создание контекста API: " + std::to_string((int)(uintptr_t)a1));
+            // В режиме ES 1.1 запрос ES 2.0 обязан провалиться, как на устройстве без шейдеров:
+            // иначе игра выбирает шейдерный драйвер и требует GLSL-эффекты, которых нет.
+            if ((int)(uintptr_t)a1 >= 2 && g_esModeOption == 1) {
+                LogToJava("HLE_DEBUG: [EAGLContext initWithAPI:] - отказ, враппер в режиме ES 1.1");
+                return 0;
+            }
             uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
         }
         if (clsName == "EAGLContext" && strcmp(op, "sharegroup") == 0) {
@@ -5626,14 +7262,22 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             std::string imgName = GetNSString(a1);
             std::string fullPath = g_appBundlePath + "/" + imgName;
             int w, h, channels;
-            uint8_t* data = stbi_load(fullPath.c_str(), &w, &h, &channels, 4);
+            std::vector<unsigned char> imgRaw;
+            uint8_t* data = nullptr;
+            if (VfsReadFileAny(fullPath, imgRaw) && !imgRaw.empty()) {
+                DwStbLoadArgs la{imgRaw.data(), (int)imgRaw.size(), 0, 0, 0};
+                data = DwStbLoad(&la);
+                w = la.x; h = la.y; channels = la.comp;
+            }
             if (data) {
                 uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self;
                 HLE_CGImage* cgImg = new HLE_CGImage{w, h, 32, data};
                 inst[1] = (uint32_t)cgImg;
                 return (uint64_t)(uintptr_t)inst;
             }
-            LogToJava("HLE_ERROR: Не удалось загрузить картинку: " + fullPath);
+            LogToJava("HLE_ERROR: Не удалось загрузить картинку: " + fullPath +
+                      " (прочитано " + std::to_string((int)imgRaw.size()) + " Б, stb: " +
+                      (stbi_failure_reason() ? stbi_failure_reason() : "нет причины") + ")");
             return 0;
         }
         if (clsName == "UIView" && strcmp(op, "setAnimationsEnabled:") == 0) return 0;
@@ -5723,14 +7367,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "NSData") {
             if (strcmp(op, "dataWithContentsOfFile:") == 0 || strcmp(op, "dataWithContentsOfMappedFile:") == 0) {
                 std::string path = GetNSString(a1);
-                std::ifstream in(path, std::ios::binary | std::ios::ate);
-                if (!in.is_open()) return 0;
-                std::streamsize size = in.tellg();
-                in.seekg(0, std::ios::beg);
+                std::vector<unsigned char> raw;
+                if (!VfsReadFileAny(path, raw)) return 0;
+                size_t size = raw.size();
                 uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)(uintptr_t)self;
                 if (size > 0) {
-                    uint8_t* binData = (uint8_t*)malloc((size_t)size + 1);
-                    in.read((char*)binData, size);
+                    uint8_t* binData = (uint8_t*)malloc(size + 1);
+                    memcpy(binData, raw.data(), size);
                     binData[size] = 0;
                     inst[1] = (uint32_t)(uintptr_t)binData;
                     inst[2] = (uint32_t)size;
@@ -5847,9 +7490,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (table.empty()) table = "Localizable";
             // .strings — это строки вида "ключ" = "значение";
             // Xcode пишет их в UTF-16 с BOM, поэтому сначала приводим к UTF-8.
-            std::ifstream in(root + "/en.lproj/" + table + ".strings", std::ios::binary);
-            if (in.is_open()) {
-                std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            std::vector<unsigned char> rawBuf;
+            if (VfsReadFileAny(root + "/en.lproj/" + table + ".strings", rawBuf)) {
+                std::string raw((const char*)rawBuf.data(), rawBuf.size());
                 bool be = raw.size() >= 2 && (uint8_t)raw[0] == 0xFE && (uint8_t)raw[1] == 0xFF;
                 bool le = raw.size() >= 2 && (uint8_t)raw[0] == 0xFF && (uint8_t)raw[1] == 0xFE;
                 if (be || le) {
@@ -5901,7 +7544,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (!dir.empty()) root += "/" + dir;
             std::string fullPath = root + "/" + name + (ext.empty() ? "" : "." + ext);
             struct stat buffer;
-            if (stat(fullPath.c_str(), &buffer) == 0) {
+            if (VfsStatAny(fullPath, &buffer) == 0) {
                 LogToJava("HLE_DEBUG: [NSBundle pathForResource] НАЙДЕН: " + fullPath);
                 return (uint64_t)(uintptr_t)CreateNSString(fullPath);
             }
@@ -6031,7 +7674,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "UTF8String") == 0) return (uint64_t)(uintptr_t)"DamnDevice";
             if (strcmp(op, "uniqueGlobalDeviceIdentifier") == 0) return (uint64_t)(uintptr_t)CreateNSString("DamnDevice-1234-5678");
             if (strcmp(op, "userInterfaceIdiom") == 0) return 0; // 0 = Phone
-            if (strcmp(op, "orientation") == 0) return 3; // 3 = UIDeviceOrientationLandscapeRight
+            if (strcmp(op, "orientation") == 0) return (uint64_t)g_ifaceOrientation;
+            if (strcmp(op, "setOrientation:") == 0) { if (OriValid((int)a1)) g_ifaceOrientation = (int)a1; return 0; }
             if (strcmp(op, "beginGeneratingDeviceOrientationNotifications") == 0) return 0;
             if (strcmp(op, "isGeneratingDeviceOrientationNotifications") == 0) return 0;
             if (strcmp(op, "uniqueIdentifier") == 0) return (uint64_t)(uintptr_t)CreateNSString("DamnWrapper-0000-1111");
@@ -6066,7 +7710,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 
         if (clsName == "UIApplication") {
-            if (strcmp(op, "statusBarOrientation") == 0) return 3; // UIDeviceOrientationLandscapeRight
+            if (strcmp(op, "statusBarOrientation") == 0) return (uint64_t)g_ifaceOrientation;
             if (strcmp(op, "delegate") == 0) return (uint64_t)(uintptr_t)g_appDelegateInstance;
             if (strcmp(op, "keyWindow") == 0) {
                 static uint32_t* dummyWindow = nullptr;
@@ -6078,7 +7722,14 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 return (uint64_t)(uintptr_t)dummyWindow;
             }
             if (strcmp(op, "setStatusBarHidden:") == 0 || strcmp(op, "setStatusBarHidden:animated:") == 0) return 0;
-            if (strcmp(op, "setStatusBarOrientation:animated:") == 0) return 0;
+            // Игра сама объявляет, в какой ориентации работает. Запоминаем и с этого
+            // момента отвечаем ей тем же: иначе она видит расхождение с «устройством»
+            // и доворачивает сцену сама.
+            if (strcmp(op, "setStatusBarOrientation:") == 0 ||
+                strcmp(op, "setStatusBarOrientation:animated:") == 0) {
+                if (OriValid((int)a1)) g_ifaceOrientation = (int)a1;
+                return 0;
+            }
             if (strcmp(op, "setIdleTimerDisabled:") == 0) return 0;
             if (strcmp(op, "registerForRemoteNotificationTypes:") == 0) return 0;
             if (strcmp(op, "beginReceivingRemoteControlEvents") == 0) return 0;
@@ -6521,7 +8172,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         path = g_appBundlePath + "/" + path;
                     } else {
                         struct stat buffer;
-                        if (stat(path.c_str(), &buffer) != 0) {
+                        if (VfsStatAny(path, &buffer) != 0) {
                             std::string fileName = path.substr(path.find_last_of('/') + 1);
                             path = g_appBundlePath + "/" + fileName;
                         }
@@ -6784,23 +8435,20 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 std::string res = GetNSString(a1); std::string ext = GetNSString(a2);
                 std::string fullPath = g_appBundlePath + "/" + res + (ext.empty() ? "" : "." + ext);
                 struct stat buffer;
-                if (stat(fullPath.c_str(), &buffer) == 0) {
-                    return (uint64_t)(uintptr_t)CreateNSString(fullPath);
-                }
+                bool found = VfsStatAny(fullPath, &buffer) == 0;
+                if (found) return (uint64_t)(uintptr_t)CreateNSString(fullPath);
                 return 0;
             }
         }
         if (clsName == "NSData") {
             if (strcmp(op, "initWithContentsOfFile:") == 0) {
                 std::string path = GetNSString(a1);
-                std::ifstream in(path, std::ios::binary | std::ios::ate);
-                if (in.is_open()) {
-                    std::streamsize size = in.tellg();
-                    in.seekg(0, std::ios::beg);
-                    uint8_t* binData = (uint8_t*)malloc(size);
-                    in.read((char*)binData, size);
+                std::vector<unsigned char> raw;
+                if (VfsReadFileAny(path, raw) && !raw.empty()) {
+                    uint8_t* binData = (uint8_t*)malloc(raw.size());
+                    memcpy(binData, raw.data(), raw.size());
                     self_ptr[1] = (uint32_t)binData;
-                    self_ptr[2] = (uint32_t)size;
+                    self_ptr[2] = (uint32_t)raw.size();
                 }
                 return (uint64_t)(uintptr_t)self;
             }
@@ -7162,7 +8810,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "fileExistsAtPath:isDirectory:") == 0) {
                 std::string path = GetNSString(a1);
                 struct stat info;
-                int exists = (stat(path.c_str(), &info) == 0);
+                int exists = (VfsStatAny(path, &info) == 0);
                 if (a2) {
                     int8_t* isDir = (int8_t*)a2; 
                     *isDir = (info.st_mode & S_IFDIR) ? 1 : 0;
@@ -7172,7 +8820,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "fileExistsAtPath:") == 0) {
                 std::string path = GetNSString(a1);
                 struct stat info;
-                return (stat(path.c_str(), &info) == 0) ? 1 : 0;
+                return (VfsStatAny(path, &info) == 0) ? 1 : 0;
             }
             if (strcmp(op, "createDirectoryAtPath:withIntermediateDirectories:attributes:error:") == 0) {
                 std::string path = GetNSString(a1);
@@ -7185,8 +8833,21 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
         }
 
+        // Asphalt 6 1.0.2: -[EAGLView drawView] (IMP 0x53a4) — switch по ивару
+        // self+104 (0..10); только case 5 рисует кадр.
+        if (A6Dbg() && (strcmp(op, "drawView") == 0 || strcmp(op, "drawViewEventPump") == 0)) {
+            static int dv_cnt = 0;
+            if (dv_cnt < 10 || dv_cnt % 120 == 0) {
+                uint32_t st = self ? *(uint32_t*)((uint8_t*)self + 104) : 0xdeadbeef;
+                char buf[160];
+                snprintf(buf, sizeof(buf), "[A6-DIAG] %s #%d self=%p state=%u", op, dv_cnt, self, st);
+                LogToJava(buf);
+            }
+            dv_cnt++;
+        }
+
         // --- Original HLE Handlers ---
-        if (clsName == "CADisplayLink" && strcmp(op, "addToRunLoop:forMode:") == 0) { 
+        if (clsName == "CADisplayLink" && strcmp(op, "addToRunLoop:forMode:") == 0) {
             LogToJava("HLE_DEBUG: [CADisplayLink addToRunLoop:forMode:] - ИГРА ЗАПУСТИЛА РЕНДЕР ЛУП!");
             g_renderingStarted = true; 
             return (uint64_t)(uintptr_t)self; 
@@ -7205,9 +8866,20 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return val ? (uint64_t)(uintptr_t)val : 1;
         }
         
+        // В режиме ES 1.1 запрос ES 2.0 обязан провалиться, как на устройстве без шейдеров:
+        // иначе игра выбирает шейдерный драйвер и требует GLSL-эффекты, которых фиксированный
+        // конвейер не регистрирует (Asphalt 6 падал на поиске customspheremap_*).
+        if (clsName == "EAGLContext" && strcmp(op, "initWithAPI:") == 0) {
+            int api = (int)(uintptr_t)a1;
+            LogToJava("HLE_DEBUG: [EAGLContext initWithAPI:" + std::to_string(api) + "]" +
+                      ((api >= 2 && g_esModeOption == 1) ? " -> nil, враппер в режиме ES 1.1" : ""));
+            if (api >= 2 && g_esModeOption == 1) return 0;
+            return (uint64_t)(uintptr_t)self;
+        }
+
         // ВМЕШАТЕЛЬСТВО HLE: Рендерим наш UI поверх кадра игры перед SwapBuffers
-        if (clsName == "EAGLContext" && strcmp(op, "presentRenderbuffer:") == 0) { 
-            bool isSpamOn = (g_spamFiltersMask & (1 << 5)) != 0;
+        if (clsName == "EAGLContext" && strcmp(op, "presentRenderbuffer:") == 0) {
+            bool isSpamOn = (g_spamMask & (1u << LOG_RENDER_DUMP)) != 0;
             static int pr_cnt = 0; pr_cnt++;
             if (!isSpamOn || pr_cnt <= 30 || pr_cnt % 120 == 0) {
                 SyncLog("[MEGA-DEBUG] EAGLContext presentRenderbuffer: called");
@@ -7217,8 +8889,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (!isSpamOn || pr_cnt <= 30 || pr_cnt % 120 == 0) {
                 DumpGLState("AFTER RenderHLEUI inside presentRenderbuffer");
             }
-            MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface); 
-            return 1; 
+            MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+            g_framePresented = true;
+            return 1;
         }
 
         if (clsName == "EAGLContext" && strcmp(op, "renderbufferStorage:fromDrawable:") == 0) {
@@ -7236,12 +8909,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
         if ((strcmp(op, "locationInView:") == 0 || strcmp(op, "previousLocationInView:") == 0) && clsName == "FakeUITouch") {
             FakeUITouch* t = (FakeUITouch*)self;
-            float rx = t->x, ry = t->y;
-            
-            if (g_gameViewportH > g_gameViewportW && g_surfaceWidth > g_surfaceHeight) {
-                rx = (float)g_surfaceHeight - t->y;
-                ry = t->x;
-            }
+            float rx, ry; MapTouchToGameView(t->x, t->y, rx, ry);
             
             // Если запрашивают координаты относительно конкретного View, а не окна (a1 != nil)
             if (a1 && g_views.count(a1)) {
@@ -7276,11 +8944,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         if (clsName == "FakeUITouch" && strcmp(op, "previousLocationInView:") == 0) {
             FakeUITouch* t = (FakeUITouch*)self; 
-            float rx = t->x, ry = t->y;
-            if (g_gameViewportH > g_gameViewportW && g_surfaceWidth > g_surfaceHeight) {
-                rx = (float)g_surfaceHeight - t->y;
-                ry = t->x;
-            }
+            float rx, ry; MapTouchToGameView(t->x, t->y, rx, ry);
             uint32_t bx, by; memcpy(&bx, &rx, 4); memcpy(&by, &ry, 4); return ((uint64_t)by << 32) | bx;
         }
         if (clsName == "FakeUITouch" && strcmp(op, "view") == 0) {
@@ -7681,6 +9345,9 @@ uint64_t Impl_objc_msgSendSuper2(void* super_struct, const char* op, void* a1, v
 }
 
 extern "C" uint64_t Stub_objc_msgSendSuper2(void* super_struct, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8) {
+#if defined(__arm__)
+    asm volatile("vstr s0, [%0]\n vstr s1, [%0, #4]\n vstr s2, [%0, #8]\n vstr s3, [%0, #12]" : : "r"(g_fpu_args) : "memory");
+#endif
     uint64_t ret = Impl_objc_msgSendSuper2(super_struct, op, a1, a2, a3, a4, a5, a6, a7, a8);
     if (g_fpu_ret_flag) {
 #if defined(__arm__)
@@ -7721,7 +9388,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET MSG_SEND " + std::string(op) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
         LogToJava("  Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: 0x" + std::to_string((uintptr_t)ret_addr));
-        LogToJava("  Writing (Float): x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
+        LogToJava("  Writing (Float): x=0 y=0 w=" + std::to_string((int)w) + " h=" + std::to_string((int)h));
 
         if (ret_addr) {
             memcpy(ret_addr, rectData, 16);
@@ -7740,11 +9407,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     if (strcmp(op, "locationInView:") == 0 || strcmp(op, "previousLocationInView:") == 0) {
         if (ret_addr) {
             FakeUITouch* t = (FakeUITouch*)self;
-            float rx = t->x, ry = t->y;
-            if (g_gameViewportH > g_gameViewportW && g_surfaceWidth > g_surfaceHeight) {
-                rx = (float)g_surfaceHeight - t->y;
-                ry = t->x;
-            }
+            float rx, ry; MapTouchToGameView(t->x, t->y, rx, ry);
             float* pt = (float*)ret_addr;
             pt[0] = rx;
             pt[1] = ry;
@@ -7865,11 +9528,7 @@ void* Impl_objc_msgSendSuper2_stret(void* ret_addr, void* super_struct, const ch
     if (strcmp(op, "locationInView:") == 0 || strcmp(op, "previousLocationInView:") == 0) {
         if (ret_addr) {
             FakeUITouch* t = (FakeUITouch*)receiver;
-            float rx = t->x, ry = t->y;
-            if (g_gameViewportH > g_gameViewportW && g_surfaceWidth > g_surfaceHeight) {
-                rx = (float)g_surfaceHeight - t->y;
-                ry = t->x;
-            }
+            float rx, ry; MapTouchToGameView(t->x, t->y, rx, ry);
             float* pt = (float*)ret_addr;
             pt[0] = rx;
             pt[1] = ry;
@@ -8110,9 +9769,15 @@ void FillIOSStat(struct stat& android_st, void* ios_stat_buf) {
 extern "C" int wrap_stat(const char* path, void* ios_stat_buf) {
     if (!path || !ios_stat_buf) return -1;
     std::string sPath = path;
+    if (IpaIsVirtualPath(sPath.c_str())) {
+        struct stat vst;
+        if (!IpaStat(sPath, &vst)) { errno = ENOENT; return -1; }
+        FillIOSStat(vst, ios_stat_buf);
+        return 0;
+    }
     bool isRelative = (sPath.length() > 0 && sPath[0] != '/');
     if (isRelative) sPath = g_sandboxDir + "Documents/" + sPath;
-    
+
     if (sPath.find(".dll") != std::string::npos || sPath.find("mscorlib") != std::string::npos || sPath.find("Mono") != std::string::npos || sPath.find("Data/Managed") != std::string::npos) {
         LogToJava("MONO-TRACE: [stat] Запрос инфы: " + sPath);
     } else {
@@ -8121,8 +9786,10 @@ extern "C" int wrap_stat(const char* path, void* ios_stat_buf) {
     struct stat android_st;
     int res = stat(sPath.c_str(), &android_st);
     if (res != 0 && isRelative) {
-        sPath = g_appBundlePath + "/" + path;
-        res = stat(sPath.c_str(), &android_st);
+        std::string bundlePath = g_appBundlePath + "/" + path;
+        res = IpaIsVirtualPath(bundlePath.c_str()) ? (IpaStat(bundlePath, &android_st) ? 0 : -1)
+                                                  : stat(bundlePath.c_str(), &android_st);
+        sPath = bundlePath;
     }
     if (res == 0) FillIOSStat(android_st, ios_stat_buf);
     return res;
@@ -8131,7 +9798,9 @@ extern "C" int wrap_stat(const char* path, void* ios_stat_buf) {
 extern "C" int wrap_fstat(int fd, void* ios_stat_buf) {
     if (!ios_stat_buf) return -1;
     struct stat android_st;
-    int res = fstat(fd, &android_st);
+    int res;
+    if (IpaIsVirtualFd(fd)) res = IpaFstat(fd, &android_st) ? 0 : -1;
+    else res = fstat(fd, &android_st);
     if (res == 0) FillIOSStat(android_st, ios_stat_buf);
     return res;
 }
@@ -8139,14 +9808,21 @@ extern "C" int wrap_fstat(int fd, void* ios_stat_buf) {
 extern "C" int wrap_lstat(const char* path, void* ios_stat_buf) {
     if (!path || !ios_stat_buf) return -1;
     std::string sPath = path;
+    if (IpaIsVirtualPath(sPath.c_str())) {
+        struct stat vst;
+        if (!IpaStat(sPath, &vst)) { errno = ENOENT; return -1; }
+        FillIOSStat(vst, ios_stat_buf);
+        return 0;
+    }
     bool isRelative = (sPath.length() > 0 && sPath[0] != '/');
     if (isRelative) sPath = g_sandboxDir + "Documents/" + sPath;
-    
+
     struct stat android_st;
     int res = lstat(sPath.c_str(), &android_st);
     if (res != 0 && isRelative) {
-        sPath = g_appBundlePath + "/" + path;
-        res = lstat(sPath.c_str(), &android_st);
+        std::string bundlePath = g_appBundlePath + "/" + path;
+        res = IpaIsVirtualPath(bundlePath.c_str()) ? (IpaStat(bundlePath, &android_st) ? 0 : -1)
+                                                  : lstat(bundlePath.c_str(), &android_st);
     }
     if (res == 0) FillIOSStat(android_st, ios_stat_buf);
     return res;
@@ -8315,7 +9991,27 @@ extern "C" void wrap_CFRunLoopAddTimer(void* rl, void* timer, void* mode) {
     }, args);
 }
 extern "C" void wrap_CFRunLoopTimerInvalidate(void* timer) { if (timer) ((HLE_CFRunLoopTimer*)timer)->valid = false; }
-extern "C" int wrap_CFRunLoopRunInMode(void* mode, double seconds, uint8_t returnAfterSourceHandled) { usleep((int)(seconds * 1000000.0)); return 1; }
+extern "C" int wrap_CFRunLoopRunInMode(void* mode, double seconds, uint8_t returnAfterSourceHandled) {
+    usleep((int)(seconds * 1000000.0));
+    // Игры вроде Asphalt не возвращают управление главному циклу враппера и пампят рунлуп
+    // сами — очередь главного потока надо сливать здесь, иначе до игры не доходят ни тачи,
+    // ни её собственные отложенные селекторы.
+    static thread_local std::vector<std::pair<void*, std::string>> s_active;
+    std::vector<MainQueueItem> queueCopy;
+    pthread_mutex_lock(&g_mainQueueMutex);
+    queueCopy.swap(g_mainQueue);
+    pthread_mutex_unlock(&g_mainQueueMutex);
+    for (auto& item : queueCopy) {
+        // Кадровый метод игры сам пампит рунлуп, поэтому повторный вызов того же
+        // селектора из его собственного стека уводил бы в бесконечную рекурсию.
+        std::pair<void*, std::string> key(item.target, item.sel ? item.sel : "");
+        if (std::find(s_active.begin(), s_active.end(), key) != s_active.end()) continue;
+        s_active.push_back(key);
+        Stub_objc_msgSend(item.target, item.sel, item.arg, item.arg2, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        s_active.pop_back();
+    }
+    return 1;
+}
 
 extern "C" void* wrap_CFStringCreateExternalRepresentation(void* alloc, void* theString, uint32_t encoding, uint8_t lossByte) {
     std::string s = GetNSString(theString); HLE_CFData* d = new HLE_CFData{ g_hleClasses.count("NSData") ? (uint32_t)g_hleClasses["NSData"] : 0xDEADBEEF };
@@ -8922,6 +10618,21 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             Stub_objc_msgSend(appDel, "setWindow:", window, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         }
         
+        // Главный nib на iOS разворачивается до делегата и сам создаёт корневой контроллер.
+        // Без него контроллер обязан создавать сам делегат: если враппер сделает это заранее,
+        // игра получит два контроллера, и первый отработает до того, как делегат выставит
+        // размеры экрана (Wolf3D так уходил в glViewport(0,0,0,0)).
+        bool hasMainNib = false;
+        for (const char* nibName : {"/MainWindow.nib", "/MainWindow-iPhone.nib", "/MainWindow~iphone.nib"}) {
+            std::string nibPath = g_appBundlePath + nibName;
+            if (IpaIsVirtualPath(nibPath.c_str()) ? IpaExists(nibPath)
+                                                 : (access(nibPath.c_str(), F_OK) == 0)) {
+                hasMainNib = true; break;
+            }
+        }
+        if (!hasMainNib && FindMethodIMP(appDelIsa, "application:didFinishLaunchingWithOptions:")) {
+            LogToJava("HLE: Главного nib нет — корневой контроллер создаст сам делегат.");
+        } else {
         uint32_t vcClassAddr = 0;
         for (auto const& pair : g_appSymbols) {
             if (pair.first.find("_OBJC_CLASS_$_") == 0 && pair.first.find("ViewController") != std::string::npos) {
@@ -8958,7 +10669,8 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             }
             Stub_objc_msgSend(window, "setRootViewController:", vc, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         }
-        
+        }
+
         void* uiApp = (void*)Stub_objc_msgSend((void*)ResolveSymbol("OBJC_CLASS_$_UIApplication"), "sharedApplication", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         
         if (FindMethodIMP(appDelIsa, "application:didFinishLaunchingWithOptions:")) {
@@ -9035,7 +10747,24 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         if (g_renderingStarted && g_displayLinkTarget && g_displayLinkSelector) {
             static int dl_ticks = 0;
             if (dl_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Вызов DisplayLink: target=" + GetObjCClassName(g_displayLinkTarget) + " sel=" + std::string(g_displayLinkSelector));
+            g_framePresented = false;
             Stub_objc_msgSend(g_displayLinkTarget, g_displayLinkSelector, realFakeLink, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            // Игра с UIKit-меню (Wolf3D) крутит display link, но пока меню на экране ничего не
+            // презентует — без этого кадр не доходит до экрана и остаётся чёрным.
+            if (!g_framePresented) {
+                EGLSurface curSurf = eglGetCurrentSurface(EGL_DRAW);
+                EGLint sw = -1, sh = -1;
+                if (curSurf != EGL_NO_SURFACE) {
+                    EGLDisplay curDpy = eglGetCurrentDisplay();
+                    eglQuerySurface(curDpy, curSurf, EGL_WIDTH, &sw);
+                    eglQuerySurface(curDpy, curSurf, EGL_HEIGHT, &sh);
+                }
+                if (sw > 0 && sh > 0) {
+                    MegaDebug_glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                    RenderHLEUI();
+                    MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+                }
+            }
         } else {
             static int idle_ticks = 0;
             if (idle_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Крутимся в IDLE_LOOP. g_renderingStarted=" + std::to_string(g_renderingStarted) + " target_set=" + std::to_string(g_displayLinkTarget != nullptr));
@@ -9301,6 +11030,9 @@ extern "C" void* wrap_CGBitmapContextCreateImage(void* c) {
 extern "C" size_t wrap_CGImageGetWidth(void* image) { return image ? ((HLE_CGImage*)image)->width : 0; }
 extern "C" size_t wrap_CGImageGetHeight(void* image) { return image ? ((HLE_CGImage*)image)->height : 0; }
 extern "C" size_t wrap_CGImageGetBitsPerComponent(void* image) { return image ? ((HLE_CGImage*)image)->bpp : 8; }
+// Игры делят это значение на 8 и считают размер буфера: заглушка с нулём давала нулевую
+// аллокацию, а следом чтение всей текстуры за её пределами.
+extern "C" size_t wrap_CGImageGetBitsPerPixel(void* image) { return image ? ((HLE_CGImage*)image)->bpp : 32; }
 extern "C" uint32_t wrap_CGImageGetAlphaInfo(void* image) { return 1; } // CGImageAlphaInfo::kCGImageAlphaPremultipliedLast
 extern "C" void* wrap_CGColorSpaceCreateDeviceRGB() {
     uint32_t* cs = (uint32_t*)calloc(1, 4);
@@ -9712,18 +11444,31 @@ extern "C" long wrap_sysconf(int name) {
     return sysconf(name);
 }
 
+// PTHREAD_MUTEX_INITIALIZER в iOS — это сигнатура в первом слове, а в bionic — нули.
+// Подменять сигнатуру можно только через CAS: иначе два потока, одновременно взявшие
+// статический мьютекс, успевают оба «проинициализировать» его, и повторный
+// pthread_mutex_init сбрасывает уже захваченный замок в свободное состояние.
+static inline void IosMutexEnsureInit(void* mutex) {
+    uint32_t expected = 0x32AAABA7;
+    __atomic_compare_exchange_n((uint32_t*)mutex, &expected, 0u, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+static inline void IosCondEnsureInit(void* cond) {
+    uint32_t expected = 0x3CB0B1BB;
+    __atomic_compare_exchange_n((uint32_t*)cond, &expected, 0u, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
 extern "C" int wrap_pthread_mutex_init(void* mutex, const void* attr) {
     memset(mutex, 0, 40); // iOS mutex = 40 bytes
-    return pthread_mutex_init((pthread_mutex_t*)mutex, nullptr);
+    // pthread_mutexattr_* привязаны напрямую к bionic, поэтому attr уже в его формате.
+    // Без него рекурсивный мьютекс становился обычным и игра вставала на себе самой.
+    return pthread_mutex_init((pthread_mutex_t*)mutex, (const pthread_mutexattr_t*)attr);
 }
 extern "C" int wrap_pthread_mutex_lock(void* mutex) {
-    uint32_t* ptr = (uint32_t*)mutex;
-    if (ptr[0] == 0x32AAABA7) { ptr[0] = 0; pthread_mutex_init((pthread_mutex_t*)mutex, nullptr); }
+    IosMutexEnsureInit(mutex);
     return pthread_mutex_lock((pthread_mutex_t*)mutex);
 }
 extern "C" int wrap_pthread_mutex_trylock(void* mutex) {
-    uint32_t* ptr = (uint32_t*)mutex;
-    if (ptr[0] == 0x32AAABA7) { ptr[0] = 0; pthread_mutex_init((pthread_mutex_t*)mutex, nullptr); }
+    IosMutexEnsureInit(mutex);
     return pthread_mutex_trylock((pthread_mutex_t*)mutex);
 }
 extern "C" int wrap_pthread_mutex_unlock(void* mutex) {
@@ -9737,34 +11482,39 @@ extern "C" int wrap_pthread_cond_init(void* cond, const void* attr) {
     return pthread_cond_init((pthread_cond_t*)cond, nullptr);
 }
 extern "C" int wrap_pthread_cond_wait(void* cond, void* mutex) {
-    uint32_t* ptr = (uint32_t*)cond;
-    if (ptr[0] == 0x3CB0B1BB) { ptr[0] = 0; pthread_cond_init((pthread_cond_t*)cond, nullptr); }
+    IosCondEnsureInit(cond);
+    IosMutexEnsureInit(mutex);
     return pthread_cond_wait((pthread_cond_t*)cond, (pthread_mutex_t*)mutex);
 }
 extern "C" int wrap_pthread_cond_timedwait(void* cond, void* mutex, const struct timespec* abstime) {
-    uint32_t* ptr = (uint32_t*)cond;
-    if (ptr[0] == 0x3CB0B1BB) { ptr[0] = 0; pthread_cond_init((pthread_cond_t*)cond, nullptr); }
+    IosCondEnsureInit(cond);
+    IosMutexEnsureInit(mutex);
     return pthread_cond_timedwait((pthread_cond_t*)cond, (pthread_mutex_t*)mutex, abstime);
 }
 extern "C" int wrap_pthread_cond_signal(void* cond) {
-    uint32_t* ptr = (uint32_t*)cond;
-    if (ptr[0] == 0x3CB0B1BB) return 0;
+    IosCondEnsureInit(cond);
     return pthread_cond_signal((pthread_cond_t*)cond);
 }
 extern "C" int wrap_pthread_cond_broadcast(void* cond) {
-    uint32_t* ptr = (uint32_t*)cond;
-    if (ptr[0] == 0x3CB0B1BB) return 0;
+    IosCondEnsureInit(cond);
     return pthread_cond_broadcast((pthread_cond_t*)cond);
 }
 extern "C" int wrap_pthread_cond_destroy(void* cond) {
     return pthread_cond_destroy((pthread_cond_t*)cond);
 }
 
+// В режиме ES 1.1 враппер обязан выглядеть устройством без ES 2.0, иначе игра
+// грузит шейдеры «ES2-класса» и рассогласуется с фиксированным конвейером.
+static const char* HleDeviceModel() {
+    // Asphalt 6 исключена: на iPhone1,2 она уходит в урезанный набор ресурсов.
+    return (g_esModeOption == 1 && !g_isAsphalt6) ? "iPhone1,2" : "iPhone2,1";
+}
+
 extern "C" int wrap_sysctlbyname(const char* name, void* oldp, size_t* oldlenp, void* newp, size_t newlen) {
     uint32_t lr = (uint32_t)__builtin_return_address(0);
     LogToJava(std::string(">>>>>>>> [SYSCTL-TRACE] sysctlbyname: ") + (name ? name : "null") + " | Caller: " + GetModuleInfoForAddress(lr) + " <<<<<<<<");
     if (name && (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0)) {
-        const char* machine = "iPhone2,1"; // Обманываем игру, притворяясь iPhone 3GS
+        const char* machine = HleDeviceModel();
         if (oldlenp) {
             if (oldp && *oldlenp >= strlen(machine) + 1) {
                 strcpy((char*)oldp, machine);
@@ -9784,7 +11534,7 @@ extern "C" int wrap_sysctl(int* name, unsigned int namelen, void* oldp, size_t* 
     }
     if (name && namelen >= 2 && name[0] == 6) { // 6 = CTL_HW
         if (name[1] == 1 || name[1] == 2) { // 1 = HW_MACHINE, 2 = HW_MODEL
-            const char* machine = "iPhone2,1";
+            const char* machine = HleDeviceModel();
             if (oldlenp) {
                 if (oldp && *oldlenp >= strlen(machine) + 1) {
                     strcpy((char*)oldp, machine);
@@ -9948,14 +11698,68 @@ extern "C" {
     void wrap_glShadeModel(GLenum mode) {
         g_shadeModel = mode;
     }
-    void wrap_glTexEnvf(GLenum target, GLenum pname, GLfloat param) {
-        // Заглушка: программный рендер уже применяет текстуру через GL_MODULATE в CPUExtractAndDraw
+    static void SetTexEnv(GLenum target, GLenum pname, GLint param) {
+        {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: какие ступени texEnv игра реально настраивает
+            uint64_t key = ((uint64_t)target << 40) | ((uint64_t)pname << 20) | ((uint64_t)g_cpuTextureUnit << 16) | (uint32_t)(param & 0xFFFF);
+            if (A6Dbg() && g_a6SeenTexEnv.size() < 60 && g_a6SeenTexEnv.insert(key).second) {
+                char b[160];
+                snprintf(b, sizeof(b), "[A6-ENV] unit=%d target=0x%x pname=0x%x param=0x%x", g_cpuTextureUnit,
+                         (unsigned)target, (unsigned)pname, (unsigned)param);
+                LogToJava(b);
+            }
+        }
+        if (target != GL_TEXTURE_ENV) return;
+        if (g_cpuTextureUnit < 0 || g_cpuTextureUnit >= 8) return;
+        SWTexCombine& C = g_texCombine[g_cpuTextureUnit];
+        switch (pname) {
+            case GL_TEXTURE_ENV_MODE: g_texEnvMode[g_cpuTextureUnit] = (GLenum)param; break;
+            case 0x8571: C.combineRGB = (GLenum)param; break;   // GL_COMBINE_RGB
+            case 0x8572: C.combineAlpha = (GLenum)param; break; // GL_COMBINE_ALPHA
+            case 0x8580: C.srcRGB[0] = (GLenum)param; break;    // GL_SRC0_RGB
+            case 0x8581: C.srcRGB[1] = (GLenum)param; break;
+            case 0x8582: C.srcRGB[2] = (GLenum)param; break;
+            case 0x8588: C.srcAlpha[0] = (GLenum)param; break;  // GL_SRC0_ALPHA
+            case 0x8589: C.srcAlpha[1] = (GLenum)param; break;
+            case 0x858A: C.srcAlpha[2] = (GLenum)param; break;
+            case 0x8590: C.operandRGB[0] = (GLenum)param; break; // GL_OPERAND0_RGB
+            case 0x8591: C.operandRGB[1] = (GLenum)param; break;
+            case 0x8592: C.operandRGB[2] = (GLenum)param; break;
+            case 0x8598: C.operandAlpha[0] = (GLenum)param; break; // GL_OPERAND0_ALPHA
+            case 0x8599: C.operandAlpha[1] = (GLenum)param; break;
+            case 0x859A: C.operandAlpha[2] = (GLenum)param; break;
+            case 0x8573: C.rgbScale = (float)param; break;      // GL_RGB_SCALE
+            case 0x0D1C: C.alphaScale = (float)param; break;    // GL_ALPHA_SCALE
+            default: break;
+        }
     }
-    void wrap_glTexEnvfv(GLenum target, GLenum pname, const GLfloat *params) {}
-    void wrap_glTexEnvi(GLenum target, GLenum pname, GLint param) {}
+    void wrap_glTexEnvf(GLenum target, GLenum pname, GLfloat param) {
+        SetTexEnv(target, pname, (GLint)param);
+    }
+    void wrap_glTexEnvfv(GLenum target, GLenum pname, const GLfloat *params) {
+        if (!params) return;
+        if (pname == 0x2201 && g_cpuTextureUnit >= 0 && g_cpuTextureUnit < 8) { // GL_TEXTURE_ENV_COLOR
+            memcpy(g_texCombine[g_cpuTextureUnit].envColor, params, sizeof(float) * 4);
+            {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+                static std::set<uint64_t> seen;
+                uint64_t k = ((uint64_t)g_cpuTextureUnit << 40) ^ (uint64_t)(params[0] * 1000) ^ ((uint64_t)(params[1] * 1000) << 12) ^ ((uint64_t)(params[2] * 1000) << 24);
+                if (A6Dbg() && seen.size() < 40 && seen.insert(k).second) {
+                    char b[160];
+                    snprintf(b, sizeof(b), "[A6-ENVC] unit=%d %.3f %.3f %.3f %.3f", g_cpuTextureUnit,
+                             (double)params[0], (double)params[1], (double)params[2], (double)params[3]);
+                    LogToJava(b);
+                }
+            }
+            return;
+        }
+        SetTexEnv(target, pname, (GLint)params[0]);
+    }
+    void wrap_glTexEnvi(GLenum target, GLenum pname, GLint param) {
+        SetTexEnv(target, pname, param);
+    }
     
     void wrap_glTexEnvx(GLenum target, GLenum pname, GLint param) {
-        wrap_glTexEnvf(target, pname, (GLfloat)param / 65536.0f);
+        // GL_TEXTURE_ENV_MODE — перечисление, а не 16.16: делить его на 65536 нельзя.
+        SetTexEnv(target, pname, param);
     }
     void wrap_glCurrentPaletteMatrixOES(GLuint matrixpaletteindex) {
         g_currentPaletteMatrix = matrixpaletteindex;
@@ -9992,11 +11796,87 @@ extern "C" {
     void wrap_glFogf(GLenum pname, GLfloat param) {}
     void wrap_glFogfv(GLenum pname, const GLfloat *params) {}
     void wrap_glLightModelf(GLenum pname, GLfloat param) {}
-    void wrap_glLightModelfv(GLenum pname, const GLfloat *params) {}
-    void wrap_glLightf(GLenum light, GLenum pname, GLfloat param) {}
-    void wrap_glLightfv(GLenum light, GLenum pname, const GLfloat *params) {}
-    void wrap_glMaterialf(GLenum face, GLenum pname, GLfloat param) {}
-    void wrap_glMaterialfv(GLenum face, GLenum pname, const GLfloat *params) {}
+    void wrap_glLightModelfv(GLenum pname, const GLfloat *params) {
+        if (pname == 0x0B53 && params) memcpy(g_lightModelAmbient, params, sizeof(float) * 4); // GL_LIGHT_MODEL_AMBIENT
+    }
+    void wrap_glLightf(GLenum light, GLenum pname, GLfloat param) {
+        if (light < 0x4000 || light > 0x4007) return;
+        SWLight& L = g_lights[light - 0x4000];
+        switch (pname) {
+            case 0x1206: L.spotExponent = param; break;            // GL_SPOT_EXPONENT
+            case 0x1207: L.spotCutoff = param; break;              // GL_SPOT_CUTOFF
+            case 0x1208: L.attenuation[0] = param; break;          // GL_CONSTANT_ATTENUATION
+            case 0x1209: L.attenuation[1] = param; break;          // GL_LINEAR_ATTENUATION
+            case 0x120A: L.attenuation[2] = param; break;          // GL_QUADRATIC_ATTENUATION
+            default: break;
+        }
+    }
+    void wrap_glLightfv(GLenum light, GLenum pname, const GLfloat *params) {
+        if (light < 0x4000 || light > 0x4007 || !params) return;
+        {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            static std::set<uint64_t> seen;
+            uint64_t k = ((uint64_t)light << 40) ^ ((uint64_t)pname << 24) ^ (uint64_t)(params[0] * 100) ^ ((uint64_t)(params[1] * 100) << 8);
+            if (A6Dbg() && seen.size() < 60 && seen.insert(k).second) {
+                char b[160];
+                snprintf(b, sizeof(b), "[A6-LGT] light=0x%x pname=0x%x %.3f %.3f %.3f %.3f", (unsigned)light, (unsigned)pname,
+                         (double)params[0], (double)params[1], (double)params[2], (double)params[3]);
+                LogToJava(b);
+            }
+        }
+        SWLight& L = g_lights[light - 0x4000];
+        // GL_POSITION и GL_SPOT_DIRECTION по спеке переводятся в координаты глаза
+        // текущей модельно-видовой матрицей В МОМЕНТ ВЫЗОВА, а не при отрисовке.
+        const float* m = g_modelViewStack.back().data();
+        switch (pname) {
+            case 0x1200: memcpy(L.ambient, params, sizeof(float) * 4); break;  // GL_AMBIENT
+            case 0x1201: memcpy(L.diffuse, params, sizeof(float) * 4); break;  // GL_DIFFUSE
+            case 0x1202: memcpy(L.specular, params, sizeof(float) * 4); break; // GL_SPECULAR
+            case 0x1203: // GL_POSITION
+                for (int r = 0; r < 4; r++) {
+                    L.position[r] = params[0] * m[r] + params[1] * m[4 + r] + params[2] * m[8 + r] + params[3] * m[12 + r];
+                }
+                break;
+            case 0x1204: // GL_SPOT_DIRECTION — вектор, сдвиг не применяется
+                for (int r = 0; r < 3; r++) {
+                    L.spotDir[r] = params[0] * m[r] + params[1] * m[4 + r] + params[2] * m[8 + r];
+                }
+                break;
+            case 0x1206: L.spotExponent = params[0]; break;
+            case 0x1207: L.spotCutoff = params[0]; break;
+            case 0x1208: L.attenuation[0] = params[0]; break;
+            case 0x1209: L.attenuation[1] = params[0]; break;
+            case 0x120A: L.attenuation[2] = params[0]; break;
+            default: break;
+        }
+    }
+    void wrap_glMaterialf(GLenum face, GLenum pname, GLfloat param) {
+        if (pname == 0x1601) g_matShininess = param; // GL_SHININESS
+    }
+    void wrap_glMaterialfv(GLenum face, GLenum pname, const GLfloat *params) {
+        if (!params) return;
+        {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            static std::set<uint64_t> seen;
+            uint64_t k = ((uint64_t)pname << 32) ^ (uint64_t)(params[0] * 1000) ^ ((uint64_t)(params[1] * 1000) << 10) ^ ((uint64_t)(params[2] * 1000) << 20);
+            if (A6Dbg() && seen.size() < 60 && seen.insert(k).second) {
+                char b[160];
+                snprintf(b, sizeof(b), "[A6-MAT] pname=0x%x %.3f %.3f %.3f %.3f", (unsigned)pname,
+                         (double)params[0], (double)params[1], (double)params[2], (double)params[3]);
+                LogToJava(b);
+            }
+        }
+        switch (pname) {
+            case 0x1200: memcpy(g_matAmbient, params, sizeof(float) * 4); break;  // GL_AMBIENT
+            case 0x1201: memcpy(g_matDiffuse, params, sizeof(float) * 4); break;  // GL_DIFFUSE
+            case 0x1202: memcpy(g_matSpecular, params, sizeof(float) * 4); break; // GL_SPECULAR
+            case 0x1600: memcpy(g_matEmission, params, sizeof(float) * 4); break; // GL_EMISSION
+            case 0x1601: g_matShininess = params[0]; break;                       // GL_SHININESS
+            case 0x1602: // GL_AMBIENT_AND_DIFFUSE
+                memcpy(g_matAmbient, params, sizeof(float) * 4);
+                memcpy(g_matDiffuse, params, sizeof(float) * 4);
+                break;
+            default: break;
+        }
+    }
     void wrap_glPointParameterf(GLenum pname, GLfloat param) {}
     void wrap_glPointParameterfv(GLenum pname, const GLfloat *params) {}
     void wrap_glPointSize(GLfloat size) { g_pointSize = size; }
@@ -10050,9 +11930,27 @@ extern "C" {
         g_clientActiveTexture = texture - GL_TEXTURE0; 
     }
     void wrap_glColor4f(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
+        {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            static std::set<uint32_t> seen;
+            uint32_t k = ((uint32_t)(red * 255) << 16) | ((uint32_t)(green * 255) << 8) | (uint32_t)(blue * 255);
+            if (A6Dbg() && seen.size() < 80 && seen.insert(k).second) {
+                char b[128];
+                snprintf(b, sizeof(b), "[A6-COL] %.3f %.3f %.3f %.3f", (double)red, (double)green, (double)blue, (double)alpha);
+                LogToJava(b);
+            }
+        }
         Stub_glVertexAttrib4f(1, red, green, blue, alpha);
     }
     void wrap_glColor4ub(GLubyte red, GLubyte green, GLubyte blue, GLubyte alpha) {
+        {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            static std::set<uint32_t> seen;
+            uint32_t k = ((uint32_t)red << 16) | ((uint32_t)green << 8) | (uint32_t)blue;
+            if (A6Dbg() && seen.size() < 80 && seen.insert(k).second) {
+                char b[128];
+                snprintf(b, sizeof(b), "[A6-COLB] %d %d %d %d", (int)red, (int)green, (int)blue, (int)alpha);
+                LogToJava(b);
+            }
+        }
         Stub_glVertexAttrib4f(1, red/255.0f, green/255.0f, blue/255.0f, alpha/255.0f);
     }
     void wrap_glMultiTexCoord4f(GLenum target, GLfloat s, GLfloat t, GLfloat r, GLfloat q) {
@@ -10317,6 +12215,14 @@ extern "C" int wrap___snprintf_chk(char *str, size_t maxlen, int flag, size_t bo
     }
     return ret; 
 }
+extern "C" int wrap___vsnprintf_chk(char* str, size_t maxlen, int flag, size_t bos, const char* format, va_list ap) {
+    return IOSFormatV(str, maxlen, format, ap);
+}
+extern "C" int wrap___vsprintf_chk(char* str, int flag, size_t slen, const char* format, va_list ap) {
+    int need = IOSFormatV(nullptr, 0, format, ap);
+    if (str) IOSFormatV(str, (size_t)need + 1, format, ap);
+    return need;
+}
 extern "C" int wrap___tolower(int c) { return (c >= 'A' && c <= 'Z') ? (c + 32) : c; }
 extern "C" int wrap___toupper(int c) { return (c >= 'a' && c <= 'z') ? (c - 32) : c; }
 
@@ -10486,8 +12392,19 @@ extern "C" int wrap_fcntl(int fd, int cmd, ...) {
 // off_t у Darwin всегда 64-битный, а у bionic на 32 битах — 32-битный. Вдобавок Apple
 // выравнивает 64-битный аргумент по 4 байта, то есть кладёт его в r3:[sp], а не в [sp]
 // с пропуском r3, как сделал бы AAPCS. Поэтому принимаем смещение половинками.
+extern "C" ssize_t wrap_read(int fd, void* buf, size_t nbyte) {
+    if (IpaIsVirtualFd(fd)) return IpaRead(fd, buf, nbyte);
+    return read(fd, buf, nbyte);
+}
+
+extern "C" off_t wrap_lseek(int fd, off_t offset, int whence) {
+    if (IpaIsVirtualFd(fd)) return IpaLseek(fd, offset, whence);
+    return lseek(fd, offset, whence);
+}
+
 extern "C" ssize_t wrap_pread(int fd, void* buf, size_t nbyte, uint32_t offLo, uint32_t offHi) {
     int64_t offset = (int64_t)(((uint64_t)offHi << 32) | offLo);
+    if (IpaIsVirtualFd(fd)) return IpaPread(fd, buf, nbyte, (off64_t)offset);
     ssize_t r = pread64(fd, buf, nbyte, (off64_t)offset);
     LogToBlackBox("C-API-IO: [pread] fd=" + std::to_string(fd) + " len=" + std::to_string(nbyte) +
                   " off=" + std::to_string(offset) + " -> " + std::to_string(r));
@@ -10540,8 +12457,73 @@ extern "C" int wrap_wcsncmp(const wchar_t* ws1, const wchar_t* ws2, size_t n) {
 extern "C" float wrap_wcstof(const wchar_t* nptr, wchar_t** endptr) {
     return wcstof(nptr, endptr);
 }
+// Darwin-раскладка _RuneLocale: игры разворачивают isdigit/isspace инлайном и читают
+// __runetype (offset 0x34) напрямую из _DefaultRuneLocale, минуя __maskrune.
+struct DarwinRuneLocale {
+    char     magic[8];
+    char     encoding[32];
+    void*    sgetrune;
+    void*    sputrune;
+    int32_t  invalid_rune;
+    uint32_t runetype[256];
+    int32_t  maplower[256];
+    int32_t  mapupper[256];
+    int32_t  runetype_ext_nranges;  void* runetype_ext_ranges;
+    int32_t  maplower_ext_nranges;  void* maplower_ext_ranges;
+    int32_t  mapupper_ext_nranges;  void* mapupper_ext_ranges;
+    void*    variable;
+    int32_t  variable_len;
+};
+
+#define DRUNE_A 0x00000100u
+#define DRUNE_C 0x00000200u
+#define DRUNE_D 0x00000400u
+#define DRUNE_G 0x00000800u
+#define DRUNE_L 0x00001000u
+#define DRUNE_P 0x00002000u
+#define DRUNE_S 0x00004000u
+#define DRUNE_U 0x00008000u
+#define DRUNE_X 0x00010000u
+#define DRUNE_B 0x00020000u
+#define DRUNE_R 0x00040000u
+#define DRUNE_SW1 0x40000000u
+
+static DarwinRuneLocale g_darwinRuneLocale;
+
+static void InitDarwinRuneLocale() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    memset(&g_darwinRuneLocale, 0, sizeof(g_darwinRuneLocale));
+    memcpy(g_darwinRuneLocale.magic, "RuneMagi", 8);
+    snprintf(g_darwinRuneLocale.encoding, sizeof(g_darwinRuneLocale.encoding), "NONE");
+    g_darwinRuneLocale.invalid_rune = 0xFFFD;
+    for (int c = 0; c < 256; c++) {
+        uint32_t v = 0;
+        if (c < 128) {
+            if (iscntrl(c))  v |= DRUNE_C;
+            if (isdigit(c))  v |= DRUNE_D | DRUNE_G | DRUNE_R | DRUNE_X;
+            if (isupper(c))  v |= DRUNE_U | DRUNE_A | DRUNE_G | DRUNE_R;
+            if (islower(c))  v |= DRUNE_L | DRUNE_A | DRUNE_G | DRUNE_R;
+            if (isxdigit(c)) v |= DRUNE_X;
+            if (ispunct(c))  v |= DRUNE_P | DRUNE_G | DRUNE_R;
+            if (isspace(c))  v |= DRUNE_S;
+            if (c == ' ' || c == '\t') v |= DRUNE_B;
+            if (c == ' ')    v |= DRUNE_R;
+            if (isprint(c))  v |= DRUNE_SW1;
+        }
+        g_darwinRuneLocale.runetype[c] = v;
+        g_darwinRuneLocale.maplower[c] = (c < 128) ? tolower(c) : c;
+        g_darwinRuneLocale.mapupper[c] = (c < 128) ? toupper(c) : c;
+    }
+}
+
+static struct DarwinRuneAutoInit { DarwinRuneAutoInit() { InitDarwinRuneLocale(); } } g_darwinRuneAutoInit;
+
 extern "C" uint32_t wrap___maskrune(int c, uint32_t f) {
-    return c & f; // BSD ctype fallback
+    InitDarwinRuneLocale();
+    if (c < 0 || c > 255) return 0;
+    return g_darwinRuneLocale.runetype[c] & f;
 }
 extern "C" int64_t wrap___divdi3(int64_t a, int64_t b) {
     return b != 0 ? (a / b) : 0;
@@ -11006,17 +12988,21 @@ extern "C" void wrap_free(void* ptr) {
 
 // Хелпер для извлечения реального Android FILE* из нашей фейковой iOS структуры
 std::map<void*, FILE*> g_fileMap;
+// Игра открывает и закрывает файлы из нескольких потоков сразу, таблицы общие.
+std::recursive_mutex g_fileTableMutex;
 
 FILE* unwrap_file(void* fp) {
     if (!fp) return nullptr;
     // Системные потоки Android Bionic пропускаем как есть
     if (fp == stdout || fp == stderr || fp == stdin) return (FILE*)fp;
-    
+
     // Проверяем наличие в нашем пуленепробиваемом словаре
-    if (g_fileMap.count(fp)) {
-        return g_fileMap[fp];
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_fileTableMutex);
+        auto it = g_fileMap.find(fp);
+        if (it != g_fileMap.end()) return it->second;
     }
-    
+
     // Резервная проверка (если структура не повреждена)
     uint32_t isa = 0;
     if (SafeRead32((uintptr_t)fp + 60, &isa) && isa == 0xBADF00D5) {
@@ -11029,14 +13015,75 @@ FILE* unwrap_file(void* fp) {
     return nullptr;
 }
 
+// Игры делают chdir в свой бандл и дальше строят пути от getcwd(). Бандл лежит
+// в .ipa, реальный chdir туда невозможен, поэтому cwd ведём сами.
+static std::string g_virtualCwd = "/";
+
+static std::string NormalizeVfsPath(const std::string& in) {
+    std::vector<std::string> parts;
+    std::string cur;
+    for (size_t i = 0; i <= in.size(); i++) {
+        if (i == in.size() || in[i] == '/') {
+            if (cur == "..") { if (!parts.empty()) parts.pop_back(); }
+            else if (!cur.empty() && cur != ".") parts.push_back(cur);
+            cur.clear();
+        } else cur += in[i];
+    }
+    std::string out;
+    for (auto& p : parts) { out += "/"; out += p; }
+    return out.empty() ? "/" : out;
+}
+
+std::string VfsResolveCwd(const std::string& path) {
+    if (path.empty()) return g_virtualCwd;
+    if (path[0] == '/') return NormalizeVfsPath(path);
+    return NormalizeVfsPath(g_virtualCwd + "/" + path);
+}
+
+bool VfsCwdIsVirtual() { return IpaIsVirtualPath(g_virtualCwd.c_str()); }
+
+extern "C" int wrap_chdir(const char* path) {
+    std::string want = VfsResolveCwd(path ? path : "");
+    if (IpaIsVirtualPath(want.c_str())) {
+        if (!IpaExists(want)) {
+            LogToJava("C-API-IO: [chdir] ОШИБКА: нет такой папки в бандле: " + want);
+            errno = ENOENT;
+            return -1;
+        }
+        g_virtualCwd = want;
+        LogToJava("C-API-IO: [chdir] виртуальный cwd -> " + g_virtualCwd);
+        return 0;
+    }
+    if (chdir(want.c_str()) == 0) {
+        g_virtualCwd = want;
+        return 0;
+    }
+    return -1;
+}
+
+extern "C" char* wrap_getcwd(char* buf, size_t size) {
+    if (!buf) return strdup(g_virtualCwd.c_str());
+    if (size <= g_virtualCwd.size()) { errno = ERANGE; return nullptr; }
+    memcpy(buf, g_virtualCwd.c_str(), g_virtualCwd.size() + 1);
+    return buf;
+}
+
 extern "C" int wrap_access(const char* path, int mode) {
     std::string sPath = path ? path : "null";
+    if (IpaIsVirtualPath(sPath.c_str())) {
+        LogToBlackBox("C-API-IO: [access] Бандл: " + sPath);
+        if (IpaExists(sPath)) return (mode & W_OK) ? -1 : 0;
+        errno = ENOENT;
+        return -1;
+    }
     bool isRelative = (sPath.length() > 0 && sPath[0] != '/');
     if (isRelative) {
         std::string docPath = g_sandboxDir + "Documents/" + sPath;
         if (access(docPath.c_str(), mode) == 0) return 0;
         std::string bundlePath = g_appBundlePath + "/" + sPath;
-        if (access(bundlePath.c_str(), mode) == 0) return 0;
+        if (IpaIsVirtualPath(bundlePath.c_str())) {
+            if (IpaExists(bundlePath) && !(mode & W_OK)) return 0;
+        } else if (access(bundlePath.c_str(), mode) == 0) return 0;
         sPath = docPath; // Для лога
     }
     LogToBlackBox("C-API-IO: [access] Проверка доступа: " + sPath + " mode: " + std::to_string(mode));
@@ -11059,7 +13106,25 @@ extern "C" int wrap_open(const char* path, int ios_flags, ...) {
     if (ios_flags & 0x100000) flags |= O_DIRECTORY;     // O_DIRECTORY у Darwin
 
     std::string sPath = path ? path : "";
-    if (!sPath.empty() && sPath[0] != '/') sPath = g_sandboxDir + "Documents/" + sPath;
+    bool wantsWrite = (flags & (O_WRONLY | O_RDWR | O_CREAT)) != 0;
+    if (IpaIsVirtualPath(sPath.c_str())) {
+        int vfd = wantsWrite ? -1 : IpaOpenFd(sPath);
+        LogToBlackBox("C-API-IO: [open] бандл " + sPath + " -> vfd=" + std::to_string(vfd));
+        if (vfd < 0) errno = wantsWrite ? EROFS : ENOENT;
+        return vfd;
+    }
+    if (!sPath.empty() && sPath[0] != '/') {
+        std::string docPath = g_sandboxDir + "Documents/" + sPath;
+        if (!wantsWrite && access(docPath.c_str(), F_OK) != 0) {
+            std::string bundlePath = g_appBundlePath + "/" + sPath;
+            if (IpaIsVirtualPath(bundlePath.c_str()) && IpaExists(bundlePath)) {
+                int vfd = IpaOpenFd(bundlePath);
+                LogToBlackBox("C-API-IO: [open] бандл " + bundlePath + " -> vfd=" + std::to_string(vfd));
+                if (vfd >= 0) return vfd;
+            }
+        }
+        sPath = docPath;
+    }
 
     int fd = open(sPath.c_str(), flags, mode);
     LogToBlackBox("C-API-IO: [open] " + sPath + " ios_flags=" + std::to_string(ios_flags) +
@@ -11069,6 +13134,10 @@ extern "C" int wrap_open(const char* path, int ios_flags, ...) {
 
 extern "C" DIR* wrap_opendir(const char* name) {
     std::string sName = name ? name : "";
+    if (IpaIsVirtualPath(sName.c_str())) {
+        LogToBlackBox("C-API-IO: [opendir] Бандл: " + sName);
+        return IpaOpendir(sName);
+    }
     if (!sName.empty() && sName[0] != '/') sName = g_sandboxDir + "Documents/" + sName;
     LogToBlackBox("C-API-IO: [opendir] Чтение директории: " + sName);
     return opendir(sName.c_str());
@@ -11086,8 +13155,13 @@ struct DarwinDirent {
     char     d_name[1024];
 } __attribute__((packed));
 
+extern "C" int wrap_closedir(DIR* dirp) {
+    if (IpaIsVirtualDir(dirp)) return IpaClosedir(dirp);
+    return closedir(dirp);
+}
+
 extern "C" struct dirent* wrap_readdir(DIR* dirp) {
-    struct dirent* res = readdir(dirp);
+    struct dirent* res = IpaIsVirtualDir(dirp) ? IpaReaddir(dirp) : readdir(dirp);
     if (!res) return nullptr;
 
     static __thread DarwinDirent out;
@@ -11114,6 +13188,7 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
     if (isRelative) {
         sPath = g_sandboxDir + "Documents/" + origPath;
     }
+
     
     if (sPath.find(".dll") != std::string::npos || sPath.find("mscorlib") != std::string::npos || sPath.find("Mono") != std::string::npos) {
         LogToJava("MONO-TRACE: [fopen] Попытка открыть: " + sPath + " | Caller: " + GetModuleInfoForAddress(lr));
@@ -11124,12 +13199,23 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
         }
     }
     
-    FILE* real_f = fopen(sPath.c_str(), sMode.c_str());
-    
+    bool readOnly = sMode.find('w') == std::string::npos && sMode.find('a') == std::string::npos &&
+                    sMode.find('+') == std::string::npos;
+
+    FILE* real_f = nullptr;
+    if (IpaIsVirtualPath(origPath.c_str())) {
+        // Бандл лежит в .ipa и доступен только на чтение.
+        sPath = origPath;
+        if (readOnly) real_f = IpaFopen(origPath);
+    } else {
+        real_f = fopen(sPath.c_str(), sMode.c_str());
+    }
+
     // ФОЛБЕК НА БАНДЛ: Если файл не найден в Documents (например, кэш) и открыт на чтение, ищем в архивах игры!
-    if (!real_f && isRelative && sMode.find('w') == std::string::npos && sMode.find('a') == std::string::npos) {
+    if (!real_f && isRelative && readOnly) {
         std::string bundlePath = g_appBundlePath + "/" + origPath;
-        real_f = fopen(bundlePath.c_str(), sMode.c_str());
+        real_f = IpaIsVirtualPath(bundlePath.c_str()) ? IpaFopen(bundlePath)
+                                                      : fopen(bundlePath.c_str(), sMode.c_str());
         if (real_f) {
             sPath = bundlePath;
             LogToJava("C-API-IO: Файл успешно открыт из Bundle: " + sPath);
@@ -11153,8 +13239,11 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
     fake_fp[15] = 0xBADF00D5; // MAGIC для идентификации нашей обертки
     fake_fp[16] = (uint32_t)real_f; // Прячем реальный указатель
     
-    g_fileMap[fake_fp] = real_f;  // Надежно регистрируем файл
-    g_fileNames[fake_fp] = sPath; // Запоминаем путь для отладки
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_fileTableMutex);
+        g_fileMap[fake_fp] = real_f;  // Надежно регистрируем файл
+        g_fileNames[fake_fp] = sPath; // Запоминаем путь для отладки
+    }
     return fake_fp;
 }
 
@@ -11176,6 +13265,7 @@ extern "C" size_t wrap_fread(void* ptr, size_t size, size_t nitems, void* fp) {
     size_t res = fread(ptr, size, nitems, real_f); 
     size_t bytesRead = res * size;
 
+    std::lock_guard<std::recursive_mutex> lk(g_fileTableMutex);
     if (g_fileNames.count(fp) && bytesRead > 0) {
         if (!g_fileReadStats.count(fp)) {
             g_fileReadStats[fp].firstOffset = cur_offset;
@@ -11203,9 +13293,12 @@ extern "C" size_t wrap_fwrite(const void* ptr, size_t size, size_t nitems, void*
 extern "C" int wrap_fseek(void* fp, long offset, int whence) { 
     FILE* real_f = unwrap_file(fp);
     if (!real_f) return -1;
-    int res = fseek(real_f, offset, whence); 
-    if (g_fileNames.count(fp)) {
-        LogToBlackBox("C-API-IO: fseek offset=" + std::to_string(offset) + " whence=" + std::to_string(whence) + " in " + g_fileNames[fp] + " -> result: " + std::to_string(res));
+    int res = fseek(real_f, offset, whence);
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_fileTableMutex);
+        if (g_fileNames.count(fp)) {
+            LogToBlackBox("C-API-IO: fseek offset=" + std::to_string(offset) + " whence=" + std::to_string(whence) + " in " + g_fileNames[fp] + " -> result: " + std::to_string(res));
+        }
     }
     return res; 
 }
@@ -11231,6 +13324,19 @@ extern "C" int wrap_fclose(void* fp) {
     if (!fp) return EOF;
     if (fp == stdout || fp == stderr || fp == stdin) return 0;
     
+    std::lock_guard<std::recursive_mutex> lk(g_fileTableMutex);
+
+    auto itMap = g_fileMap.find(fp);
+    if (itMap == g_fileMap.end()) {
+        // Указателя нет в таблице: либо это повторный fclose, либо чужая структура.
+        // Освобождать такое нельзя — именно так ломалась куча.
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "C-API-IO: [fclose] ОШИБКА: неизвестный FILE* %p", fp);
+        LogToJava(dbg);
+        return EOF;
+    }
+    FILE* real_f = itMap->second;
+
     if (g_fileNames.count(fp)) {
         std::string fname = g_fileNames[fp];
         if (g_fileReadStats.count(fp)) {
@@ -11243,13 +13349,12 @@ extern "C" int wrap_fclose(void* fp) {
         LogToBlackBox("C-API-IO: fclose called for " + fname);
         g_fileNames.erase(fp);
     }
-    
-    FILE* real_f = unwrap_file(fp);
+
+    g_fileMap.erase(itMap);
     int res = EOF;
     if (real_f) res = fclose(real_f);
-    g_fileMap.erase(fp);
     if (real_f != fp) free(fp);
-    return res; 
+    return res;
 }
 
 extern "C" int wrap___srget(void* fp) { FILE* f = unwrap_file(fp); return f ? fgetc(f) : EOF; }
@@ -11358,7 +13463,7 @@ extern "C" int wrap_AudioFileOpenURL(void* inFileRef, int inPermissions, uint32_
         } 
     }
     LogToJava("HLE_AUDIO: AudioFileOpenURL запрашивает: " + af->path);
-    FILE* f = fopen(af->path.c_str(), "rb");
+    FILE* f = VfsFopenAny(af->path, "rb");
     if (!f) { 
         LogToJava("HLE_AUDIO_ERROR: AudioFileOpenURL не смог открыть: " + af->path);
         delete af; return -43; 
@@ -11478,7 +13583,7 @@ extern "C" int wrap_AudioFileReadPackets(void* inAudioFile, uint8_t inUseCache, 
     if (bytesPerPacket == 0) bytesPerPacket = 1;
     uint32_t reqPackets = *ioNumPackets;
     uint32_t bytesToRead = reqPackets * bytesPerPacket;
-    FILE* f = fopen(af->path.c_str(), "rb");
+    FILE* f = VfsFopenAny(af->path, "rb");
     if (!f) { 
         LogToJava("HLE_AUDIO_ERROR: ReadPackets не смог открыть файл: " + af->path);
         *ioNumPackets = 0; if (outNumBytes) *outNumBytes = 0; return -39; 
@@ -11499,7 +13604,7 @@ extern "C" int wrap_AudioFileReadBytes(void* inAudioFile, uint8_t inUseCache, in
     if (!inAudioFile || !ioNumBytes || !outBuffer) return -50;
     HLE_AudioFile* af = (HLE_AudioFile*)inAudioFile;
     uint32_t reqBytes = *ioNumBytes;
-    FILE* f = fopen(af->path.c_str(), "rb");
+    FILE* f = VfsFopenAny(af->path, "rb");
     if (!f) { 
         LogToJava("HLE_AUDIO_ERROR: ReadBytes не смог открыть файл: " + af->path);
         *ioNumBytes = 0; return -39; 
@@ -11532,11 +13637,25 @@ struct HLE_ExtAudioFile {
 static bool ExtAudioDecodeToPCM(HLE_ExtAudioFile* ef) {
     JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity) return false;
     jclass clazz = env->GetObjectClass(g_mainActivity);
-    jmethodID m = env->GetMethodID(clazz, "decodeAudioFileJava", "(Ljava/lang/String;)[B");
-    if (!m) { env->DeleteLocalRef(clazz); return false; }
-    jstring jpath = env->NewStringUTF(ef->path.c_str());
-    jbyteArray arr = (jbyteArray)env->CallObjectMethod(g_mainActivity, m, jpath);
-    env->DeleteLocalRef(jpath);
+
+    // MediaExtractor умеет только настоящий файл, а игра с 0.3.0.0 читает звук из бандла.
+    // Когда бандл — это .ipa, отдаём ей сам архив и срез внутри него.
+    std::string archive; int64_t off = 0, len64 = 0;
+    jbyteArray arr = nullptr;
+    if (IpaGetStoredRange(ef->path, archive, off, len64)) {
+        jmethodID mr = env->GetMethodID(clazz, "decodeAudioRangeJava", "(Ljava/lang/String;JJ)[B");
+        if (mr) {
+            jstring jarc = env->NewStringUTF(archive.c_str());
+            arr = (jbyteArray)env->CallObjectMethod(g_mainActivity, mr, jarc, (jlong)off, (jlong)len64);
+            env->DeleteLocalRef(jarc);
+        }
+    } else {
+        jmethodID m = env->GetMethodID(clazz, "decodeAudioFileJava", "(Ljava/lang/String;)[B");
+        if (!m) { env->DeleteLocalRef(clazz); return false; }
+        jstring jpath = env->NewStringUTF(ef->path.c_str());
+        arr = (jbyteArray)env->CallObjectMethod(g_mainActivity, m, jpath);
+        env->DeleteLocalRef(jpath);
+    }
     env->DeleteLocalRef(clazz);
     if (!arr) return false;
     jsize len = env->GetArrayLength(arr);
@@ -12366,6 +14485,7 @@ extern "C" int wrap_close(int fd) {
     typedef uint64_t (*FdsanGetTag)(int);
     static FdsanGetTag getTag = (FdsanGetTag)dlsym(RTLD_DEFAULT, "android_fdsan_get_owner_tag");
     if (fd < 0) { errno = EBADF; return -1; }
+    if (IpaIsVirtualFd(fd)) return IpaCloseFd(fd);
     if (getTag && getTag(fd) != 0) {
         LogToJava("C-API-IO: close(" + std::to_string(fd) + ") — дескриптор системный, закрытие отклонено");
         return 0;
@@ -12418,7 +14538,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_S(exit), {"___stack_chk_guard", (void*)&hle_stack_chk_guard_val}, {"___stack_chk_fail", (void*)Stub_exit}, STB_D(sinf), STB_D(cosf), STB_D(tanf), 
     {"_NSDefaultRunLoopMode", (void*)&hle_NSDefaultRunLoopMode_ptr}, {"_kEAGLColorFormatRGBA8", (void*)&hle_kEAGLColorFormatRGBA8_ptr}, {"_kEAGLColorFormatRGB565", (void*)&hle_kEAGLColorFormatRGB565_ptr}, {"_kEAGLDrawablePropertyColorFormat", (void*)&hle_kEAGLDrawablePropertyColorFormat_ptr}, {"_kEAGLDrawablePropertyRetainedBacking", (void*)&hle_kEAGLDrawablePropertyRetainedBacking_ptr}, 
     STB_D(glAttachShader), STB_S(glBindBuffer), STB_S(glBufferData), STB_S(glBufferSubData), STB_S(glDeleteBuffers), STB_S(glBindFramebuffer), {"_glBindFramebufferOES", (void*)Stub_glBindFramebuffer}, STB_S(glBindRenderbuffer), {"_glBindRenderbufferOES", (void*)Stub_glBindRenderbuffer}, STB_S(glBindAttribLocation), {"_glClear", (void*)MegaDebug_glClear}, STB_S(glClearColor), STB_S(glCompileShader), STB_S(glGetShaderPrecisionFormat),
-    STB_D(glCreateProgram), STB_D(glCreateShader), {"_glDrawElements", (void*)MegaDebug_glDrawElements}, {"_glEnable", (void*)MegaDebug_glEnable}, STB_S(glEnableVertexAttribArray), STB_S(glFramebufferRenderbuffer), {"_glFramebufferRenderbufferOES", (void*)Stub_glFramebufferRenderbuffer}, STB_D(glGenFramebuffers), {"_glGenFramebuffersOES", (void*)glGenFramebuffers}, STB_D(glGenRenderbuffers), {"_glGenRenderbuffersOES", (void*)glGenRenderbuffers}, {"_glGetAttribLocation", (void*)MegaDebug_glGetAttribLocation}, STB_S(glBindAttribLocation), {"_glGetBufferParameteriv", (void*)Stub_glGetBufferParameteriv}, {"_glGetShaderInfoLog", (void*)MegaDebug_glGetShaderInfoLog}, STB_D(glGetShaderiv), {"_glGetUniformLocation", (void*)MegaDebug_glGetUniformLocation},
+    STB_D(glCreateProgram), STB_D(glCreateShader), {"_glDrawElements", (void*)MegaDebug_glDrawElements}, {"_glEnable", (void*)MegaDebug_glEnable}, STB_S(glEnableVertexAttribArray), STB_S(glFramebufferRenderbuffer), {"_glFramebufferRenderbufferOES", (void*)Stub_glFramebufferRenderbuffer}, STB_S(glGenFramebuffers), {"_glGenFramebuffersOES", (void*)Stub_glGenFramebuffers}, STB_S(glGenRenderbuffers), {"_glGenRenderbuffersOES", (void*)Stub_glGenRenderbuffers}, {"_glGetAttribLocation", (void*)MegaDebug_glGetAttribLocation}, STB_S(glBindAttribLocation), {"_glGetBufferParameteriv", (void*)Stub_glGetBufferParameteriv}, {"_glGetShaderInfoLog", (void*)MegaDebug_glGetShaderInfoLog}, STB_D(glGetShaderiv), {"_glGetUniformLocation", (void*)MegaDebug_glGetUniformLocation},
     STB_S(glLinkProgram), STB_S(glRenderbufferStorage), {"_glRenderbufferStorageOES", (void*)Stub_glRenderbufferStorage}, STB_S(glGetRenderbufferParameteriv), {"_glGetRenderbufferParameterivOES", (void*)Stub_glGetRenderbufferParameteriv}, STB_S(glCheckFramebufferStatus), {"_glCheckFramebufferStatusOES", (void*)Stub_glCheckFramebufferStatus}, STB_S(glShaderSource), STB_W(glUniformMatrix4fv), {"_glUseProgram", (void*)MegaDebug_glUseProgram}, STB_S(glVertexAttribPointer), STB_S(glViewport), STB_S(NSHomeDirectory), STB_S(NSTemporaryDirectory), STB_S(NSSearchPathForDirectoriesInDomains),
     STB_W(SCNetworkReachabilityCreateWithName), {"_SCNetworkReachabilityCreateWithAddress", (void*)+[](void* a, void* b) -> void* { return (void*)0xDEADBEEF; }}, {"_SCNetworkReachabilityGetFlags", (void*)+[](void* r, uint32_t* f) -> bool { if(f) *f = 2; return true; }},
     {"_AVAudioSessionCategoryPlayback", (void*)&hle_AVAudioSessionCategoryPlayback_ptr}, {"_AVAudioSessionCategoryAmbient", (void*)&hle_AVAudioSessionCategoryAmbient_ptr}, {"_NSUserDefaultsDidChangeNotification", (void*)&hle_NSUserDefaultsDidChangeNotification_ptr}, {"_kCFCoreFoundationVersionNumber", (void*)&wrap_kCFCoreFoundationVersionNumber}, {"_CGSizeZero", (void*)&wrap_CGSizeZero}, {"_CGPointZero", (void*)&wrap_CGPointZero}, {"__objc_empty_cache", (void*)&hle_objc_empty_cache}, STB_S(objc_enumerationMutation),
@@ -12435,7 +14555,7 @@ std::map<std::string, void*> g_hleStubs = {
     {"_sin", (void*)(double(*)(double))sin}, {"_cos", (void*)(double(*)(double))cos}, {"_tan", (void*)(double(*)(double))tan}, {"_asin", (void*)(double(*)(double))asin}, {"_acos", (void*)(double(*)(double))acos}, {"_atan", (void*)(double(*)(double))atan}, {"_atan2", (void*)(double(*)(double, double))atan2}, STB_D(atan2f), STB_D(atanf),
     {"_sinh", (void*)(double(*)(double))sinh}, {"_cosh", (void*)(double(*)(double))cosh}, {"_tanh", (void*)(double(*)(double))tanh}, {"_abs", (void*)(int(*)(int))abs}, {"_fabs", (void*)(double(*)(double))fabs}, STB_D(fabsf),
     STB_D(srand), STB_D(srandom), STB_D(random), STB_D(rand), STB_D(gettimeofday), STB_D(clock), STB_D(time), STB_S(bzero),
-    STB_W(getenv), STB_D(getcwd), STB_D(chdir), STB_W(stat), STB_W(fstat), STB_W(lstat), STB_W(mkdir), STB_D(remove), STB_D(rename), STB_W(abort), STB_W(mmap), STB_W(munmap), STB_W(rmdir), STB_W(unlink), STB_W(ecvt), STB_W(fcvt), STB_W(fnmatch), STB_W(mbstowcs), STB_W(aio_read), STB_W(aio_error), STB_W(aio_return), STB_W(ioctl), STB_W(select), STB_W(statfs), STB_W(getifaddrs), STB_W(freeifaddrs),
+    STB_W(getenv), STB_W(getcwd), STB_W(chdir), STB_W(stat), STB_W(fstat), STB_W(lstat), STB_W(mkdir), STB_D(remove), STB_D(rename), STB_W(abort), STB_W(mmap), STB_W(munmap), STB_W(rmdir), STB_W(unlink), STB_W(ecvt), STB_W(fcvt), STB_W(fnmatch), STB_W(mbstowcs), STB_W(aio_read), STB_W(aio_error), STB_W(aio_return), STB_W(ioctl), STB_W(select), STB_W(statfs), STB_W(getifaddrs), STB_W(freeifaddrs),
     {"_ldexp", (void*)(double(*)(double, int))ldexp}, STB_D(ldexpf), {"_modf", (void*)(double(*)(double, double*))modf}, STB_D(modff),
     STB_W(pthread_create), STB_D(pthread_join), STB_W(pthread_mutex_init), STB_W(pthread_mutex_lock), STB_W(pthread_mutex_unlock), STB_W(pthread_mutex_destroy), STB_W(pthread_cond_init), STB_W(pthread_cond_wait), STB_W(pthread_cond_signal), STB_W(pthread_cond_broadcast), STB_W(pthread_cond_destroy), STB_D(pthread_self), STB_D(pthread_equal), STB_W(pthread_once), STB_D(pthread_attr_init), STB_D(pthread_attr_destroy), STB_D(pthread_attr_setdetachstate), STB_W(pthread_attr_setstacksize), STB_W(pthread_mach_thread_np), STB_W(thread_get_state), STB_W(thread_set_state), STB_D(pthread_key_create), STB_D(pthread_key_delete), STB_D(pthread_setspecific), STB_D(pthread_getspecific),
     STB_D(sqlite3_open), STB_D(sqlite3_close), STB_D(sqlite3_prepare_v2), STB_D(sqlite3_step), STB_D(sqlite3_finalize), STB_D(sqlite3_bind_int), STB_D(sqlite3_bind_text), STB_D(sqlite3_free_table), STB_D(sqlite3_get_table),
@@ -12444,7 +14564,7 @@ std::map<std::string, void*> g_hleStubs = {
     
     STB_D(acosf), STB_D(asinf), STB_D(strlcpy), STB_D(strtok), STB_D(strerror_r), STB_D(wcscmp), STB_D(wcscpy), STB_D(wcslen), {"_wcschr", (void*)(wchar_t*(*)(wchar_t*, wchar_t))wcschr}, STB_D(wcsncpy), STB_D(wcstombs), STB_D(wcstol), STB_W(memset_pattern16),
     {"_wmemchr", (void*)(wchar_t*(*)(wchar_t*, wchar_t, size_t))wmemchr}, STB_D(wmemcmp), STB_D(wmemcpy), STB_D(wmemmove), STB_D(swprintf), STB_W(vswprintf), STB_W(swscanf), STB_W(wcsncmp), STB_W(wcstof),
-    STB_W(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_W(open), STB_D(read), STB_D(write), STB_W(pread), STB_W(fsync), STB_D(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
+    STB_W(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_W(open), STB_W(read), STB_D(write), STB_W(pread), STB_W(fsync), STB_W(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
     {"_div", (void*)(div_t(*)(int, int))div}, STB_D(gethostbyaddr), STB_W(gethostbyname), STB_W(gethostname), STB_D(getnameinfo), STB_W(getpeername), STB_W(getsockname), STB_W(getsockopt), STB_D(if_nametoindex), STB_D(inet_addr),
     STB_W(SecItemAdd), STB_W(SecItemCopyMatching), STB_W(SecItemUpdate), STB_W(SecItemDelete), STB_D(getpid), STB_D(inet_aton), STB_D(inet_ntoa), STB_W(longjmp), STB_D(perror), STB_D(sigaction), STB_W(sigprocmask), STB_D(utimes), STB_D(vprintf), STB_W(fcntl), STB_D(system), STB_D(uname), STB_D(dladdr), STB_D(dlsym), STB_D(arc4random), STB_D(localtime), STB_D(localtime_r),
     STB_W(sysctl), STB_W(sysctlbyname), STB_W(sysconf), STB_W(asprintf), STB_W(dlopen), STB_W(dlclose), STB_W(hash_create), STB_W(hash_search),
@@ -12455,7 +14575,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(OSAtomicOr32Barrier), STB_W(OSAtomicTestAndClearBarrier), STB_W(OSSpinLockLock), STB_W(OSSpinLockTry), STB_W(OSSpinLockUnlock), STB_W(OSMemoryBarrier),
     {"___udivmodsi4", (void*)wrap___udivmodsi4}, {"_strerror", (void*)(char*(*)(int))strerror},
 
-    STB_S(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_D(glCopyTexImage2D), STB_D(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, STB_D(glDepthRangef), {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), STB_D(glPolygonOffset), STB_D(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_D(glTexParameterf), STB_D(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
+    STB_S(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_S(glCopyTexImage2D), STB_S(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, STB_D(glDepthRangef), {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), STB_D(glPolygonOffset), STB_S(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_S(glTexParameterf), STB_S(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
 
 
     STB_W(CFRetain), STB_W(CFRelease), STB_W(CFStringCreateWithCString), STB_W(CFStringGetLength),
@@ -12463,13 +14583,13 @@ std::map<std::string, void*> g_hleStubs = {
  STB_W(CFStringCreateExternalRepresentation), STB_W(CFStringCreateFromExternalRepresentation), STB_W(CFStringCreateWithCStringNoCopy), STB_W(CFStringCreateWithCharacters), STB_W(CFStringGetCharacters), STB_W(CFStringGetMaximumSizeForEncoding), STB_W(CFStringGetTypeID), STB_W(CFURLCreateFromFileSystemRepresentation), STB_W(CFURLCreateStringByAddingPercentEscapes), STB_W(CFURLCreateStringByReplacingPercentEscapes), STB_W(CFURLCreateWithString), STB_W(CFArrayCreate), STB_W(CFArrayCreateMutable), STB_W(CFArrayGetCount), STB_W(CFArrayGetValueAtIndex), STB_W(CFArrayAppendValue), STB_W(CFArrayRemoveAllValues), STB_W(CFDictionaryCreateMutable), STB_W(CFDictionaryGetValue), STB_W(CFDictionarySetValue), STB_W(CFDictionaryRemoveValue), STB_W(CFBundleGetInfoDictionary), STB_W(CFBundleGetMainBundle), STB_W(CFBundleGetIdentifier), STB_W(CFBundleGetValueForInfoDictionaryKey), STB_W(CFBundleCopyResourcesDirectoryURL), STB_W(CFURLCopyFileSystemPath), STB_W(CFURLGetFileSystemRepresentation), STB_W(CFRunLoopGetCurrent), STB_W(CFRunLoopGetMain), STB_W(CFUUIDCreate), STB_W(CFUUIDCreateString), STB_W(CFTimeZoneCopySystem), STB_W(CFTimeZoneCopyDefault), STB_W(CFTimeZoneGetName), STB_W(CFTimeZoneGetSecondsFromGMT), STB_W(CFAbsoluteTimeGetGregorianDate), STB_W(CFAbsoluteTimeGetDayOfWeek), STB_W(CC_MD5), STB_W(CC_SHA1), STB_W(CC_SHA256), STB_W(CCCrypt), STB_W(CCCryptorCreate), STB_W(CCCryptorUpdate), STB_W(CCCryptorFinal), STB_W(CCCryptorRelease), STB_W(CCCryptorGetOutputLength), STB_W(AudioComponentFindNext), STB_W(AudioComponentInstanceNew), STB_W(UIGraphicsGetCurrentContext), STB_W(UIGraphicsPushContext), STB_W(UIGraphicsPopContext), STB_W(UIGraphicsBeginImageContext), STB_W(UIGraphicsEndImageContext), STB_W(UIGraphicsGetImageFromCurrentImageContext), STB_W(UIRectFill), STB_W(UIImagePNGRepresentation), STB_W(NSAllocateObject), STB_W(NSStringFromClass), STB_W(NSStringFromSelector), STB_W(CFBitVectorCreate), STB_W(CFBitVectorCreateMutableCopy), STB_W(CFBitVectorGetBitAtIndex), STB_W(CFBitVectorSetBitAtIndex),
     STB_V(kCFAllocatorDefault), STB_V(kCFAllocatorNull), STB_V(kCFBooleanFalse), STB_V(kCFBooleanTrue), STB_V(kCFErrorDescriptionKey), STB_V(kCFHTTPVersion1_1), STB_V(kCFPreferencesAnyHost), STB_V(kCFPreferencesCurrentUser), STB_V(kCFStreamPropertyHTTPResponseHeader), STB_V(kCFStreamPropertyHTTPShouldAutoredirect), STB_V(kSecAttrAccessGroup), STB_V(kSecAttrAccessible), STB_V(kSecAttrAccessibleWhenUnlocked), STB_V(kSecAttrDescription), STB_V(kSecAttrLabel), STB_V(kSecAttrAccount), STB_V(kSecAttrGeneric), STB_V(kSecAttrService), STB_V(kSecClass), STB_V(kSecClassGenericPassword), STB_V(kSecMatchLimit), STB_V(kSecMatchLimitOne), STB_V(kSecReturnAttributes), STB_V(kSecReturnData), STB_V(kSecValueData), STB_V(kCFRunLoopDefaultMode), STB_V(kCFRunLoopCommonModes), STB_V(kCFTypeArrayCallBacks), STB_V(kCFTypeDictionaryKeyCallBacks), STB_V(kCFTypeDictionaryValueCallBacks), STB_V(kCFBundleIdentifierKey), STB_V(kCFNumberNaN), STB_V(kCFNumberNegativeInfinity), STB_V(kCFNumberPositiveInfinity), {"_ADBannerContentSizeIdentifierLandscape", (void*)&hle_ADBannerContentSizeIdentifierLandscape_ptr}, {"_ADBannerContentSizeIdentifierPortrait", (void*)&hle_ADBannerContentSizeIdentifierPortrait_ptr},
     
-    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
+    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGImageGetBitsPerPixel), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
     {"_SCNetworkReachabilityScheduleWithRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }}, {"_SCNetworkReachabilitySetCallback", (void*)+[](void* target, void* callout, void* context) -> bool { return true; }}, {"_SCNetworkReachabilityUnscheduleFromRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }},
     {"__Block_object_assign", (void*)wrap_Block_object_assign}, {"__Block_copy", (void*)wrap_Block_copy}, {"__Block_release", (void*)wrap_Block_release},
 
     STB_DSTR(MPMediaItemPropertyAlbumTitle), STB_DSTR(MPMediaItemPropertyArtist), STB_DSTR(MPMediaItemPropertyPersistentID), STB_DSTR(MPMediaItemPropertyPlaybackDuration), STB_DSTR(MPMediaItemPropertyTitle), STB_DSTR(MPMediaLibraryDidChangeNotification), STB_DSTR(MPMediaPlaylistPropertyName), STB_DSTR(MPMoviePlayerContentPreloadDidFinishNotification), STB_DSTR(MPMoviePlayerDidExitFullscreenNotification), STB_DSTR(MPMoviePlayerLoadStateDidChangeNotification), STB_DSTR(MPMoviePlayerPlaybackStateDidChangeNotification), STB_DSTR(MPMoviePlayerScalingModeDidChangeNotification), STB_DSTR(MPMoviePlayerWillExitFullscreenNotification), STB_DSTR(MPMusicPlayerControllerNowPlayingItemDidChangeNotification), STB_DSTR(MPMusicPlayerControllerPlaybackStateDidChangeNotification), STB_DSTR(NSErrorFailingURLStringKey), STB_DSTR(NSFileSystemFreeSize), STB_DSTR(NSFileSystemSize), {"_NSFileModificationDate", (void*)&hle_NSFileModificationDate_ptr}, STB_DSTR(NSGregorianCalendar), STB_DSTR(NSHTTPCookieDomain), STB_DSTR(NSHTTPCookieName), STB_DSTR(NSHTTPCookiePath), STB_DSTR(NSHTTPCookieValue), STB_DSTR(NSInvalidArgumentException), STB_DSTR(NSLocaleCountryCode), STB_DSTR(NSLocaleLanguageCode), STB_DSTR(NSLocalizedDescriptionKey), STB_DSTR(NSLocalizedFailureReasonErrorKey), {"_NSNetServicesErrorCode", (void*)&hle_NSNetServicesErrorCode_ptr}, STB_DSTR(NSUnderlyingErrorKey), STB_DSTR(OBJC_EHTYPE_$_NSException), STB_DSTR(OBJC_EHTYPE_id), STB_DSTR(UIApplicationDidBecomeActiveNotification), STB_DSTR(UIApplicationDidEnterBackgroundNotification), STB_DSTR(UIApplicationDidFinishLaunchingNotification), STB_DSTR(UIApplicationLaunchOptionsRemoteNotificationKey), STB_DSTR(UIApplicationWillEnterForegroundNotification), STB_DSTR(UIApplicationWillResignActiveNotification), STB_DSTR(UIApplicationWillTerminateNotification), {"_GKPlayerAuthenticationDidChangeNotificationName", (void*)&hle_GKPlayerAuthenticationDidChangeNotificationName_ptr}, STB_DSTR(UIDeviceOrientationDidChangeNotification), STB_DSTR(UIKeyboardDidHideNotification), STB_DSTR(UIKeyboardDidShowNotification), STB_DSTR(UIKeyboardWillHideNotification), STB_DSTR(UIKeyboardWillShowNotification), STB_DSTR(UITextFieldTextDidChangeNotification), STB_DSTR(kABPersonEmailProperty), STB_DSTR(kABPersonFirstNameProperty), STB_DSTR(kABPersonLastNameProperty), STB_DSTR(kABPersonPhoneProperty), STB_DSTR(kABWorkLabel), STB_DSTR(kCAMediaTimingFunctionEaseInEaseOut), STB_DSTR(kCAMediaTimingFunctionEaseOut), STB_DSTR(kCAMediaTimingFunctionLinear), STB_DSTR(kCATransitionFromBottom), STB_DSTR(kCATransitionFromLeft), STB_DSTR(kCATransitionFromRight), STB_DSTR(kCATransitionFromTop), STB_DSTR(kCATransitionMoveIn), STB_DSTR(kCATransitionPush), STB_DSTR(kCATransitionReveal), STB_DSTR(kCFBundleVersionKey), STB_DSTR(kCLLocationAccuracyThreeKilometers),
 
-    STB_DSTRC(UIBackgroundTaskInvalid), STB_DSTRC(UIEdgeInsetsZero), STB_DSTRC(UIWindowLevelStatusBar), STB_DSTRC(_DefaultRuneLocale),
+    STB_DSTRC(UIBackgroundTaskInvalid), STB_DSTRC(UIEdgeInsetsZero), STB_DSTRC(UIWindowLevelStatusBar), {"__DefaultRuneLocale", (void*)&g_darwinRuneLocale},
     {"__NSConcreteGlobalBlock", (void*)&hle_NSConcreteGlobalBlock_class}, {"__NSConcreteStackBlock", (void*)&hle_NSConcreteStackBlock_class},
     STB_DSTRC(_objc_empty_vtable), {"__ZNSs4_Rep20_S_empty_rep_storageE", (void*)&hle_empty_string_rep}, {"__ZNSbIwSt11char_traitsIwESaIwEE4_Rep20_S_empty_rep_storageE", (void*)&hle_empty_string_rep},
 
@@ -12478,7 +14598,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(glEnableClientState), STB_W(glDisableClientState), STB_W(glVertexPointer), STB_W(glColorPointer), STB_W(glTexCoordPointer), STB_W(glNormalPointer), STB_W(glClientActiveTexture), STB_W(glColor4f), STB_W(glColor4ub), STB_W(glMultiTexCoord4f), STB_W(glNormal3f), STB_W(glAlphaFunc), STB_W(glLoadIdentity), STB_W(glLoadMatrixf), STB_W(glMatrixMode), STB_W(glPopMatrix), STB_W(glPushMatrix), STB_W(glScalef), STB_W(glTranslatef), STB_W(glRotatef), STB_W(glOrthof), STB_W(glFrustumf), STB_W(glMultMatrixf), STB_W(glShadeModel), STB_W(glTexEnvf), STB_W(glTexEnvfv), STB_W(glTexEnvi), STB_W(glClipPlanef), STB_W(glDiscardFramebufferEXT), STB_W(glFogf), STB_W(glFogfv), STB_W(glLightModelf), STB_W(glLightModelfv), STB_W(glLightf), STB_W(glLightfv), STB_W(glMaterialf), STB_W(glMaterialfv),     STB_W(glPointParameterf), STB_W(glPointParameterfv), STB_W(glPointSize), STB_W(glResolveMultisampleFramebufferAPPLE), STB_W(glTexEnvx), STB_W(glCurrentPaletteMatrixOES), STB_W(glLoadPaletteFromModelViewMatrixOES), STB_W(glMatrixIndexPointerOES), STB_W(glWeightPointerOES), STB_W(glPointSizePointerOES),
     {"_glCurrentPaletteMatrix", (void*)wrap_glCurrentPaletteMatrixOES}, {"_glLoadPaletteFromModelViewMatrix", (void*)wrap_glLoadPaletteFromModelViewMatrixOES}, {"_glMatrixIndexPointer", (void*)wrap_glMatrixIndexPointerOES}, {"_glWeightPointer", (void*)wrap_glWeightPointerOES},
 
-    STB_W(__assert_rtn), STB_W(__error), STB_W(__memset_chk), STB_W(strnstr), STB_W(__memcpy_chk), STB_W(__memmove_chk), STB_W(__strcpy_chk), STB_W(__strcat_chk), STB_W(__sprintf_chk), STB_W(__snprintf_chk), STB_W(__tolower), STB_W(__toupper),
+    STB_W(__assert_rtn), STB_W(__error), STB_W(__memset_chk), STB_W(strnstr), STB_W(__memcpy_chk), STB_W(__memmove_chk), STB_W(__strcpy_chk), STB_W(__strcat_chk), STB_W(__sprintf_chk), STB_W(__snprintf_chk), STB_W(__vsnprintf_chk), STB_W(__vsprintf_chk), STB_W(__tolower), STB_W(__toupper),
     {"__Znwm", (void*)wrap_malloc}, {"__Znwj", (void*)wrap_malloc}, {"__Znam", (void*)wrap_malloc}, {"__Znaj", (void*)wrap_malloc}, {"__ZdlPv", (void*)wrap_free}, {"__ZdaPv", (void*)wrap_free},
     {"___dynamic_cast", (void*)wrap_dynamic_cast}, {"___cxa_throw", (void*)wrap_cxa_throw}, {"___cxa_allocate_exception", (void*)malloc}, {"___cxa_free_exception", (void*)free}, STB_W(__cxa_guard_acquire), STB_W(__cxa_guard_release), STB_W(__cxa_begin_catch), STB_W(__cxa_call_unexpected), STB_W(__cxa_rethrow), STB_W(objc_begin_catch), STB_W(_Unwind_SjLj_Resume), STB_W(dyld_stub_binder), STB_W(__divsi3), STB_W(__fixdfdi), STB_W(__fixsfdi), STB_W(__fixunsdfdi), STB_W(__floatdidf), STB_W(__floatundidf), STB_W(__floatundisf), STB_W(__floatdisf), STB_W(__gxx_personality_sj0), STB_W(__maskrune), STB_W(__modsi3), STB_W(__objc_personality_v0), STB_W(__udivdi3), STB_W(__udivsi3), STB_W(__divdi3), STB_W(__fixunssfdi), STB_W(__cxa_demangle), STB_W(__umoddi3), STB_W(__moddi3), STB_W(__umodsi3),
     STB_W(crc32), STB_W(deflate), STB_W(deflateEnd), STB_W(deflateInit2_), STB_W(inflate), STB_W(inflateEnd), STB_W(inflateInit2_), STB_W(inflateInit_), STB_W(inflateReset),
@@ -12807,13 +14927,103 @@ void* ResolveSymbol(const std::string& name) {
     return CreateDynamicStub(name);
 }
 
+// ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6 1.0.2: подменяем метод игры по адресу 0x567a14
+// (запись состояния текстурного слота) своей копией, чтобы увидеть, сколько стадий
+// реально есть у шейдерной программы — игра пишет в стадии 0 и 1 безусловно.
+extern "C" void A6_SetTexStageState(void* self, uint32_t i1, uint32_t i2, const void* src) {
+    i1 &= 0xFF; i2 &= 0xFF;
+    uint8_t* elem = *(uint8_t**)((uint8_t*)self + 0x18) + i1 * 12;
+    uint8_t* dst = *(uint8_t**)(elem + 8) + i2 * 48;
+    if ((uintptr_t)dst < 0x10000) {
+        static int reported = 0;
+        if (A6Dbg() && reported++ < 12) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[A6-DIAG] stage self=%p stages=%u i1=%u i2=%u elem=%p ptr=%p "
+                     "hdr=[%08x %08x %08x %08x %08x %08x]",
+                     self, (unsigned)*((uint8_t*)self + 0x10), i1, i2, elem, *(void**)(elem + 8),
+                     ((uint32_t*)self)[5], ((uint32_t*)self)[6], ((uint32_t*)self)[7],
+                     ((uint32_t*)self)[8], ((uint32_t*)self)[9], ((uint32_t*)self)[10]);
+            LogToJava(buf);
+        }
+        return;
+    }
+    if (memcmp(dst, src, 28) == 0) return;
+    memcpy(dst, src, 28);
+    dst[0x2c] = 1;
+    dst[0x2d] = 1;
+}
+
+// Asphalt 6 1.0.2: 0x5a34e0 — CCommonGLDriver::pushShader(IShader*&), который
+// безусловно дергает виртуальный метод шейдера. В меню туда приходит пустой
+// intrusive_ptr и игра уходит по нулевому адресу — подставляем последний живой.
+static void (*g_a6PushShaderOrig)(void*, void**) = nullptr;
+static void* g_a6LastGoodShader = nullptr;
+extern "C" void A6_PushShader(void* drv, void** shaderPtr) {
+    static int nulls = 0, oks = 0;
+    if (!shaderPtr || !*shaderPtr) {
+        if (shaderPtr && g_a6LastGoodShader) {
+            void* saved = *shaderPtr;
+            *shaderPtr = g_a6LastGoodShader;
+            g_a6PushShaderOrig(drv, shaderPtr);
+            *shaderPtr = saved;
+            nulls++;
+            return;
+        }
+        if ((nulls++ % 200) == 0 && A6Dbg()) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "[A6-DIAG] pushShader пустых=%d непустых=%d слот=%p вызов из ",
+                     nulls, oks, (void*)shaderPtr);
+            LogToJava(std::string(buf) + GetModuleInfoForAddress((uint32_t)(uintptr_t)__builtin_return_address(0)));
+        }
+        return;
+    }
+    g_a6LastGoodShader = *shaderPtr;
+    if ((oks++ % 200) == 0 && A6Dbg()) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "[A6-DIAG] pushShader непустых=%d пустых=%d шейдер=%p", oks, nulls, *shaderPtr);
+        LogToJava(buf);
+    }
+    g_a6PushShaderOrig(drv, shaderPtr);
+}
+
+static void A6InstallPushShaderHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x5a34e0 + slide);
+    if (fn[0] != 0xe92d40b0 || fn[1] != 0xe28d7008 || fn[2] != 0xe5903118) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;                               // ldr pc, [pc, #-4]
+    tr[3] = 0x5a34e8 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6PushShaderOrig = (void (*)(void*, void**))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_PushShader;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-DIAG] хук на 0x5a34e0 установлен");
+}
+
+static void A6InstallStageHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x567a14 + slide);
+    if (fn[0] != 0xe92d40b0 || fn[1] != 0xe28d7008 || fn[2] != 0xe6ef1071) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;                                  // ldr pc, [pc, #-4]
+    fn[1] = (uint32_t)(uintptr_t)&A6_SetTexStageState;   // бит 0 задан — уход в Thumb
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-DIAG] хук на 0x567a14 установлен");
+}
+
 // --- Структуры Mach-O ---
 struct fat_header { uint32_t magic; uint32_t nfat_arch; }; struct fat_arch { uint32_t cputype; uint32_t cpusubtype; uint32_t offset; uint32_t size; uint32_t align; }; struct mach_header { uint32_t magic; uint32_t cputype; uint32_t cpusubtype; uint32_t filetype; uint32_t ncmds; uint32_t sizeofcmds; uint32_t flags; }; struct load_command { uint32_t cmd; uint32_t cmdsize; }; struct segment_command { uint32_t cmd; uint32_t cmdsize; char segname[16]; uint32_t vmaddr; uint32_t vmsize; uint32_t fileoff; uint32_t filesize; uint32_t maxprot; uint32_t initprot; uint32_t nsects; uint32_t flags; }; struct section { char sectname[16]; char segname[16]; uint32_t addr; uint32_t size; uint32_t offset; uint32_t align; uint32_t reloff; uint32_t nreloc; uint32_t flags; uint32_t reserved1; uint32_t reserved2; }; struct symtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t symoff; uint32_t nsyms; uint32_t stroff; uint32_t strsize; }; struct dysymtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t ilocalsym; uint32_t nlocalsym; uint32_t iextdefsym; uint32_t nextdefsym; uint32_t iundefsym; uint32_t nundefsym; uint32_t tocoff; uint32_t ntoc; uint32_t modtaboff; uint32_t nmodtab; uint32_t extrefsymoff; uint32_t nextrefsyms; uint32_t indirectsymoff; uint32_t nindirectsyms; uint32_t extreloff; uint32_t nextrel; uint32_t locreloff; uint32_t nlocrel; }; struct thread_command { uint32_t cmd; uint32_t cmdsize; uint32_t flavor; uint32_t count; }; struct nlist { union { uint32_t n_strx; } n_un; uint8_t n_type; uint8_t n_sect; int16_t n_desc; uint32_t n_value; }; struct dyld_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t rebase_off; uint32_t rebase_size; uint32_t bind_off; uint32_t bind_size; uint32_t weak_bind_off; uint32_t weak_bind_size; uint32_t lazy_bind_off; uint32_t lazy_bind_size; uint32_t export_off; uint32_t export_size; };
 struct encryption_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t cryptoff; uint32_t cryptsize; uint32_t cryptid; };
 uint64_t read_uleb128(const uint8_t** p) { uint64_t result = 0; int bit = 0; do { result |= ((**p & 0x7f) << bit); bit += 7; } while (*(*p)++ & 0x80); return result; } int64_t read_sleb128(const uint8_t** p) { int64_t result = 0; int bit = 0; uint8_t byte; do { byte = *(*p)++; result |= ((byte & 0x7f) << bit); bit += 7; } while (byte & 0x80); if (byte & 0x40) result |= (-1ULL) << bit; return result; }
 
 void ProcessRebaseOpcodes(int fd, uint32_t arch_offset, uint32_t rebase_off, uint32_t rebase_size, const std::vector<segment_command>& segments, uint32_t slide) {
-    std::vector<uint8_t> rebase_data(rebase_size); lseek(fd, arch_offset + rebase_off, SEEK_SET); read(fd, rebase_data.data(), rebase_size);
+    std::vector<uint8_t> rebase_data(rebase_size); VfsLseekAny(fd, arch_offset + rebase_off, SEEK_SET); VfsReadAny(fd, rebase_data.data(), rebase_size);
     const uint8_t* p = rebase_data.data(); const uint8_t* end = p + rebase_size;
     uint32_t segment_idx = 0; uint64_t offset = 0; uint32_t type = 0;
     while (p < end) {
@@ -12854,7 +15064,7 @@ void ProcessRebaseOpcodes(int fd, uint32_t arch_offset, uint32_t rebase_off, uin
 }
 
 void ProcessBindOpcodes(int fd, uint32_t arch_offset, uint32_t bind_off, uint32_t bind_size, const std::vector<segment_command>& segments, uint32_t slide) {
-    std::vector<uint8_t> bind_data(bind_size); lseek(fd, arch_offset + bind_off, SEEK_SET); read(fd, bind_data.data(), bind_size);
+    std::vector<uint8_t> bind_data(bind_size); VfsLseekAny(fd, arch_offset + bind_off, SEEK_SET); VfsReadAny(fd, bind_data.data(), bind_size);
     const uint8_t* p = bind_data.data(); const uint8_t* end = p + bind_size; uint32_t segment_idx = 0; uint64_t offset = 0; std::string symbol_name = "";
     while (p < end) {
         uint8_t opcode = *p & 0xF0; uint8_t imm = *p & 0x0F; p++;
@@ -13036,15 +15246,15 @@ void LoadMachO(const std::string& bundlePath) {
 
     std::string execName = bundlePath.substr(bundlePath.find_last_of('/') + 1); execName = execName.substr(0, execName.find(".app")); std::string execPath = bundlePath + "/" + execName;
     g_execPath = execPath;
-    int fd = open(execPath.c_str(), O_RDONLY); if (fd < 0) return;
+    int fd = VfsOpenAny(execPath.c_str(), O_RDONLY); if (fd < 0) return;
     
-    uint32_t magic; read(fd, &magic, sizeof(magic));
+    uint32_t magic; VfsReadAny(fd, &magic, sizeof(magic));
     uint32_t arch_offset = 0; bool isFat = false; bool hasArmv6 = false; bool hasArmv7 = false; bool hasArmv8 = false;
     
     if (magic == 0xbebafeca || magic == 0xcafebabe) {
-        isFat = true; uint32_t nfat; read(fd, &nfat, sizeof(nfat)); nfat = __builtin_bswap32(nfat);
+        isFat = true; uint32_t nfat; VfsReadAny(fd, &nfat, sizeof(nfat)); nfat = __builtin_bswap32(nfat);
         for (uint32_t i = 0; i < nfat; i++) {
-            fat_arch fa; read(fd, &fa, sizeof(fa));
+            fat_arch fa; VfsReadAny(fd, &fa, sizeof(fa));
             uint32_t type = __builtin_bswap32(fa.cputype); uint32_t subtype = __builtin_bswap32(fa.cpusubtype);
             if (type == 12) {
                 if (subtype == 6) hasArmv6 = true;
@@ -13054,14 +15264,14 @@ void LoadMachO(const std::string& bundlePath) {
             }
         }
         if (!hasArmv7 && hasArmv6) {
-            lseek(fd, 8, SEEK_SET);
+            VfsLseekAny(fd, 8, SEEK_SET);
             for (uint32_t i = 0; i < nfat; i++) {
-                fat_arch fa; read(fd, &fa, sizeof(fa));
+                fat_arch fa; VfsReadAny(fd, &fa, sizeof(fa));
                 if (__builtin_bswap32(fa.cputype) == 12 && __builtin_bswap32(fa.cpusubtype) == 6) { arch_offset = __builtin_bswap32(fa.offset); break; }
             }
         }
     } else if (magic == 0xfeedface || magic == 0xcefaedfe) {
-        mach_header mh; lseek(fd, 0, SEEK_SET); read(fd, &mh, sizeof(mh));
+        mach_header mh; VfsLseekAny(fd, 0, SEEK_SET); VfsReadAny(fd, &mh, sizeof(mh));
         uint32_t ctype = (magic == 0xcefaedfe) ? __builtin_bswap32(mh.cputype) : mh.cputype;
         uint32_t csubtype = (magic == 0xcefaedfe) ? __builtin_bswap32(mh.cpusubtype) : mh.cpusubtype;
         if (ctype == 12) { 
@@ -13082,24 +15292,24 @@ void LoadMachO(const std::string& bundlePath) {
         if (hasArmv7) archStr = "ARMv7"; else if (hasArmv8) archStr = "ARMv8"; else if (hasArmv6) archStr = "ARMv6";
     }
 
-    lseek(fd, arch_offset, SEEK_SET); mach_header mh; read(fd, &mh, sizeof(mh));
+    VfsLseekAny(fd, arch_offset, SEEK_SET); mach_header mh; VfsReadAny(fd, &mh, sizeof(mh));
 
     // --- ПЕРВЫЙ ПРОХОД: Вычисляем min/max vmaddr и slide ---
     uint32_t min_vmaddr = 0xFFFFFFFF; uint32_t max_vmaddr = 0;
     uint32_t scan_offset = arch_offset + sizeof(mach_header);
     for (uint32_t i = 0; i < mh.ncmds; i++) {
-        load_command lc; lseek(fd, scan_offset, SEEK_SET); read(fd, &lc, sizeof(lc));
+        load_command lc; VfsLseekAny(fd, scan_offset, SEEK_SET); VfsReadAny(fd, &lc, sizeof(lc));
         if (lc.cmd == 0x21) { // LC_ENCRYPTION_INFO
-            encryption_info_command enc; lseek(fd, scan_offset, SEEK_SET); read(fd, &enc, sizeof(enc));
+            encryption_info_command enc; VfsLseekAny(fd, scan_offset, SEEK_SET); VfsReadAny(fd, &enc, sizeof(enc));
             if (enc.cryptid != 0) {
-                close(fd);
+                VfsCloseAny(fd);
                 LogToJava("HLE: Обнаружен Apple DRM (LC_ENCRYPTION_INFO cryptid = " + std::to_string(enc.cryptid) + ")");
                 ShowDrmErrorToJava();
                 return;
             }
         }
         if (lc.cmd == 1) {
-            segment_command seg; lseek(fd, scan_offset, SEEK_SET); read(fd, &seg, sizeof(seg));
+            segment_command seg; VfsLseekAny(fd, scan_offset, SEEK_SET); VfsReadAny(fd, &seg, sizeof(seg));
             if (seg.vmsize > 0) {
                 if (seg.vmaddr < min_vmaddr) min_vmaddr = seg.vmaddr;
                 if (seg.vmaddr + seg.vmsize > max_vmaddr) max_vmaddr = seg.vmaddr + seg.vmsize;
@@ -13137,16 +15347,16 @@ void LoadMachO(const std::string& bundlePath) {
 
     uint32_t cmd_offset = arch_offset + sizeof(mach_header); symtab_command symtab = {0}; dysymtab_command dysymtab = {0}; uint32_t dyld_bind_off = 0, dyld_bind_size = 0; uint32_t dyld_lazy_bind_off = 0, dyld_lazy_bind_size = 0; uint32_t dyld_rebase_off = 0, dyld_rebase_size = 0; std::vector<segment_command> loaded_segments; std::vector<section> dysym_sections; std::vector<section> classlist_sections; std::vector<section> init_func_sections;
     for (uint32_t i = 0; i < mh.ncmds; i++) {
-        lseek(fd, cmd_offset, SEEK_SET); load_command lc; read(fd, &lc, sizeof(lc));
+        VfsLseekAny(fd, cmd_offset, SEEK_SET); load_command lc; VfsReadAny(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { 
-            segment_command seg; lseek(fd, cmd_offset, SEEK_SET); read(fd, &seg, sizeof(seg)); loaded_segments.push_back(seg);
+            segment_command seg; VfsLseekAny(fd, cmd_offset, SEEK_SET); VfsReadAny(fd, &seg, sizeof(seg)); loaded_segments.push_back(seg);
             if (seg.vmsize > 0) {
                 uint32_t target_addr = seg.vmaddr + g_appSlide;
                 void* mapped = mmap((void*)target_addr, seg.vmsize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
-                if (mapped != MAP_FAILED && seg.filesize > 0) { lseek(fd, arch_offset + seg.fileoff, SEEK_SET); read(fd, mapped, seg.filesize); }
+                if (mapped != MAP_FAILED && seg.filesize > 0) { VfsLseekAny(fd, arch_offset + seg.fileoff, SEEK_SET); VfsReadAny(fd, mapped, seg.filesize); }
                 uint32_t sect_offset = cmd_offset + sizeof(segment_command);
                 for(uint32_t s = 0; s < seg.nsects; s++) { 
-                    section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect)); 
+                    section sect; VfsLseekAny(fd, sect_offset, SEEK_SET); VfsReadAny(fd, &sect, sizeof(sect)); 
                     sect.addr += g_appSlide; // Сдвигаем адрес секции
                     uint8_t type = sect.flags & 0xff; 
                     if (type == 6 || type == 7) dysym_sections.push_back(sect); 
@@ -13162,17 +15372,17 @@ void LoadMachO(const std::string& bundlePath) {
                     sect_offset += sizeof(section); 
                 }
             }
-        } else if (lc.cmd == 2) { lseek(fd, cmd_offset, SEEK_SET); read(fd, &symtab, sizeof(symtab));
-        } else if (lc.cmd == 11) { lseek(fd, cmd_offset, SEEK_SET); read(fd, &dysymtab, sizeof(dysymtab));
-        } else if (lc.cmd == 0x22 || lc.cmd == 0x80000022) { dyld_info_command dyld; lseek(fd, cmd_offset, SEEK_SET); read(fd, &dyld, sizeof(dyld)); dyld_bind_off = dyld.bind_off; dyld_bind_size = dyld.bind_size; dyld_lazy_bind_off = dyld.lazy_bind_off; dyld_lazy_bind_size = dyld.lazy_bind_size; dyld_rebase_off = dyld.rebase_off; dyld_rebase_size = dyld.rebase_size;
-        } else if (lc.cmd == 5) { thread_command th; lseek(fd, cmd_offset, SEEK_SET); read(fd, &th, sizeof(th)); if (th.flavor == 1) { struct { uint32_t r[13]; uint32_t sp; uint32_t lr; uint32_t pc; uint32_t cpsr; } state; read(fd, &state, sizeof(state)); g_entryPoint = state.pc + g_appSlide; }
+        } else if (lc.cmd == 2) { VfsLseekAny(fd, cmd_offset, SEEK_SET); VfsReadAny(fd, &symtab, sizeof(symtab));
+        } else if (lc.cmd == 11) { VfsLseekAny(fd, cmd_offset, SEEK_SET); VfsReadAny(fd, &dysymtab, sizeof(dysymtab));
+        } else if (lc.cmd == 0x22 || lc.cmd == 0x80000022) { dyld_info_command dyld; VfsLseekAny(fd, cmd_offset, SEEK_SET); VfsReadAny(fd, &dyld, sizeof(dyld)); dyld_bind_off = dyld.bind_off; dyld_bind_size = dyld.bind_size; dyld_lazy_bind_off = dyld.lazy_bind_off; dyld_lazy_bind_size = dyld.lazy_bind_size; dyld_rebase_off = dyld.rebase_off; dyld_rebase_size = dyld.rebase_size;
+        } else if (lc.cmd == 5) { thread_command th; VfsLseekAny(fd, cmd_offset, SEEK_SET); VfsReadAny(fd, &th, sizeof(th)); if (th.flavor == 1) { struct { uint32_t r[13]; uint32_t sp; uint32_t lr; uint32_t pc; uint32_t cpsr; } state; VfsReadAny(fd, &state, sizeof(state)); g_entryPoint = state.pc + g_appSlide; }
         } else if (lc.cmd == 0xC || lc.cmd == 0x18 || lc.cmd == 0x80000018) {
         }
         cmd_offset += lc.cmdsize;
     }
     if (symtab.cmdsize > 0) {
-        std::vector<char> strTable(symtab.strsize); lseek(fd, arch_offset + symtab.stroff, SEEK_SET); read(fd, strTable.data(), symtab.strsize);
-        std::vector<nlist> symTable(symtab.nsyms); lseek(fd, arch_offset + symtab.symoff, SEEK_SET); read(fd, symTable.data(), symtab.nsyms * sizeof(nlist));
+        std::vector<char> strTable(symtab.strsize); VfsLseekAny(fd, arch_offset + symtab.stroff, SEEK_SET); VfsReadAny(fd, strTable.data(), symtab.strsize);
+        std::vector<nlist> symTable(symtab.nsyms); VfsLseekAny(fd, arch_offset + symtab.symoff, SEEK_SET); VfsReadAny(fd, symTable.data(), symtab.nsyms * sizeof(nlist));
         bool isES1 = false; bool isES2 = false;
         for (uint32_t i = 0; i < symtab.nsyms; i++) {
             if (symTable[i].n_un.n_strx > 0) {
@@ -13202,7 +15412,7 @@ void LoadMachO(const std::string& bundlePath) {
         LogToJava("Picked render: " + (g_activeESVersion == 2 ? std::string("OpenGL ES 2.0") : std::string("OpenGL ES 1.1")));
         
         if (!hasArmv7) {
-            close(fd);
+            VfsCloseAny(fd);
             std::string badArch = hasArmv8 ? "8" : (hasArmv6 ? "6" : "?");
             ShowArchErrorToJava(badArch);
             return;
@@ -13259,12 +15469,12 @@ void LoadMachO(const std::string& bundlePath) {
 
                 uint32_t scan_cmd_offset = arch_offset + sizeof(mach_header);
                 for (uint32_t i = 0; i < mh.ncmds; i++) {
-                    load_command lc; lseek(fd, scan_cmd_offset, SEEK_SET); read(fd, &lc, sizeof(lc));
+                    load_command lc; VfsLseekAny(fd, scan_cmd_offset, SEEK_SET); VfsReadAny(fd, &lc, sizeof(lc));
                     if (lc.cmd == 1) { // LC_SEGMENT
-                        segment_command seg; lseek(fd, scan_cmd_offset, SEEK_SET); read(fd, &seg, sizeof(seg));
+                        segment_command seg; VfsLseekAny(fd, scan_cmd_offset, SEEK_SET); VfsReadAny(fd, &seg, sizeof(seg));
                         uint32_t sect_offset = scan_cmd_offset + sizeof(segment_command);
                         for(uint32_t s = 0; s < seg.nsects; s++) {
-                            section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect));
+                            section sect; VfsLseekAny(fd, sect_offset, SEEK_SET); VfsReadAny(fd, &sect, sizeof(sect));
                             std::string sectname = sect.sectname;
                             
                             bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
@@ -13496,7 +15706,7 @@ void LoadMachO(const std::string& bundlePath) {
         if (dyld_bind_size > 0) ProcessBindOpcodes(fd, arch_offset, dyld_bind_off, dyld_bind_size, loaded_segments, g_appSlide);
         if (dyld_lazy_bind_size > 0) ProcessBindOpcodes(fd, arch_offset, dyld_lazy_bind_off, dyld_lazy_bind_size, loaded_segments, g_appSlide);
         if (dysymtab.cmdsize > 0) {
-            std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
+            std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); VfsLseekAny(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); VfsReadAny(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
                 uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
                 for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
@@ -13505,11 +15715,18 @@ void LoadMachO(const std::string& bundlePath) {
     }
     cmd_offset = arch_offset + sizeof(mach_header);
     for (uint32_t i = 0; i < mh.ncmds; i++) {
-        load_command lc; lseek(fd, cmd_offset, SEEK_SET); read(fd, &lc, sizeof(lc));
-        if (lc.cmd == 1) { segment_command seg; lseek(fd, cmd_offset, SEEK_SET); read(fd, &seg, sizeof(seg)); if (seg.vmsize > 0) { int prot = PROT_READ; if (seg.initprot & 2) prot |= PROT_WRITE; if (seg.initprot & 4) prot |= PROT_EXEC; mprotect((void*)(seg.vmaddr + g_appSlide), seg.vmsize, prot); } }
+        load_command lc; VfsLseekAny(fd, cmd_offset, SEEK_SET); VfsReadAny(fd, &lc, sizeof(lc));
+        if (lc.cmd == 1) { segment_command seg; VfsLseekAny(fd, cmd_offset, SEEK_SET); VfsReadAny(fd, &seg, sizeof(seg)); if (seg.vmsize > 0) { int prot = PROT_READ; if (seg.initprot & 2) prot |= PROT_WRITE; if (seg.initprot & 4) prot |= PROT_EXEC; mprotect((void*)(seg.vmaddr + g_appSlide), seg.vmsize, prot); } }
         cmd_offset += lc.cmdsize;
     }
-    close(fd); 
+    VfsCloseAny(fd);
+    // Хуки бьют по абсолютным адресам образа Asphalt 6 — в чужой игре это чтение по
+    // невалидному указателю и SIGSEGV прямо в LoadMachO.
+    g_isAsphalt6 = bundlePath.find("Asphalt6") != std::string::npos;
+    if (g_isAsphalt6) {
+        A6InstallStageHook(g_appSlide);
+        A6InstallPushShaderHook(g_appSlide);
+    }
 
     // --- ПАРСИНГ __objc_classlist (Восстановление скрытых/stripped классов) ---
     for (const auto& sect : classlist_sections) {
@@ -13525,7 +15742,7 @@ void LoadMachO(const std::string& bundlePath) {
                     if (isValidString((const char*)name_ptr)) {
                         std::string cName = (const char*)name_ptr;
                         g_appSymbols["_OBJC_CLASS_$_" + cName] = cls_addr;
-                        if (g_logHiddenClasses) {
+                        if (LogCatOn(LOG_DIAG)) {
                             LogToJava("OBJC-CLASS-FOUND: Нашёлся скрытый класс " + cName);
                         }
                     }
@@ -13545,7 +15762,7 @@ void LoadMachO(const std::string& bundlePath) {
     }
     
     // --- ВЫВОД ОТСОРТИРОВАННОГО КЭША C-API ---
-    if (g_logFuncList) {
+    if (LogCatOn(LOG_DIAG)) {
         std::string batchLog = "\n=== РЕАЛИЗОВАННЫЕ C-API СИМВОЛЫ ===\n";
         int counter = 0;
         for (auto const& pair : g_implementedSymbols) {
@@ -15556,6 +17773,26 @@ extern bool g_machOLoaded;
 
 extern "C" void* wrap_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     uint32_t lr = (uint32_t)__builtin_return_address(0);
+    // Записи .ipa нельзя отобразить напрямую: они не выровнены, а то и сжаты.
+    // Отдаём анонимную память с вычитанным содержимым — для чтения это неотличимо.
+    if (IpaIsVirtualFd(fd)) {
+        void* mem = mmap(addr, length, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | (flags & MAP_FIXED), -1, 0);
+        if (mem == MAP_FAILED) {
+            LogToJava("C-API-ERROR: mmap записи .ipa не удался, len=" + std::to_string(length));
+            return MAP_FAILED;
+        }
+        size_t done = 0;
+        while (done < length) {
+            ssize_t r = IpaPread(fd, (char*)mem + done, length - done, (off64_t)offset + done);
+            if (r <= 0) break;
+            done += (size_t)r;
+        }
+        if (!(prot & PROT_WRITE)) mprotect(mem, length, prot);
+        LogToBlackBox("C-API-MEM: [mmap] из .ipa len=" + std::to_string(length) +
+                      " прочитано=" + std::to_string(done));
+        return mem;
+    }
     void* res = mmap(addr, length, prot, flags, fd, offset);
     if (res == MAP_FAILED) {
         LogToJava("C-API-ERROR: mmap(" + std::to_string(length) + " bytes, prot=" + std::to_string(prot) + ") FAILED! Caller: " + GetModuleInfoForAddress(lr));
@@ -15663,22 +17900,18 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     return JNI_VERSION_1_6;
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_initWrapper(JNIEnv *env, jobject thiz, jstring workDir, jstring sandboxRoot, jstring appBundle, jstring bundleId, jboolean logRender, jboolean logSound, jboolean logFs, jboolean logNet, jboolean logTodo, jboolean logRenderDebug, jboolean logFuncList, jboolean logHiddenClasses, jboolean logOther, jint spamFiltersMask, jboolean onScreenDebugOverlay, jboolean showPerfOverlay, jboolean nativeRootMmap, jint resWidth, jint resHeight, jint esMode, jint gpuOffloadMask) {
+extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_setLogUiVisible(JNIEnv*, jobject, jboolean visible) {
+    g_logUiVisible = visible;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_initWrapper(JNIEnv *env, jobject thiz, jstring workDir, jstring sandboxRoot, jstring appBundle, jstring bundleId, jint logMask, jint spamMask, jboolean onScreenDebugOverlay, jboolean showPerfOverlay, jboolean nativeRootMmap, jint resWidth, jint resHeight, jint esMode, jint gpuOffloadMask) {
     g_mainActivity = env->NewGlobalRef(thiz); 
     g_gpuOffloadMask = gpuOffloadMask;
     g_surfaceWidth = resWidth;
     g_surfaceHeight = resHeight;
-    g_logRender = logRender;
-    g_logSound = logSound;
-    g_logFs = logFs;
-    g_logNet = logNet;
-    g_logTodo = logTodo;
-    g_logRenderDebug = logRenderDebug;
-    g_logFuncList = logFuncList;
-    g_logHiddenClasses = logHiddenClasses;
-    g_logOther = logOther;
-    g_spamFiltersMask = spamFiltersMask;
-    g_disableLogging = !(logRender || logSound || logFs || logNet || logTodo || logRenderDebug || logFuncList || logHiddenClasses || logOther);
+    g_logMask = (uint32_t)logMask;
+    g_spamMask = (uint32_t)spamMask;
+    g_disableLogging = (g_logMask == 0);
     g_esModeOption = esMode;
     g_onScreenDebugOverlay = onScreenDebugOverlay;
     g_showPerfOverlay = showPerfOverlay;
@@ -15688,10 +17921,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     g_startTimeMs = 0;
     g_fpsFrameCount = 0;
     g_totalFrames = 0;
-    const char* wd = env->GetStringUTFChars(workDir, 0); 
-    g_workDir = wd; 
+    const char* wd = env->GetStringUTFChars(workDir, 0);
+    g_workDir = wd;
     snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%sdamn32_log.txt", wd);
-    env->ReleaseStringUTFChars(workDir, wd); 
+    env->ReleaseStringUTFChars(workDir, wd);
+    // Java удаляет damn32_log.txt перед запуском — старый fd указывал бы на удалённый инод.
+    ResetLogFile();
 
     const char* bId = env->GetStringUTFChars(bundleId, 0);
     std::string bundleIdStr = bId;
@@ -15726,10 +17961,23 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         }
     }
 
-    const char* bundle = env->GetStringUTFChars(appBundle, 0); 
+    const char* bundle = env->GetStringUTFChars(appBundle, 0);
     std::string bundleStr(bundle);
+    env->ReleaseStringUTFChars(appBundle, bundle);
+
+    // Игра может лежать как распакованный <Имя>.app, так и .ipa — тогда бандл
+    // подключается виртуальным диском, а гостю видны пути /ipa/Payload/<Имя>.app.
+    if (bundleStr.size() > 4 && bundleStr.compare(bundleStr.size() - 4, 4, ".ipa") == 0) {
+        std::string vdir, err;
+        if (!IpaMount(bundleStr, vdir, err)) {
+            LogToJava("IPA: не удалось смонтировать " + bundleStr + ": " + err);
+            return;
+        }
+        LogToJava("IPA: смонтирован " + bundleStr + " -> " + vdir);
+        bundleStr = vdir;
+    }
+
     g_appBundlePath = bundleStr; // Сохраняем путь к .app для NSBundle
-    env->ReleaseStringUTFChars(appBundle, bundle); 
     LoadMachO(bundleStr);
 }
 
@@ -15784,6 +18032,26 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
 extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_onTouchEventNative(JNIEnv *env, jobject thiz, jint actionMasked, jint pointerId, jfloat x, jfloat y) {
     if (g_ignoringInteractionEvents > 0) return;
     void* activeView = g_presentedView ? g_presentedView : g_mainView; if (!activeView) return;
+
+    // UIKit никогда не отдаёт тач вью нулевого размера. Asphalt последним кладёт в окно
+    // свой служебный substView с фреймом 0x0, и без этой проверки весь ввод уходил в него
+    // мимо EAGLView. Если текущая цель не накрывает точку — ищем ту, что накрывает.
+    auto hitOk = [&](void* view) -> bool {
+        if (!view || !g_views.count(view)) return false;
+        auto& d = g_views[view];
+        if (d.hidden || !d.userInteraction || d.frame[2] <= 0 || d.frame[3] <= 0) return false;
+        return x >= d.frame[0] && x <= d.frame[0] + d.frame[2] && y >= d.frame[1] && y <= d.frame[1] + d.frame[3];
+    };
+    if (!hitOk(activeView)) {
+        void* best = nullptr; float bestArea = 0.0f;
+        for (auto const& pair : g_views) {
+            if (!hitOk(pair.first)) continue;
+            if (!FindMethodIMP(((uint32_t*)pair.first)[0], "touchesBegan:withEvent:")) continue;
+            float area = g_views[pair.first].frame[2] * g_views[pair.first].frame[3];
+            if (!best || area < bestArea) { best = pair.first; bestArea = area; }
+        }
+        if (best) activeView = best;
+    }
 
     bool isDown = (actionMasked == 0 || actionMasked == 5);
     bool isUp = (actionMasked == 1 || actionMasked == 6);
@@ -15843,7 +18111,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
                     for (auto& btn : g_buttons) {
                         if (btn.button == activeUI && btn.target && !btn.action.empty()) {
                             pthread_mutex_lock(&g_mainQueueMutex);
-                            g_mainQueue.push_back({btn.target, btn.action.c_str(), btn.button});
+                            g_mainQueue.push_back({btn.target, btn.action.c_str(), btn.button, nullptr, true});
                             pthread_mutex_unlock(&g_mainQueueMutex);
                             break;
                         }
@@ -15887,12 +18155,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     if (method) { 
         pthread_mutex_lock(&g_mainQueueMutex);
         // Отправляем тач во View
-        g_mainQueue.push_back({activeView, method, (void*)set});
+        g_mainQueue.push_back({activeView, method, (void*)set, nullptr, true});
         
         // ВАЖНО: Дублируем тач в ViewController (Responder Chain), так как логика часто там
         for (auto const& pair : g_viewControllersViews) {
             if (pair.second == activeView) {
-                g_mainQueue.push_back({pair.first, method, (void*)set});
+                g_mainQueue.push_back({pair.first, method, (void*)set, nullptr, true});
                 break;
             }
         }
@@ -15910,9 +18178,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
 
 extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_onSensorChangedNative(JNIEnv *env, jobject thiz, jint sensorType, jfloat x, jfloat y, jfloat z) {
     if (sensorType == 1) { // Accelerometer
-        g_latestAccelX = (double)x;
-        g_latestAccelY = (double)y;
-        g_latestAccelZ = (double)z;
+        double ax = (double)x, ay = (double)y, az = (double)z;
+        OrientAccel(ax, ay);
+        g_latestAccelX = ax;
+        g_latestAccelY = ay;
+        g_latestAccelZ = az;
         if (g_accelerometerDelegate) {
             if (!g_hleClasses.count("FakeUIAcceleration")) {
                 g_hleClasses["FakeUIAcceleration"] = new HLEClass{0xDEADBEEF, "FakeUIAcceleration"};
@@ -15922,9 +18192,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
                 (uint32_t)g_hleClasses["FakeUIAcceleration"], 
                 "FakeUIAcceleration", 
                 (double)Stub_mach_absolute_time() / 1000000000.0, 
-                (double)x, 
-                (double)y, 
-                (double)z
+                ax, 
+                ay, 
+                az
             };
             
             static uint32_t* accelInst = nullptr;
@@ -15934,7 +18204,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
             }
 
             pthread_mutex_lock(&g_mainQueueMutex);
-            g_mainQueue.push_back({g_accelerometerDelegate, "accelerometer:didAccelerate:", (void*)accelInst, (void*)acc});
+            g_mainQueue.push_back({g_accelerometerDelegate, "accelerometer:didAccelerate:", (void*)accelInst, (void*)acc, true});
             pthread_mutex_unlock(&g_mainQueueMutex);
         }
     } else if (sensorType == 4) { // Gyroscope
