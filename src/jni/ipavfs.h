@@ -46,6 +46,9 @@ off_t   IpaLseek(int fd, off_t off, int whence);
 int     IpaCloseFd(int fd);
 bool    IpaFstat(int fd, struct stat* st);
 
+// Сколько раз чтение из архива пришлось дочитывать до запрошенного размера.
+extern long g_ipaShortReadFixups;
+
 DIR*           IpaOpendir(const std::string& vpath);
 bool           IpaIsVirtualDir(DIR* d);
 struct dirent* IpaReaddir(DIR* d);

@@ -117,8 +117,15 @@ void _SyncLog(const std::string& msg);
 // остальных версий игры, поэтому код живёт в репозитории, а включается правкой
 // единицы ниже и пересборкой. При 0 компилятор выбрасывает всю обвязку целиком.
 #define A6_DEBUG_LOG 1
+// ВРЕМЕННО: потолок кадров для проверки гипотезы «баг экрана трасс — гонка от высокого fps». 0 — выключено.
+#define A6_FPS_CAP 0
 extern bool g_isAsphalt6;
-static inline bool A6Dbg() { return A6_DEBUG_LOG && g_isAsphalt6; }
+// Диагностика молчит по умолчанию и включается файлом-маркером a6debug в рабочем каталоге.
+// На скорость загрузки белый зал не завязан: с выключенными категориями лога он всё равно
+// выпадает 4 раза из 6, ровно как и с включёнными.
+extern bool g_a6DebugEnabled;
+void A6ScanGuestMemory(const char* needle);
+static inline bool A6Dbg() { return A6_DEBUG_LOG && g_isAsphalt6 && g_a6DebugEnabled; }
 #define A6Log(msg) do { if (A6Dbg()) _LogToJava(msg); } while(0)
 std::string DumpHexToString(const char* data, int max_len);
 
@@ -282,6 +289,43 @@ int g_lastActiveFBO = 0;
 std::set<GLuint> g_texCreatedEmpty;   // ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6
 bool g_isAsphalt6 = false;            // диагностика A6 лезет по абсолютным адресам её образа
 int g_a6FrameNo = 0;   // ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6: номер кадра для выборочных дампов
+int g_a6BlendFrame = -1;
+uint32_t g_a6BlendLr = 0;
+int g_a6BlendOn = -1;
+uint32_t g_a6BlendGameLr = 0;
+uint32_t g_a6ApplyFlags = 0;   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: слово флагов SRenderState последнего apply()
+int g_a6ApplyCount = 0;
+uint32_t g_a6ApplyState = 0;
+uint32_t g_a6ApplyLr = 0;
+uint32_t g_a6PassEff = 0;
+char g_a6LastMatName[128] = "";
+extern uint32_t g_a6GarageRend;
+extern uint32_t g_a6LastCommitRend;
+extern uint32_t g_a6CommitKind;
+extern char g_a6CommitDiag[192];
+extern uint32_t g_a6MapInserts;
+extern uint32_t g_a6SortDef, g_a6SortDist, g_a6SortTrans;
+uint32_t g_a6PassHolder = 0;
+int g_a6PassIdx = 0;
+uint32_t g_a6PassFlags[3] = {0, 0, 0};
+uint32_t g_a6PassStack[12] = {0};
+static void A6ProbePixel(const char* what, int count);   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: откуда в коде игры пришёл GL-вызов. Импорты игры идут
+// через трамплины враппера, поэтому __builtin_return_address показывает трамплин;
+// настоящий адрес лежит глубже в стеке. Образ игры загружен со slide 0, так что
+// адреса совпадают с дизассемблером. Кандидат подтверждается тем, что предыдущее
+// слово декодируется как ARM-инструкция ветвления со ссылкой (BL/BLX).
+static inline uint32_t A6GameCaller() {
+    if (!g_isAsphalt6) return 0;
+    const uint32_t* stack = (const uint32_t*)__builtin_frame_address(0);
+    for (int i = 0; i < 192; i++) {
+        uint32_t v = stack[i];
+        if (v < 0x2000 || v >= 0x800000 || (v & 3) != 0) continue;
+        uint32_t prev = *(const uint32_t*)(uintptr_t)(v - 4);
+        if ((prev & 0x0E000000) == 0x0A000000) return v;
+    }
+    return 0;
+}
 std::map<GLuint, GLuint> g_fboColorTex;
 std::map<GLuint, std::vector<float>> g_fboDepthBuf;
 std::map<GLuint, bool> g_fboTextures;
@@ -848,6 +892,7 @@ pthread_t g_lastLoggedThread = 0;
 uint32_t g_logMask = 0;
 uint32_t g_spamMask = 0;
 bool g_nativeRootMmap = false;
+bool g_a6DebugEnabled = false;
 bool g_disableLogging = true;
 bool g_logUiVisible = true;   // пока игра рисует, лог-вью не на экране и JNI-мост не нужен
 
@@ -1018,7 +1063,11 @@ static bool LooksLikeError(const std::string& m) {
 
 void _LogToJava(const std::string& msg) {
     LogCat cat = (LogCat)ClassifyLog(msg);
-    if (!LogCatOn(cat) && !LooksLikeError(msg)) return;
+    // Скрытая категория A6: метки [A6-*] ставит только A6Dbg(), ключа в настройках у неё нет.
+    // Маску они обходят, иначе диагностику нельзя снять с выключенным логированием, а сам
+    // включённый log_other замедляет загрузку настолько, что меняет исход опыта.
+    const bool a6 = msg.compare(0, 4, "[A6-") == 0;
+    if (!a6 && !LogCatOn(cat) && !LooksLikeError(msg)) return;
 
     pthread_mutex_lock(&g_filterMutex);
     if (g_spamMask & (1u << cat)) {
@@ -1044,7 +1093,8 @@ void _LogToJava(const std::string& msg) {
     if (needEllipsis) InternalWriteLog("...");
     if (threadChanged) {
         char tid_buf[64];
-        snprintf(tid_buf, sizeof(tid_buf), "\n=== [СМЕНА ПОТОКА: T:%ld] ===", (long)currentThread);
+        snprintf(tid_buf, sizeof(tid_buf), "\n=== [СМЕНА ПОТОКА: T:%ld ctx:%p] ===",
+                 (long)currentThread, (void*)eglGetCurrentContext());
         InternalWriteLog(std::string(tid_buf));
     }
     InternalWriteLog(msg);
@@ -1792,7 +1842,7 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
     // от которых Android-драйвер крашится при аппаратном рендере
     mask &= (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     if (A6Dbg()) {
-        LogToJava("[A6-RTT] glClear mask=" + std::to_string((unsigned)mask) + " fbo=" + std::to_string(g_lastActiveFBO) +
+        A6Log("[A6-RTT] glClear mask=" + std::to_string((unsigned)mask) + " fbo=" + std::to_string(g_lastActiveFBO) +
                   " depthMask=" + std::to_string((int)g_depthMask) +
                   " colorMask=" + std::to_string((int)g_colorMask[0]) + std::to_string((int)g_colorMask[1]) +
                   std::to_string((int)g_colorMask[2]) + std::to_string((int)g_colorMask[3]) +
@@ -1848,6 +1898,7 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
         } else {
             glClear(mask);
         }
+        A6ProbePixel("CLEAR", (int)mask);
     } else {
         SyncLog("[RENDER] Выполняем очистку буфера...");
         std::vector<uint32_t>* targetColorBuf = &g_cpuColorBuffer;
@@ -2139,7 +2190,7 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
                 if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
                 int aMin = 255, aMax = 0; long aSum = 0;
                 for (size_t i = 0; i < g_cpuColorBuffer.size(); i += 97) { int a = (int)(g_cpuColorBuffer[i] >> 24); if (a < aMin) aMin = a; if (a > aMax) aMax = a; aSum += a; }
-                LogToJava("[A6-BIG] финальный буфер альфа min=" + std::to_string(aMin) + " max=" + std::to_string(aMax) +
+                A6Log("[A6-BIG] финальный буфер альфа min=" + std::to_string(aMin) + " max=" + std::to_string(aMax) +
                           " avg=" + std::to_string(aSum / (long)(g_cpuColorBuffer.size() / 97 + 1)));
             }
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
@@ -2237,7 +2288,7 @@ static int g_a6FboTrace = 0;
 
 extern "C" void Stub_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, GLvoid* pix) {
     if (A6Dbg())
-        LogToJava("[A6-RTT] glReadPixels " + std::to_string(w) + "x" + std::to_string(h) +
+        A6Log("[A6-RTT] glReadPixels " + std::to_string(w) + "x" + std::to_string(h) +
                   " fmt=" + std::to_string((unsigned)fmt) + " buf=" + std::to_string(pix != nullptr));
     glReadPixels(x, y, w, h, fmt, type, pix);
 }
@@ -2246,32 +2297,206 @@ extern "C" void Stub_glGenFramebuffers(GLsizei n, GLuint* fb) {
     glGenFramebuffers(n, fb);
     if (A6Dbg() && g_a6FboTrace < 120 && fb && n > 0) {
         g_a6FboTrace++;
-        LogToJava("[A6-RTT] glGenFramebuffers n=" + std::to_string(n) + " -> " + std::to_string(fb[0]));
+        A6Log("[A6-RTT] glGenFramebuffers n=" + std::to_string(n) + " -> " + std::to_string(fb[0]));
     }
 }
 extern "C" void Stub_glGenRenderbuffers(GLsizei n, GLuint* rb) {
     glGenRenderbuffers(n, rb);
     if (A6Dbg() && g_a6FboTrace < 120 && rb && n > 0) {
         g_a6FboTrace++;
-        LogToJava("[A6-RTT] glGenRenderbuffers n=" + std::to_string(n) + " -> " + std::to_string(rb[0]));
+        A6Log("[A6-RTT] glGenRenderbuffers n=" + std::to_string(n) + " -> " + std::to_string(rb[0]));
     }
 }
 
 void ApplyGpuViewport();
 
-// ВРЕМЕННАЯ ДИАГНОСТИКА A6: пустой ли выходит RTT-текстура экрана выбора трассы
-int g_a6DrawsInFbo = 0;
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: плавающая пропажа UI экрана выбора трассы
+std::map<GLuint, int> g_a6FboDraws;
 int g_a6RttQuadDraws = 0;
+std::string g_a6RttProbeTail;
 extern std::map<GLuint, int> g_cpuTexH;
+
+// Чтение чужой памяти через pipe: ядро вернёт EFAULT вместо SIGSEGV на мусорном указателе.
+bool A6SafeRead(const void* p, void* dst, size_t n) {
+    static int pfd[2] = {-1, -1};
+    if (pfd[0] < 0 && pipe(pfd) != 0) return false;
+    if (!p || n == 0 || n > 128) return false;
+    if (write(pfd[1], p, n) != (ssize_t)n) return false;
+    return read(pfd[0], dst, n) == (ssize_t)n;
+}
+
+// Если по адресу лежит строка — вернуть её, иначе пусто.
+std::string A6SafeStr(uint32_t addr) {
+    if (addr < 0x10000 || addr > 0xfff00000u) return "";
+    // Имена материалов вида ProfileCOMMON_<имя>-fx<число> длиннее 32 байт, и на коротком
+    // буфере разные эффекты выглядели одним и тем же именем.
+    char buf[129];
+    int n = 128;
+    // У края отображения чтение целиком не проходит — отступаем, пока не влезет.
+    while (n >= 16 && !A6SafeRead((const void*)(uintptr_t)addr, buf, n)) n >>= 1;
+    if (n < 16) return "";
+    buf[n] = 0;
+    int good = 0;
+    while (good < n && buf[good] >= 0x20 && buf[good] < 0x7f) good++;
+    if (good < 4 || (good < n && buf[good] != 0)) return "";
+    buf[good] = 0;
+    return buf;
+}
+
+// Имя эффекта движка glitch::video лежит по смещению 8 внутри объекта эффекта.
+std::string A6EffName(uint32_t eff) {
+    uint32_t p = 0;
+    if (!A6SafeRead((const void*)(uintptr_t)(eff + 8), &p, 4)) return "?";
+    std::string s = A6SafeStr(p);
+    return s.empty() ? "<безымянный>" : s;
+}
+
+// Какому отображению принадлежит адрес — видно ли это память игры, кучи или враппера.
+std::string A6MapOf(uint32_t addr) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return "";
+    char line[512];
+    std::string res;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
+        if (addr >= lo && addr < hi) { res = line; break; }
+    }
+    fclose(f);
+    while (!res.empty() && (res.back() == '\n' || res.back() == ' ')) res.pop_back();
+    return res;
+}
+
+// Кто ссылается на найденные копии имени. Объект-владелец опознаётся по vtable: она лежит в
+// __DATA игры, и по ней GetModuleInfoForAddress выдаёт имя класса.
+static void A6ScanRefs(const char* needle, const std::vector<uintptr_t>& hitAddrs) {
+    if (hitAddrs.empty()) return;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    uintptr_t minH = hitAddrs[0], maxH = hitAddrs[0];
+    for (uintptr_t h : hitAddrs) { if (h < minH) minH = h; if (h > maxH) maxH = h; }
+    std::string out;
+    int refs = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f) && refs < 24) {
+        uintptr_t lo = 0, hi = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%zx-%zx %4s", &lo, &hi, perms) != 3) continue;
+        if (perms[0] != 'r' || perms[1] != 'w' || hi <= lo) continue;
+        if (strstr(line, "/dev/") || strstr(line, "libDamnWrapper32.so")) continue;
+        if (hi - lo > (256u << 20)) continue;
+        for (const uint32_t* w = (const uint32_t*)lo; w < (const uint32_t*)hi && refs < 24; w++) {
+            uintptr_t v = *w;
+            if (v + 128 < minH || v > maxH) continue;
+            bool near = false;
+            for (uintptr_t h : hitAddrs) if (v <= h && h - v <= 128) { near = true; break; }
+            if (!near) continue;
+            refs++;
+            char hb[96];
+            snprintf(hb, sizeof(hb), "\n  ref %p -> %p |", (const void*)w, (const void*)v);
+            out += hb;
+            // Слова вокруг ссылки: указатель на vtable выдаёт класс владельца.
+            for (int k = -6; k <= 4; k++) {
+                const uint32_t* q = w + k;
+                if ((uintptr_t)q < lo || (uintptr_t)q >= hi) continue;
+                uint32_t val = *q;
+                if (val < 0x1000) continue;
+                std::string mi = GetModuleInfoForAddress(val);
+                if (mi.compare(0, 3, "[__") != 0) continue;
+                snprintf(hb, sizeof(hb), "\n      [%+d] %08x ", k, val);
+                out += hb + mi;
+            }
+        }
+    }
+    fclose(f);
+    A6Log("[A6-REF] '" + std::string(needle) + "' ссылок " + std::to_string(refs) + ";" + out);
+}
+
+// Одноразовый поиск строки по куче игры. Отвечает на развилку: материала нет на отрисовке,
+// потому что он не создан, или потому что создан, но его меш не попал в сцену.
+void A6ScanGuestMemory(const char* needle) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    size_t nlen = strlen(needle);
+    int hits = 0;
+    uint64_t scanned = 0;
+    std::string firstHits;
+    std::vector<uintptr_t> hitAddrs;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t lo = 0, hi = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%zx-%zx %4s", &lo, &hi, perms) != 3) continue;
+        if (perms[0] != 'r' || perms[1] != 'w' || hi <= lo) continue;
+        if (strstr(line, "/dev/") || strstr(line, "libDamnWrapper32.so")) continue;
+        size_t len = hi - lo;
+        if (len > (256u << 20)) continue;
+        scanned += len;
+        const char* p = (const char*)lo;
+        const char* end = (const char*)hi - nlen;
+        while (p <= end) {
+            const void* m = memmem(p, (size_t)(end - p) + nlen, needle, nlen);
+            if (!m) break;
+            if (hits < 16) {
+                char hb[128];
+                // 32 байта до совпадения: по заголовку видно, чья это строка — наша COW или игры.
+                const unsigned char* pre = (const unsigned char*)m - 32;
+                char pb[80];
+                for (int i = 0; i < 32; i++) snprintf(pb + i * 2, 3, "%02x", pre[i]);
+                snprintf(hb, sizeof(hb), "\n    %p pre=%s ", m, pb);
+                firstHits += hb + GetModuleInfoForAddress((uintptr_t)m);
+                hitAddrs.push_back((uintptr_t)m);
+            }
+            hits++;
+            if (hits > 200) break;
+            p = (const char*)m + 1;
+        }
+        if (hits > 200) break;
+    }
+    fclose(f);
+    A6Log("[A6-SCAN] '" + std::string(needle) + "' найдено " + std::to_string(hits) +
+              " раз, просмотрено " + std::to_string(scanned >> 20) + " МБ;" + firstHits);
+    A6ScanRefs(needle, hitAddrs);
+}
+
+// Код игры собран Apple-компилятором: r7 — кадровый указатель, [r7]=прошлый r7, [r7+4]=адрес возврата.
+// Цепочка сшивается с нашими кадрами, поэтому раскрутку начинаем от собственного r7.
+std::string A6Backtrace(int maxFrames) {
+    uint32_t fp = 0;
+    __asm__ volatile("mov %0, r7" : "=r"(fp));
+    std::string out;
+    for (int i = 0; i < maxFrames && fp; i++) {
+        uint32_t fr[2] = {0, 0};
+        if (!A6SafeRead((const void*)(uintptr_t)fp, fr, 8)) break;
+        if (fr[0] <= fp || (fr[0] - fp) > 0x40000) break;
+        uint32_t pc = fr[1] & ~1u;
+        if (pc > 0x10000) {
+            out += "\n    ";
+            out += GetModuleInfoForAddress(pc);
+        }
+        fp = fr[0];
+    }
+    return out;
+}
+
+void A6NoteGlThread(const char* who) {
+    static std::set<std::string> seen;
+    char k[96];
+    snprintf(k, sizeof(k), "%s/%lx", who, (unsigned long)(uintptr_t)pthread_self());
+    if (seen.size() < 24 && seen.insert(k).second)
+        LogToJava(std::string("[A6-RTT] PROBE-TID ") + k +
+                  (pthread_equal(pthread_self(), g_iosMainThread) ? " (main)" : " (НЕ main)"));
+}
+
 static void A6ProbeRttContents() {
-    if ((g_a6FrameNo % 120) != 0) { g_a6DrawsInFbo = 0; return; }
-    GLuint tex = g_fboColorTex.count(g_lastActiveFBO) ? g_fboColorTex[g_lastActiveFBO] : 0;
+    GLuint fbo = g_lastActiveFBO;
+    GLuint tex = g_fboColorTex.count(fbo) ? g_fboColorTex[fbo] : 0;
     int w = (tex && g_cpuTexW.count(tex)) ? g_cpuTexW[tex] : 0;
     int h = (tex && g_cpuTexH.count(tex)) ? g_cpuTexH[tex] : 0;
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
     int nonzero = 0, maxA = -1;
-    if (w > 0 && h > 0) {
+    if (w > 0 && h > 0 && (long)w * h <= 512 * 512) {
         std::vector<uint8_t> px((size_t)w * h * 4);
         glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
         for (size_t i = 0; i < px.size(); i += 4) {
@@ -2280,17 +2505,20 @@ static void A6ProbeRttContents() {
         }
     }
     char b[224];
-    snprintf(b, sizeof(b), "[A6-RTT] PROBE-FBO fbo=%u tex=%u %dx%d draws=%d vp=%d,%d,%dx%d nonzeroRGB=%d maxA=%d",
-             (unsigned)g_lastActiveFBO, (unsigned)tex, w, h, g_a6DrawsInFbo,
+    snprintf(b, sizeof(b), " | fbo=%u tex=%u %dx%d vp=%d,%d,%dx%d nz=%d maxA=%d",
+             (unsigned)fbo, (unsigned)tex, w, h,
              (int)vp[0], (int)vp[1], (int)vp[2], (int)vp[3], nonzero, maxA);
-    LogToJava(b);
-    g_a6DrawsInFbo = 0;
+    g_a6RttProbeTail += b;
 }
 
 extern "C" void Stub_glBindFramebuffer(GLenum target, GLuint framebuffer) {
-    if (A6Dbg() && (g_gpuOffloadMask & 64) && g_lastActiveFBO > 1 && framebuffer <= 1) A6ProbeRttContents();
+    if (A6Dbg()) {
+        A6NoteGlThread("bindFB");
+        if ((g_gpuOffloadMask & 64) && g_lastActiveFBO > 1 && framebuffer <= 1 && (g_a6FrameNo % 60) == 0)
+            A6ProbeRttContents();
+    }
     if (A6Dbg() && framebuffer != g_lastActiveFBO) {
-        LogToJava("[A6-RTT] FBO " + std::to_string(g_lastActiveFBO) + " -> " + std::to_string(framebuffer));
+        A6Log("[A6-RTT] FBO " + std::to_string(g_lastActiveFBO) + " -> " + std::to_string(framebuffer));
     }
     g_lastActiveFBO = framebuffer;
     if (g_gpuOffloadMask & 64) {
@@ -2306,7 +2534,7 @@ extern "C" void Stub_glBindRenderbuffer(GLenum target, GLuint renderbuffer) {
 extern "C" void Stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
     if (A6Dbg() && g_a6FboTrace < 120) {
         g_a6FboTrace++;
-        LogToJava("[A6-RTT] glFramebufferRenderbuffer fbo=" + std::to_string(g_lastActiveFBO) +
+        A6Log("[A6-RTT] glFramebufferRenderbuffer fbo=" + std::to_string(g_lastActiveFBO) +
                   " attachment=0x" + std::to_string((unsigned)attachment) + " rb=" + std::to_string(renderbuffer));
     }
     if (g_gpuOffloadMask & 64) {
@@ -2884,9 +3112,13 @@ extern "C" void Stub_glActiveTexture(GLenum texture) {
 extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
     if (target == GL_TEXTURE_2D) {
         if (A6Dbg() && g_texCreatedEmpty.count(texture))
-            LogToJava("[A6-RTT] bind пустой tex=" + std::to_string(texture));
+            A6Log("[A6-RTT] bind пустой tex=" + std::to_string(texture));
         g_cpuActiveTexture = texture;
         g_cpuUnitTexture[g_cpuTextureUnit] = texture;
+        if (A6Dbg() && g_cpuTextureUnit == 1 && texture) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: кто включает лайтмап
+            static bool once = false;
+            if (!once) { once = true; A6Log("[A6-RTT] PROBE-MT tex=" + std::to_string(texture) + A6Backtrace(14)); }
+        }
     }
     if (g_gpuOffloadMask & 8) glBindTexture(target, texture);
 }
@@ -2915,8 +3147,15 @@ static bool MinFilterNeedsMipmaps(GLenum f) {
            f == GL_NEAREST_MIPMAP_LINEAR  || f == GL_LINEAR_MIPMAP_LINEAR;
 }
 
+// Режим повтора каждой текстуры. Растеризатор раньше всегда тайлил, и квады с UV
+// за пределами [0,1] (миникарта гонки) размножались сеткой вместо одной картинки.
+std::map<GLuint, GLenum> g_cpuTexWrapS;
+std::map<GLuint, GLenum> g_cpuTexWrapT;
+
 static bool HandleTexParameter(GLenum target, GLenum pname, GLint param) {
     if (target != GL_TEXTURE_2D) return false;
+    if (pname == GL_TEXTURE_WRAP_S) g_cpuTexWrapS[g_cpuActiveTexture] = (GLenum)param;
+    if (pname == GL_TEXTURE_WRAP_T) g_cpuTexWrapT[g_cpuActiveTexture] = (GLenum)param;
     if (pname == DW_GL_GENERATE_MIPMAP) {
         if (param) g_texAutoMipmap.insert(g_cpuActiveTexture);
         else g_texAutoMipmap.erase(g_cpuActiveTexture);
@@ -2947,6 +3186,14 @@ extern "C" void Stub_glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 }
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: игра держит два EAGLContext, а реальный EGL-контекст у нас один.
+    // Здесь видно, грузит ли она текстуры из потока, которому контекст так и не привязали.
+    if (g_isAsphalt6 && eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        static int noCtx = 0;
+        if (noCtx++ < 20) A6Log("[A6-NOCTX] glTexImage2D без контекста, поток " +
+                                    std::to_string((long)pthread_self()) + " w=" + std::to_string(width) +
+                                    " h=" + std::to_string(height));
+    }
     // Лог с hex-значениями для диагностики
     char logbuf[256];
     snprintf(logbuf, sizeof(logbuf), "[GL-TRACE][GL-TEX] glTexImage2D: tex=%u w=%d h=%d intFmt=0x%X fmt=0x%X type=0x%X pixels=%d",
@@ -3204,7 +3451,7 @@ extern "C" void Stub_glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffs
 
 extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
     if (A6Dbg() && g_texCreatedEmpty.count(g_cpuActiveTexture))
-        LogToJava("[A6-RTT] glTexSubImage2D наполняет пустую tex=" + std::to_string(g_cpuActiveTexture) +
+        A6Log("[A6-RTT] glTexSubImage2D наполняет пустую tex=" + std::to_string(g_cpuActiveTexture) +
                   " " + std::to_string(width) + "x" + std::to_string(height) + " pixels=" + std::to_string(pixels != nullptr));
     if (target == GL_TEXTURE_2D && level == 0 && pixels && g_cpuTextures.count(g_cpuActiveTexture)) {
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
@@ -4508,12 +4755,21 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
+    auto texClamped = [](std::map<GLuint, GLenum>& m, GLuint t) {
+        auto i = m.find(t);
+        return i != m.end() && i->second != GL_REPEAT;
+    };
+    bool texClampS = texClamped(g_cpuTexWrapS, drawTex);
+    bool texClampT = texClamped(g_cpuTexWrapT, drawTex);
+
     GLuint drawTex1 = g_cpuUnitTexture[1];
     const uint32_t* activeTex2Ptr = nullptr;
     int activeTex2W = 0, activeTex2H = 0;
     // В ES 1.1 ступень второго юнита включает glEnable(GL_TEXTURE_2D), а не массив координат:
     // без массива координата берётся постоянной, и COMBINE вида GL_PREVIOUS×GL_PREVIOUS
     // (премультипликация альфы) обязан отработать. Шейдерный путь координаты по-прежнему требует.
+    bool tex2ClampS = texClamped(g_cpuTexWrapS, drawTex1);
+    bool tex2ClampT = texClamped(g_cpuTexWrapT, drawTex1);
     bool useTex2 = useTex && drawTex1 != 0 &&
                    (prog > 0 ? (t2Enabled && drawTex1 != drawTex && g_progSamplesTex1.count(prog) && g_progSamplesTex1[prog])
                              : g_texture2DUnitEnabled[1]);
@@ -4550,6 +4806,30 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                      activeTexPtr ? activeTexPtr[0] : 0u);
             LogToJava(b);
             a6t++;
+        }
+    }
+
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: 2D-слой гонки — режим повтора текстуры и текстурная матрица.
+    if (A6Dbg() && useTex && !g_depthTestEnabled && (g_a6FrameNo % 600) == 0) {
+        static int miniFrame = -1, miniShown = 0;
+        if (miniFrame != g_a6FrameNo) { miniFrame = g_a6FrameNo; miniShown = 0; }
+        if (miniShown++ < 6) {
+            const float* tm = g_textureStacks[0].back().data();
+            float uMin = 1e9f, uMax = -1e9f, vMin = 1e9f, vMax = -1e9f;
+            for (const SWVertex& sv : extractedVerts) {
+                if (sv.u < uMin) uMin = sv.u; if (sv.u > uMax) uMax = sv.u;
+                if (sv.v < vMin) vMin = sv.v; if (sv.v > vMax) vMax = sv.v;
+            }
+            char b[256];
+            snprintf(b, sizeof(b), "[A6-RTT] PROBE-MINI tex=%u %dx%d cnt=%d wrap=%x/%x fbo=%d "
+                                   "tm=[%.3f %.3f %.3f|%.3f %.3f %.3f] uv=[%.2f..%.2f, %.2f..%.2f]",
+                     (unsigned)drawTex, activeTexW, activeTexH, (int)count,
+                     (unsigned)(g_cpuTexWrapS.count(drawTex) ? g_cpuTexWrapS[drawTex] : 0),
+                     (unsigned)(g_cpuTexWrapT.count(drawTex) ? g_cpuTexWrapT[drawTex] : 0),
+                     (int)isFboTexture,
+                     tm[0], tm[4], tm[12], tm[1], tm[5], tm[13],
+                     uMin, uMax, vMin, vMax);
+            LogToJava(b);
         }
     }
 
@@ -4855,6 +5135,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         float fTex2W = (float)activeTex2W;
         float fTex2H = (float)activeTex2H;
         bool opt_isFboTex = isFboTexture;
+        bool opt_clampS = texClampS, opt_clampT = texClampT;
+        bool opt_clamp2S = tex2ClampS, opt_clamp2T = tex2ClampT;
         int texMaskW = activeTexW - 1;
         int texMaskH = activeTexH - 1;
         // Предрасчет: является ли текстура Power-Of-Two (256, 512 и т.д.)
@@ -4938,14 +5220,18 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                         if (isPOT) {
                             // Исправлен wrapping отрицательных UV координат. Без std::floor каст отрицательного
                             // float обрезается к нулю, создавая мертвую зону (от -0.99 до 0.99 = 0), ломающую тайлинг.
-                            tx = (int)(std::floor(u * realW * fTexW)) & texMaskW;
-                            ty = (int)(std::floor(v * realW * fTexH)) & texMaskH;
+                            int ix = (int)std::floor(u * realW * fTexW);
+                            int iy = (int)std::floor(v * realW * fTexH);
+                            tx = opt_clampS ? (ix < 0 ? 0 : (ix > texMaskW ? texMaskW : ix)) : (ix & texMaskW);
+                            ty = opt_clampT ? (iy < 0 ? 0 : (iy > texMaskH ? texMaskH : iy)) : (iy & texMaskH);
                         } else {
                             // Фолбек для non-POT текстур
                             float realU = (u * realW);
                             float realV = (v * realW);
-                            realU = realU - std::floor(realU);
-                            realV = realV - std::floor(realV);
+                            if (opt_clampS) realU = realU < 0.0f ? 0.0f : (realU > 0.999999f ? 0.999999f : realU);
+                            else realU = realU - std::floor(realU);
+                            if (opt_clampT) realV = realV < 0.0f ? 0.0f : (realV > 0.999999f ? 0.999999f : realV);
+                            else realV = realV - std::floor(realV);
                             tx = (int)(realU * fTexW);
                             ty = (int)(realV * fTexH);
                         }
@@ -4969,11 +5255,17 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                         if (opt_tex2) {
                             int t2x, t2y;
                             if (isPOT2) {
-                                t2x = (int)(std::floor(u2 * realW * fTex2W)) & tex2MaskW;
-                                t2y = (int)(std::floor(v2 * realW * fTex2H)) & tex2MaskH;
+                                int i2x = (int)std::floor(u2 * realW * fTex2W);
+                                int i2y = (int)std::floor(v2 * realW * fTex2H);
+                                t2x = opt_clamp2S ? (i2x < 0 ? 0 : (i2x > tex2MaskW ? tex2MaskW : i2x)) : (i2x & tex2MaskW);
+                                t2y = opt_clamp2T ? (i2y < 0 ? 0 : (i2y > tex2MaskH ? tex2MaskH : i2y)) : (i2y & tex2MaskH);
                             } else {
-                                float r2u = u2 * realW; r2u -= std::floor(r2u);
-                                float r2v = v2 * realW; r2v -= std::floor(r2v);
+                                float r2u = u2 * realW;
+                                float r2v = v2 * realW;
+                                if (opt_clamp2S) r2u = r2u < 0.0f ? 0.0f : (r2u > 0.999999f ? 0.999999f : r2u);
+                                else r2u -= std::floor(r2u);
+                                if (opt_clamp2T) r2v = r2v < 0.0f ? 0.0f : (r2v > 0.999999f ? 0.999999f : r2v);
+                                else r2v -= std::floor(r2v);
                                 t2x = (int)(r2u * fTex2W);
                                 t2y = (int)(r2v * fTex2H);
                             }
@@ -5122,6 +5414,7 @@ static GLint g_ffLocConstColor = -1, g_ffLocUseColorArray = -1;
 static GLint g_ffLocAlphaFunc = -1, g_ffLocAlphaRef = -1;
 static GLint g_ffLocRot = -1, g_ffLocPointSize = -1;
 static GLint g_ffLocTex1 = -1, g_ffLocStage1 = -1;
+static GLint g_ffLocTexMat0 = -1, g_ffLocTexMat1 = -1;
 static GLint g_ffLocMv = -1, g_ffLocNrm = -1, g_ffLocLighting = -1, g_ffLocColorMaterial = -1;
 static GLint g_ffLocMatAmb = -1, g_ffLocMatDif = -1, g_ffLocMatSpec = -1, g_ffLocMatEmis = -1;
 static GLint g_ffLocShininess = -1, g_ffLocLmAmb = -1;
@@ -5152,6 +5445,8 @@ static bool EnsureFixedFunctionProgram() {
         "attribute vec3 a_normal;\n"
         "uniform mat4 u_mvp;\n"
         "uniform mat4 u_mv;\n"
+        "uniform mat4 u_texMat0;\n"
+        "uniform mat4 u_texMat1;\n"
         "uniform mat3 u_nrm;\n"
         "uniform vec4 u_constColor;\n"
         "uniform float u_useColorArray;\n"
@@ -5218,8 +5513,8 @@ static bool EnsureFixedFunctionProgram() {
         "  vec4 vcolor = mix(u_constColor, a_color, u_useColorArray);\n"
         "  vec4 eye = u_mv * a_pos;\n"
         "  v_color = (u_lighting > 0.5) ? computeLighting(vcolor, eye) : vcolor;\n"
-        "  v_uv = a_uv;\n"
-        "  v_uv1 = a_uv1;\n"
+        "  v_uv = (u_texMat0 * vec4(a_uv, 0.0, 1.0)).xy;\n"
+        "  v_uv1 = (u_texMat1 * vec4(a_uv1, 0.0, 1.0)).xy;\n"
         "  vec4 p = u_mvp * a_pos;\n"
         "  if (u_rot > 0.5) {\n"
         "    if (u_rot < 1.5) p.xy = vec2(-p.y, p.x);\n"
@@ -5372,6 +5667,8 @@ static bool EnsureFixedFunctionProgram() {
     g_ffLocPointSize     = glGetUniformLocation(prog, "u_pointSize");
     g_ffLocTex1          = glGetUniformLocation(prog, "u_tex1");
     g_ffLocStage1        = glGetUniformLocation(prog, "u_stage1");
+    g_ffLocTexMat0       = glGetUniformLocation(prog, "u_texMat0");
+    g_ffLocTexMat1       = glGetUniformLocation(prog, "u_texMat1");
     g_ffLocMv            = glGetUniformLocation(prog, "u_mv");
     g_ffLocNrm           = glGetUniformLocation(prog, "u_nrm");
     g_ffLocLighting      = glGetUniformLocation(prog, "u_lighting");
@@ -5533,6 +5830,9 @@ static bool ApplyFixedFunctionState(int rotQuarters) {
     MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), mvp);
     glUniformMatrix4fv(g_ffLocMvp, 1, GL_FALSE, mvp);
 
+    glUniformMatrix4fv(g_ffLocTexMat0, 1, GL_FALSE, g_textureStacks[0].back().data());
+    glUniformMatrix4fv(g_ffLocTexMat1, 1, GL_FALSE, g_textureStacks[1].back().data());
+
     bool useTex = g_texture2DUnitEnabled[0] && g_cpuActiveTexture != 0 && g_vertexAttribs[2].enabled;
     glUniform1f(g_ffLocTexEnable, useTex ? 1.0f : 0.0f);
     glUniform1i(g_ffLocTex, 0);
@@ -5634,6 +5934,24 @@ static bool ApplyFixedFunctionState(int rotQuarters) {
     return true;
 }
 
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: кто последним красит центр экранного кадра
+static void A6ProbePixel(const char* what, int count) {
+    if (!A6Dbg() || !(g_gpuOffloadMask & 16) || g_lastActiveFBO > 1 || (g_a6FrameNo % 60) != 0) return;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    uint8_t px[4] = {0, 0, 0, 0};
+    glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    uint32_t cur = ((uint32_t)px[0] << 24) | ((uint32_t)px[1] << 16) | ((uint32_t)px[2] << 8) | px[3];
+    static uint32_t lastPx = 0xdeadbeef;
+    static int lastFrame = -1;
+    if (lastFrame != g_a6FrameNo) { lastFrame = g_a6FrameNo; lastPx = 0xdeadbeef; }
+    if (cur == lastPx) return;
+    lastPx = cur;
+    char b[160];
+    snprintf(b, sizeof(b), "[A6-RTT] PROBE-PX %s tex=%u cnt=%d -> %02x%02x%02x%02x",
+             what, (unsigned)g_cpuUnitTexture[0], count, px[0], px[1], px[2], px[3]);
+    LogToJava(b);
+}
 extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     SyncLog("[GL-TRACE] glDrawArrays(mode=" + std::to_string(mode) + ", first=" + std::to_string(first) + ", count=" + std::to_string(count) + ")");
     g_frameHasDraw = true;
@@ -5656,6 +5974,7 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
             }
         }
         glDrawArrays(mode, first, count);
+        A6ProbePixel("DA", (int)count);
     } else {
         CPUExtractAndDraw(mode, first, count, nullptr, 0);
     }
@@ -5663,9 +5982,193 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
 extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
     SyncLog("[GL-TRACE] glDrawElements(mode=" + std::to_string(mode) + ", count=" + std::to_string(count) + ", type=" + std::to_string(type) + ")");
     g_frameHasDraw = true;
+    if (g_isAsphalt6) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: материал, которого нет на отрисовке, — он вообще создан?
+        static bool reported = false;
+        static time_t first = 0;
+        if (!first) first = time(nullptr);
+        if (!reported && time(nullptr) - first >= 30) {
+            reported = true;
+            A6ScanGuestMemory("Multi_TextureMaps1");
+            A6ScanGuestMemory("Multi_TextureMaps2");
+        }
+    }
     if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: куда и с какой матрицей уходит отрисовка
-        if (g_lastActiveFBO > 1) g_a6DrawsInFbo++;
-        else if (g_cpuUnitTexture[0] != 0 && g_fboTextures.count(g_cpuUnitTexture[0]) > 0) g_a6RttQuadDraws++;
+        A6NoteGlThread("drawEl");
+        g_a6FboDraws[g_lastActiveFBO]++;
+        if (count == 4263 && (g_a6FrameNo % 60) == 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: материал зала
+            char r[760];
+            int n = snprintf(r, sizeof(r), "[A6-RTT] PROBE-ROOM #%d sr=%ld fbo=%u tex=%u blend=%d dm=%d "
+                                           "holder=%08x idx=%d eff=%08x p=%08x/%08x/%08x w=",
+                             g_a6FrameNo, g_ipaShortReadFixups, (unsigned)g_lastActiveFBO, (unsigned)g_cpuUnitTexture[0],
+                             (int)g_blendEnabled, (int)g_depthMask,
+                             (unsigned)g_a6PassHolder, (int)g_a6PassIdx,
+                             (unsigned)g_a6PassEff, (unsigned)g_a6PassFlags[0],
+                             (unsigned)g_a6PassFlags[1], (unsigned)g_a6PassFlags[2]);
+            uint32_t w[16];
+            if (A6SafeRead((const void*)(uintptr_t)g_a6PassEff, w, sizeof(w))) {
+                for (int i = 0; i < 16 && n < 300; i++) n += snprintf(r + n, sizeof(r) - n, "%08x ", (unsigned)w[i]);
+                unsigned char nb[24];
+                if (A6SafeRead((const void*)(uintptr_t)w[2], nb, sizeof(nb))) {
+                    n += snprintf(r + n, sizeof(r) - n, "|@w2=");
+                    for (int i = 0; i < 24 && n < 400; i++)
+                        n += snprintf(r + n, sizeof(r) - n, "%02x", nb[i]);
+                }
+                for (int i = 0; i < 16 && n < 660; i++) {
+                    std::string s = A6SafeStr(w[i]);
+                    if (s.empty()) {
+                        uint32_t q = 0;
+                        if (A6SafeRead((const void*)(uintptr_t)w[i], &q, 4)) s = A6SafeStr(q);
+                        if (!s.empty()) s = "->" + s;
+                    }
+                    if (!s.empty()) n += snprintf(r + n, sizeof(r) - n, "|w%d=%s ", i, s.c_str());
+                }
+            }
+            // Рендерер зала, созданный загрузкой: жив ли он и почему не он на отрисовке.
+            {
+                uint32_t g[6] = {0};
+                char b[220];
+                int bn = snprintf(b, sizeof(b), "[A6-RTT] PROBE-GAR rend=%08x", (unsigned)g_a6GarageRend);
+                if (A6SafeRead((const void*)(uintptr_t)g_a6GarageRend, g, sizeof(g))) {
+                    for (int i = 0; i < 6; i++) bn += snprintf(b + bn, sizeof(b) - bn, " %08x", (unsigned)g[i]);
+                    bn += snprintf(b + bn, sizeof(b) - bn, " имя='%s'", A6SafeStr(g[2]).c_str());
+                } else {
+                    bn += snprintf(b + bn, sizeof(b) - bn, " НЕЧИТАЕМ");
+                }
+                A6Log(std::string(b));
+            }
+            // Материал, отданный драйверу непосредственно перед этой отрисовкой.
+            {
+                uint32_t c[8] = {0};
+                char b[480];
+                int bn = snprintf(b, sizeof(b), "[A6-RTT] PROBE-COMMIT мат='%s' карта=%u очереди def=%u dist=%u trans=%u rend=%08x",
+                                  g_a6LastMatName, (unsigned)g_a6MapInserts,
+                                  (unsigned)g_a6SortDef, (unsigned)g_a6SortDist,
+                                  (unsigned)g_a6SortTrans, (unsigned)g_a6LastCommitRend);
+                if (A6SafeRead((const void*)(uintptr_t)g_a6LastCommitRend, c, sizeof(c))) {
+                    for (int i = 0; i < 8; i++) bn += snprintf(b + bn, sizeof(b) - bn, " %08x", (unsigned)c[i]);
+                    bn += snprintf(b + bn, sizeof(b) - bn, " имя='%s'", A6SafeStr(c[2]).c_str());
+                } else {
+                    bn += snprintf(b + bn, sizeof(b) - bn, " НЕЧИТАЕМ");
+                }
+                bn += snprintf(b + bn, sizeof(b) - bn, " хуки=[%s]", g_a6CommitDiag);
+                A6Log(std::string(b));
+            }
+            A6Log(std::string(r));
+            static bool mapped = false;
+            if (!mapped) {
+                mapped = true;
+                A6Log("[A6-RTT] PROBE-MAP name=" + A6EffName(g_a6PassEff) + " eff=" + A6MapOf(g_a6PassEff));
+                A6Log("[A6-RTT] PROBE-STACK draw" + A6Backtrace(14));
+                std::string ps = "[A6-RTT] PROBE-STACK pass";
+                for (int i = 0; i < 12 && g_a6PassStack[i]; i++)
+                    ps += "\n    " + GetModuleInfoForAddress(g_a6PassStack[i]);
+                A6Log(ps);
+                char h[700];
+                int hn = snprintf(h, sizeof(h), "[A6-RTT] PROBE-HOLDER %08x w=", (unsigned)g_a6PassHolder);
+                uint32_t hw[20];
+                if (A6SafeRead((const void*)(uintptr_t)g_a6PassHolder, hw, sizeof(hw))) {
+                    for (int i = 0; i < 20 && hn < 320; i++) hn += snprintf(h + hn, sizeof(h) - hn, "%08x ", (unsigned)hw[i]);
+                    for (int i = 0; i < 20 && hn < 660; i++) {
+                        std::string s = A6SafeStr(hw[i]);
+                        if (!s.empty()) hn += snprintf(h + hn, sizeof(h) - hn, "|w%d=%s ", i, s.c_str());
+                    }
+                }
+                A6Log(std::string(h));
+            }
+        }
+        if ((g_a6FrameNo % 600) == 0) {
+            float ml[16];
+            MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), ml);
+            char l[200];
+            snprintf(l, sizeof(l), "[A6-RTT] PROBE-LIST #%d fbo=%u tex=%u cnt=%d t=(%.1f,%.1f,%.1f) "
+                                   "sx=%.4f sy=%.4f blend=%d %x/%x depth=%d dm=%d cull=%d col=%.2f,%.2f,%.2f,%.2f",
+                     g_a6FrameNo, (unsigned)g_lastActiveFBO, (unsigned)g_cpuUnitTexture[0], (int)count,
+                     ml[12], ml[13], ml[14], ml[0], ml[5],
+                     (int)g_blendEnabled, (unsigned)g_blendSrc, (unsigned)g_blendDst,
+                     (int)g_depthTestEnabled, (int)g_depthMask, (int)g_cullFaceEnabled,
+                     g_vertexAttribs[1].constantValue[0], g_vertexAttribs[1].constantValue[1],
+                     g_vertexAttribs[1].constantValue[2], g_vertexAttribs[1].constantValue[3]);
+            char gc[160];
+            snprintf(gc, sizeof(gc), " apN=%d apF=%08x eff=%08x idx=%d p=%08x/%08x/%08x",
+                     g_a6ApplyCount, (unsigned)g_a6ApplyFlags,
+                     (unsigned)g_a6PassEff, g_a6PassIdx,
+                     (unsigned)g_a6PassFlags[0], (unsigned)g_a6PassFlags[1], (unsigned)g_a6PassFlags[2]);
+            std::string tail = " blendSet=" + std::to_string(g_a6BlendOn) + "@f" + std::to_string(g_a6BlendFrame) + gc +
+                               " name=" + A6EffName(g_a6PassEff);
+            LogToJava(std::string(l) + tail);
+        }
+        if (g_lastActiveFBO <= 1 && g_cpuUnitTexture[0] != 0 && g_fboTextures.count(g_cpuUnitTexture[0]) > 0) {
+            g_a6RttQuadDraws++;
+            if (g_a6RttQuadDraws == 1 && (g_a6FrameNo % 60) == 0) {
+                float mq[16];
+                MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), mq);
+                GLint vpq[4] = {0, 0, 0, 0};
+                glGetIntegerv(GL_VIEWPORT, vpq);
+                char q[256];
+                snprintf(q, sizeof(q), "[A6-RTT] PROBE-QUAD tex=%u cnt=%d vp=%d,%d,%dx%d "
+                                       "sx=%.3f sy=%.3f t=(%.2f,%.2f,%.2f) blend=%d %x/%x depth=%d/%x dm=%d "
+                                       "at=%d/%.2f cull=%d cm=%d%d%d%d env=%x fmt=%d",
+                         (unsigned)g_cpuUnitTexture[0], (int)count,
+                         (int)vpq[0], (int)vpq[1], (int)vpq[2], (int)vpq[3],
+                         mq[0], mq[5], mq[12], mq[13], mq[14],
+                         (int)g_blendEnabled, (unsigned)g_blendSrc, (unsigned)g_blendDst,
+                         (int)g_depthTestEnabled, (unsigned)g_depthFunc, (int)g_depthMask,
+                         (int)g_alphaTestEnabled, g_alphaRef, (int)g_cullFaceEnabled,
+                         (int)g_colorMask[0], (int)g_colorMask[1], (int)g_colorMask[2], (int)g_colorMask[3],
+                         (unsigned)g_texEnvMode[0],
+                         g_texBaseFormat.count(g_cpuUnitTexture[0]) ? g_texBaseFormat[g_cpuUnitTexture[0]] : -1);
+                LogToJava(q);
+                const float* mv = g_modelViewStack.back().data();
+                const float* pr = g_projectionStack.back().data();
+                char q2[320];
+                snprintf(q2, sizeof(q2), "[A6-RTT] PROBE-QUADM mv=[%.3f %.3f %.3f %.3f|%.3f %.3f %.3f %.3f|"
+                                         "%.3f %.3f %.3f %.3f|%.2f %.2f %.2f %.2f] pr=[%.3f %.3f %.3f %.3f|%.2f %.2f]",
+                         mv[0], mv[1], mv[2], mv[3], mv[4], mv[5], mv[6], mv[7],
+                         mv[8], mv[9], mv[10], mv[11], mv[12], mv[13], mv[14], mv[15],
+                         pr[0], pr[5], pr[10], pr[11], pr[14], pr[15]);
+                LogToJava(q2);
+            }
+        }
+        // ВРЕМЕННАЯ ДИАГНОСТИКА A6: 2D-слой поверх сцены (depth off) — что реально подаётся
+        if (g_lastActiveFBO <= 1 && !g_depthTestEnabled && (g_a6FrameNo % 600) == 0) {
+            static int shown = 0; static int shownFrame = -1;
+            if (shownFrame != g_a6FrameNo) { shownFrame = g_a6FrameNo; shown = 0; }
+            if (shown++ < 6) {
+                auto base = [](const VertexAttribState& a) -> const uint8_t* {
+                    if (!a.enabled || !a.pointer) return nullptr;
+                    if (a.vbo && g_vboShadow.count(a.vbo)) return g_vboShadow[a.vbo].data() + (uintptr_t)a.pointer;
+                    return (const uint8_t*)a.pointer;
+                };
+                const VertexAttribState& pa = g_vertexAttribs[0];
+                const VertexAttribState& ca = g_vertexAttribs[1];
+                const VertexAttribState& ta = g_vertexAttribs[3];
+                const uint8_t* pb = base(pa); const uint8_t* cb = base(ca); const uint8_t* tb = base(ta);
+                char v[320]; int n = 0;
+                n += snprintf(v + n, sizeof(v) - n, "[A6-RTT] PROBE-2D tex=%u en=%d/%d cnt=%d posT=%x/%d uvT=%x/%d colEn=%d colT=%x",
+                              (unsigned)g_cpuUnitTexture[0], (int)g_texture2DUnitEnabled[0], (int)g_texture2DUnitEnabled[1],
+                              (int)count, (unsigned)pa.type, (int)pa.size, (unsigned)ta.type, (int)ta.size,
+                              (int)ca.enabled, (unsigned)ca.type);
+                if (pb && pa.type == GL_FLOAT) {
+                    int st = pa.stride ? pa.stride : (int)(pa.size * sizeof(float));
+                    for (int k = 0; k < 3 && n < (int)sizeof(v) - 40; k++) {
+                        const float* f = (const float*)(pb + k * st);
+                        n += snprintf(v + n, sizeof(v) - n, " p%d=(%.1f,%.1f)", k, f[0], f[1]);
+                    }
+                }
+                if (tb && ta.type == GL_FLOAT) {
+                    int st = ta.stride ? ta.stride : (int)(ta.size * sizeof(float));
+                    const float* f = (const float*)tb;
+                    n += snprintf(v + n, sizeof(v) - n, " uv0=(%.2f,%.2f) uv1=(%.2f,%.2f)",
+                                  f[0], f[1], ((const float*)(tb + st))[0], ((const float*)(tb + st))[1]);
+                }
+                if (cb && ca.type == GL_UNSIGNED_BYTE)
+                    n += snprintf(v + n, sizeof(v) - n, " c0=%08x", *(const uint32_t*)cb);
+                else if (cb && ca.type == GL_FLOAT)
+                    n += snprintf(v + n, sizeof(v) - n, " c0=%.2f,%.2f,%.2f,%.2f",
+                                  ((const float*)cb)[0], ((const float*)cb)[1], ((const float*)cb)[2], ((const float*)cb)[3]);
+                LogToJava(v);
+            }
+        }
         static std::set<uint64_t> seenDE;
         float m[16];
         MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), m);
@@ -5704,6 +6207,7 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
             }
         }
         glDrawElements(mode, count, type, indices);
+        A6ProbePixel("DE", (int)count);
     } else {
         CPUExtractAndDraw(mode, 0, count, indices, type);
     }
@@ -5737,6 +6241,12 @@ static bool IsES1OnlyCap(GLenum cap) {
     }
 }
 extern "C" void MegaDebug_glEnable(GLenum cap) {
+    if (cap == GL_BLEND && A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: кто оставил блендинг включённым
+        g_a6BlendFrame = g_a6FrameNo;
+        g_a6BlendLr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+        g_a6BlendGameLr = A6GameCaller();
+        g_a6BlendOn = 1;
+    }
     if (cap == GL_BLEND) g_blendEnabled = true;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = true;
     else if (cap == GL_TEXTURE_2D) g_texture2DUnitEnabled[g_cpuTextureUnit] = true;
@@ -5750,6 +6260,12 @@ extern "C" void MegaDebug_glEnable(GLenum cap) {
     if ((g_gpuOffloadMask & 32) && !IsES1OnlyCap(cap)) glEnable(cap);
 }
 extern "C" void MegaDebug_glDisable(GLenum cap) {
+    if (cap == GL_BLEND && A6Dbg()) {
+        g_a6BlendFrame = g_a6FrameNo;
+        g_a6BlendLr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+        g_a6BlendGameLr = A6GameCaller();
+        g_a6BlendOn = 0;
+    }
     if (cap == GL_BLEND) g_blendEnabled = false;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = false;
     else if (cap == GL_TEXTURE_2D) g_texture2DUnitEnabled[g_cpuTextureUnit] = false;
@@ -6309,6 +6825,27 @@ extern "C" void* Stub_objc_msgSendSuper2_stret(void* ret_addr, void* super_struc
 // InAppSettingsKit точно так же читает список настроек из .plist. Без разбора
 // этих файлов такие экраны остаются пустыми.
 // ============================================================================
+
+// NSLock игра импортирует и реально им закрывает критические секции; без реализации
+// сообщения lock/unlock уходили в общую заглушку и защита превращалась в гонку.
+// Мьютекс рекурсивный: чужие ошибки блокировки не должны вешать игру.
+static pthread_mutex_t g_hleLockTableMx = PTHREAD_MUTEX_INITIALIZER;
+static std::map<void*, pthread_mutex_t*> g_hleLocks;
+static pthread_mutex_t* HLE_LockFor(void* obj) {
+    pthread_mutex_lock(&g_hleLockTableMx);
+    pthread_mutex_t*& m = g_hleLocks[obj];
+    if (!m) {
+        m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
+        pthread_mutexattr_t at;
+        pthread_mutexattr_init(&at);
+        pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(m, &at);
+        pthread_mutexattr_destroy(&at);
+    }
+    pthread_mutex_t* r = m;
+    pthread_mutex_unlock(&g_hleLockTableMx);
+    return r;
+}
 
 void* HLE_NewInstanceOf(const std::string& clsName) {
     uint32_t* inst = (uint32_t*)calloc(1, 32);
@@ -6944,11 +7481,44 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 FILE* fd = fopen(p, "wb");
                 if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
             }
-            g_a6FrameNo++; LogToJava("[A6-RTT] ===== PRESENT =====");
+            g_a6FrameNo++; A6Log("[A6-RTT] ===== PRESENT =====");
+            if (A6_FPS_CAP > 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: проверка гипотезы «гонка от высокого fps»
+                static uint64_t nextNs = 0;
+                const uint64_t step = 1000000000ull / A6_FPS_CAP;
+                struct timespec tsNow; clock_gettime(CLOCK_MONOTONIC, &tsNow);
+                uint64_t now = (uint64_t)tsNow.tv_sec * 1000000000ull + tsNow.tv_nsec;
+                if (nextNs > now && nextNs - now < step * 4) usleep((useconds_t)((nextNs - now) / 1000));
+                nextNs = (nextNs > now ? nextNs : now) + step;
+            }
+            if ((g_gpuOffloadMask & 16) && (g_a6FrameNo % 60) == 0) {
+                // ВРЕМЕННАЯ ДИАГНОСТИКА A6: что лежит в центре кадра в момент презента
+                GLint fb = 0, vp[4] = {0, 0, 0, 0};
+                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+                glGetIntegerv(GL_VIEWPORT, vp);
+                uint8_t px[4] = {0, 0, 0, 0};
+                glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                char b[160];
+                snprintf(b, sizeof(b), "[A6-RTT] PROBE-PRESENT fb=%d gameFbo=%u vp=%d,%d,%dx%d c=%02x%02x%02x%02x",
+                         (int)fb, (unsigned)g_lastActiveFBO, (int)vp[0], (int)vp[1], (int)vp[2], (int)vp[3],
+                         px[0], px[1], px[2], px[3]);
+                LogToJava(b);
+            }
             {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: доходит ли RTT-текстура до экрана
-                if ((g_a6FrameNo % 120) == 0)
-                    LogToJava("[A6-RTT] PROBE-FRAME rttQuads=" + std::to_string(g_a6RttQuadDraws));
+                std::string sig;
+                for (std::map<GLuint, int>::iterator it = g_a6FboDraws.begin(); it != g_a6FboDraws.end(); ++it)
+                    sig += "f" + std::to_string(it->first) + ":" + std::to_string(it->second) + " ";
+                sig += "rttQuads=" + std::to_string(g_a6RttQuadDraws);
+                static std::string lastSig;
+                static int lastLogFrame = -1000;
+                if ((sig != lastSig && g_a6FrameNo - lastLogFrame >= 10) ||
+                    g_a6FrameNo - lastLogFrame >= 300 || !g_a6RttProbeTail.empty()) {
+                    A6Log("[A6-RTT] PROBE-FRAME #" + std::to_string(g_a6FrameNo) + " " + sig + g_a6RttProbeTail);
+                    lastSig = sig;
+                    lastLogFrame = g_a6FrameNo;
+                }
+                g_a6FboDraws.clear();
                 g_a6RttQuadDraws = 0;
+                g_a6RttProbeTail.clear();
             }
         }
         if (a6_cnt < 12 || a6_cnt % 200 == 0) {
@@ -7758,7 +8328,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (A6Dbg()) {   // кто крутит контекст, если кадров нет
                 static int sc_cnt = 0;
                 if (sc_cnt < 5 || sc_cnt % 200 == 0)
-                    LogToJava("[A6-DIAG] setCurrentContext #" + std::to_string(sc_cnt) +
+                    A6Log("[A6-DIAG] setCurrentContext #" + std::to_string(sc_cnt) +
                               " caller " + GetModuleInfoForAddress((uintptr_t)__builtin_return_address(1)));
                 sc_cnt++;
             }
@@ -7931,7 +8501,16 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     // Ветка 2: Экземпляры HLE
     else if (isa > 0x1000 && ((uint32_t*)isa)[0] == 0xDEADBEEF) {
         HLEClass* hleCls = (HLEClass*)isa; std::string clsName = hleCls->className;
-        
+
+        if (clsName == "NSLock" || clsName == "NSRecursiveLock" || clsName == "NSConditionLock") {
+            if (strcmp(op, "init") == 0) { HLE_LockFor(self); return (uint64_t)(uintptr_t)self; }
+            if (strcmp(op, "lock") == 0) { pthread_mutex_lock(HLE_LockFor(self)); return 0; }
+            if (strcmp(op, "unlock") == 0) { pthread_mutex_unlock(HLE_LockFor(self)); return 0; }
+            if (strcmp(op, "tryLock") == 0) return pthread_mutex_trylock(HLE_LockFor(self)) == 0 ? 1 : 0;
+            if (strcmp(op, "lockBeforeDate:") == 0) { pthread_mutex_lock(HLE_LockFor(self)); return 1; }
+            if (strcmp(op, "dealloc") == 0 || strcmp(op, "release") == 0) return 0;
+        }
+
         // --- Обработка цветов для UI Элементов ---
         // (Перемещено в глобальный перехват)
         // -----------------------------------------
@@ -9446,6 +10025,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (strcmp(op, "removeObjectForKey:") == 0) { void* keyPtr = GetNSValuePtr(a1); g_dictionaries[self].erase(keyPtr); return 0; }
         if (strcmp(op, "objectForKey:") == 0) { void* keyPtr = GetNSValuePtr(a1); return (uint64_t)(uintptr_t)g_dictionaries[self][keyPtr]; }
 
+        if (clsName == "FakeUITouch" && A6Dbg()) A6Log(std::string("[A6-TOUCH] touch sel=") + op);
         if ((strcmp(op, "locationInView:") == 0 || strcmp(op, "previousLocationInView:") == 0) && clsName == "FakeUITouch") {
             FakeUITouch* t = (FakeUITouch*)self;
             float rx, ry; MapTouchToGameView(t->x, t->y, rx, ry);
@@ -12027,9 +12607,28 @@ extern "C" long wrap_sysconf(int name) {
 // Подменять сигнатуру можно только через CAS: иначе два потока, одновременно взявшие
 // статический мьютекс, успевают оба «проинициализировать» его, и повторный
 // pthread_mutex_init сбрасывает уже захваченный замок в свободное состояние.
+// У Darwin четыре статических инициализатора, и у каждого своя сигнатура. Обычный превращается
+// в нули (это и есть готовый bionic-мьютекс), остальным нужен настоящий init с атрибутом —
+// его делаем под глобальным замком, иначе второй поток успеет увидеть полуготовую структуру.
+static pthread_mutex_t g_iosMutexInitLock = PTHREAD_MUTEX_INITIALIZER;
 static inline void IosMutexEnsureInit(void* mutex) {
     uint32_t expected = 0x32AAABA7;
-    __atomic_compare_exchange_n((uint32_t*)mutex, &expected, 0u, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (__atomic_compare_exchange_n((uint32_t*)mutex, &expected, 0u, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;
+    if (expected != 0x32AAABA1 && expected != 0x32AAABA2 && expected != 0x32AAABA3) return;
+    pthread_mutex_lock(&g_iosMutexInitLock);
+    uint32_t sig = __atomic_load_n((uint32_t*)mutex, __ATOMIC_SEQ_CST);
+    if (sig == 0x32AAABA1 || sig == 0x32AAABA2 || sig == 0x32AAABA3) {
+        pthread_mutexattr_t at;
+        pthread_mutexattr_init(&at);
+        pthread_mutexattr_settype(&at, sig == 0x32AAABA2 ? PTHREAD_MUTEX_RECURSIVE
+                                     : sig == 0x32AAABA1 ? PTHREAD_MUTEX_ERRORCHECK
+                                                         : PTHREAD_MUTEX_NORMAL);
+        memset(mutex, 0, 40);
+        pthread_mutex_init((pthread_mutex_t*)mutex, &at);
+        pthread_mutexattr_destroy(&at);
+    }
+    pthread_mutex_unlock(&g_iosMutexInitLock);
 }
 static inline void IosCondEnsureInit(void* cond) {
     uint32_t expected = 0x3CB0B1BB;
@@ -12127,14 +12726,32 @@ extern "C" int wrap_sysctl(int* name, unsigned int namelen, void* oldp, size_t* 
     return -1;
 }
 
+// Байт 0 — «готово», байт 1 — «кто-то уже строит». Без второго байта и замка два потока
+// одновременно возвращали 1 и конструировали один и тот же статик дважды: второй объект
+// ложился поверх первого, и содержимое таблицы зависело от того, кто успел раньше.
+static pthread_mutex_t g_guardLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_guardCond = PTHREAD_COND_INITIALIZER;
+
 extern "C" int wrap___cxa_guard_acquire(int32_t* guard) {
     char* g = (char*)guard;
-    if (g[0] == 0) return 1; // 1 = Требуется инициализация
-    return 0; // 0 = Уже инициализировано
+    if (__atomic_load_n(g, __ATOMIC_ACQUIRE)) return 0;
+    pthread_mutex_lock(&g_guardLock);
+    int need = 0;
+    for (;;) {
+        if (g[0]) break;
+        if (!g[1]) { g[1] = 1; need = 1; break; }
+        pthread_cond_wait(&g_guardCond, &g_guardLock);
+    }
+    pthread_mutex_unlock(&g_guardLock);
+    return need;
 }
 extern "C" void wrap___cxa_guard_release(int32_t* guard) {
     char* g = (char*)guard;
-    g[0] = 1; // Помечаем как инициализированное
+    pthread_mutex_lock(&g_guardLock);
+    g[1] = 0;
+    __atomic_store_n(g, (char)1, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&g_guardCond);
+    pthread_mutex_unlock(&g_guardLock);
 }
 
 extern "C" void wrap__Unwind_SjLj_Resume(void* context) {
@@ -13153,10 +13770,26 @@ pthread_mutex_t g_timeMutex = PTHREAD_MUTEX_INITIALIZER;
 uint64_t g_fake_time_ns = 0;
 int g_timer_log_count = 0;
 
+// Часы должны зависеть только от реального времени. Прежняя реализация прибавляла
+// 16.6 мс на КАЖДОЕ обращение, поэтому темп игрового времени определялся числом
+// вызовов: аудио-поток и служебный код враппера (таймстемпы AudioUnit) дёргают этот
+// же счётчик, и dt между кадрами игры прыгал случайным образом.
+// Отсчёт ведётся от первого вызова, чтобы значения оставались небольшими: игры
+// переводят их во float, а монотонное время с момента загрузки телефона теряет
+// в такой арифметике точность.
+static uint64_t MonotonicNowNs() {
+    static uint64_t s_base = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    if (s_base == 0) s_base = now;
+    return now - s_base;
+}
+
 extern "C" uint64_t Stub_mach_absolute_time() {
     pthread_mutex_lock(&g_timeMutex);
-    g_fake_time_ns += 16666666ULL; // Искусственный шаг ~16.6мс (60 FPS)
-    uint64_t res = g_fake_time_ns;
+    uint64_t res = MonotonicNowNs();
+    g_fake_time_ns = res;
     if (g_timer_log_count++ < 30) LogToJava("C-API-TRACE: Stub_mach_absolute_time() -> " + std::to_string(res));
     pthread_mutex_unlock(&g_timeMutex);
     return res;
@@ -13168,7 +13801,7 @@ extern "C" int Stub_mach_timebase_info(uint32_t* info) {
 }
 extern "C" double Stub_CFAbsoluteTimeGetCurrent() {
     pthread_mutex_lock(&g_timeMutex);
-    g_fake_time_ns += 16666666ULL;
+    g_fake_time_ns = MonotonicNowNs();
     double res = (double)g_fake_time_ns / 1000000000.0;
     if (g_timer_log_count++ < 30) LogToJava("C-API-TRACE: Stub_CFAbsoluteTimeGetCurrent() -> " + std::to_string(res));
     pthread_mutex_unlock(&g_timeMutex);
@@ -13467,16 +14100,29 @@ extern "C" void wrap_dispatch_sync(void* queue, void* block) {
     }
 }
 
+// Предикат обязан переключаться в «готово» только после блока, а опоздавшие потоки —
+// ждать: иначе второй поток идёт дальше по недоинициализированному объекту.
+// 0 — не начат, 1 — выполняется, 2 — готов.
 extern "C" void wrap_dispatch_once(uint32_t* predicate, void* block) {
     if (!predicate || !block) return;
-    if (*predicate == 0) {
-        *predicate = 1;
-        LogToJava("C-API-HLE: Выполняем dispatch_once блок...");
-        uint32_t* b = (uint32_t*)block;
-        typedef void (*BlockInvoke)(void*);
-        BlockInvoke invoke = (BlockInvoke)b[3];
-        if (invoke) invoke(block); 
-    }
+    static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+    static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_lock(&mx);
+    while (*predicate == 1) pthread_cond_wait(&cv, &mx);
+    if (*predicate != 0) { pthread_mutex_unlock(&mx); return; }
+    *predicate = 1;
+    pthread_mutex_unlock(&mx);
+
+    LogToJava("C-API-HLE: Выполняем dispatch_once блок...");
+    uint32_t* b = (uint32_t*)block;
+    typedef void (*BlockInvoke)(void*);
+    BlockInvoke invoke = (BlockInvoke)b[3];
+    if (invoke) invoke(block);
+
+    pthread_mutex_lock(&mx);
+    *predicate = 2;
+    pthread_cond_broadcast(&cv);
+    pthread_mutex_unlock(&mx);
 }
 
 std::string DumpHexToString(const char* data, int max_len) {
@@ -13523,11 +14169,26 @@ static inline void _setInWrapMalloc(bool v) {
     pthread_setspecific(g_wrapMallocKey, v ? (void*)1 : nullptr);
 }
 
+// ВРЕМЕННЫЙ ОПЫТ A6: 0 — как есть, 1 — залить мусором, 2 — занулить.
+#define A6_MALLOC_FILL 0
 extern "C" void* wrap_malloc(size_t size) {
-    if (_inWrapMalloc()) return malloc(size);
+    if (_inWrapMalloc()) {
+        void* r = malloc(size);
+#if A6_MALLOC_FILL == 1
+        if (r) memset(r, 0xA5, size);
+#elif A6_MALLOC_FILL == 2
+        if (r) memset(r, 0, size);
+#endif
+        return r;
+    }
     _setInWrapMalloc(true);
     uint32_t lr = (uint32_t)__builtin_return_address(0);
     void* res = malloc(size);
+#if A6_MALLOC_FILL == 1
+    if (res) memset(res, 0xA5, size);
+#elif A6_MALLOC_FILL == 2
+    if (res) memset(res, 0, size);
+#endif
     if (size > 5 * 1024 * 1024) {
         LogToJava("C-API-DEBUG: [malloc] АНОМАЛИЯ! Игра просит " + std::to_string(size) + " байт! Caller: " + GetModuleInfoForAddress(lr));
     } else if (g_machOLoaded) {
@@ -15081,6 +15742,80 @@ extern "C" int wrap_close(int fd) {
     return close(fd);
 }
 
+// @synchronized игры компилируется в objc_sync_enter/exit. Без них обе функции уходили в
+// динамическую заглушку с возвратом нуля, то есть блок @synchronized не блокировал ничего.
+// Рекурсивный мьютекс на объект: ровно та семантика, что у рантайма Apple.
+// qsort из bionic держит рабочие указатели в r9 и между ними зовёт компаратор игры, а тот по
+// правилам iOS считает r9 мусорным и затирает. Своя пирамидальная сортировка собирается с
+// -ffixed-r9 и потому переживает такой вызов; заодно она без рекурсии и без худшего случая.
+static void QSortSwapBytes(uint8_t* a, uint8_t* b, size_t n) {
+    for (size_t i = 0; i < n; i++) { uint8_t t = a[i]; a[i] = b[i]; b[i] = t; }
+}
+
+extern "C" void wrap_qsort(void* base, size_t nmemb, size_t size,
+                           int (*cmp)(const void*, const void*)) {
+    if (A6Dbg()) {
+        static int calls = 0;
+        if (calls++ < 8) A6Log("[A6-QSORT] n=" + std::to_string(nmemb) + " size=" + std::to_string(size));
+    }
+    if (!base || !cmp || size == 0 || nmemb < 2) return;
+    uint8_t* a = (uint8_t*)base;
+    for (size_t start = nmemb / 2; start-- > 0; ) {
+        size_t root = start;
+        for (;;) {
+            size_t child = root * 2 + 1;
+            if (child >= nmemb) break;
+            if (child + 1 < nmemb && cmp(a + child * size, a + (child + 1) * size) < 0) child++;
+            if (cmp(a + root * size, a + child * size) >= 0) break;
+            QSortSwapBytes(a + root * size, a + child * size, size);
+            root = child;
+        }
+    }
+    for (size_t end = nmemb - 1; end > 0; end--) {
+        QSortSwapBytes(a, a + end * size, size);
+        size_t root = 0;
+        for (;;) {
+            size_t child = root * 2 + 1;
+            if (child >= end) break;
+            if (child + 1 < end && cmp(a + child * size, a + (child + 1) * size) < 0) child++;
+            if (cmp(a + root * size, a + child * size) >= 0) break;
+            QSortSwapBytes(a + root * size, a + child * size, size);
+            root = child;
+        }
+    }
+}
+
+static std::mutex g_objcSyncTableLock;
+static std::map<void*, pthread_mutex_t*> g_objcSyncTable;
+
+static pthread_mutex_t* ObjcSyncSlot(void* obj, bool create) {
+    std::lock_guard<std::mutex> g(g_objcSyncTableLock);
+    auto it = g_objcSyncTable.find(obj);
+    if (it != g_objcSyncTable.end()) return it->second;
+    if (!create) return nullptr;
+    pthread_mutex_t* m = new pthread_mutex_t;
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(m, &a);
+    pthread_mutexattr_destroy(&a);
+    g_objcSyncTable[obj] = m;
+    return m;
+}
+
+extern "C" int wrap_objc_sync_enter(void* obj) {
+    if (!obj) return 0;
+    pthread_mutex_lock(ObjcSyncSlot(obj, true));
+    return 0;
+}
+
+extern "C" int wrap_objc_sync_exit(void* obj) {
+    if (!obj) return 0;
+    pthread_mutex_t* m = ObjcSyncSlot(obj, false);
+    if (m) pthread_mutex_unlock(m);
+    return 0;
+}
+
 #define STB_S(n) {"_" #n, (void*)Stub_##n}
 #define STB_W(n) {"_" #n, (void*)wrap_##n}
 #define STB_D(n) {"_" #n, (void*)n}
@@ -15121,6 +15856,7 @@ extern "C" void* wrap_property_copyAttributeList(void*, uint32_t*);
 extern "C" void* wrap_sel_getUid(const char*);
 
 std::map<std::string, void*> g_hleStubs = {
+    STB_W(objc_sync_enter), STB_W(objc_sync_exit),
     STB_S(UIApplicationMain), STB_S(objc_msgSend), STB_S(objc_msgSendSuper2), STB_S(objc_msgSend_stret), STB_S(objc_msgSendSuper2_stret), STB_S(objc_setProperty), STB_S(NSLog), STB_W(NSLogv),
     STB_S(exit), {"___stack_chk_guard", (void*)&hle_stack_chk_guard_val}, {"___stack_chk_fail", (void*)Stub_exit}, STB_D(sinf), STB_D(cosf), STB_D(tanf), 
     {"_NSDefaultRunLoopMode", (void*)&hle_NSDefaultRunLoopMode_ptr}, {"_kEAGLColorFormatRGBA8", (void*)&hle_kEAGLColorFormatRGBA8_ptr}, {"_kEAGLColorFormatRGB565", (void*)&hle_kEAGLColorFormatRGB565_ptr}, {"_kEAGLDrawablePropertyColorFormat", (void*)&hle_kEAGLDrawablePropertyColorFormat_ptr}, {"_kEAGLDrawablePropertyRetainedBacking", (void*)&hle_kEAGLDrawablePropertyRetainedBacking_ptr}, 
@@ -15146,7 +15882,7 @@ std::map<std::string, void*> g_hleStubs = {
     {"_ldexp", (void*)(double(*)(double, int))ldexp}, STB_D(ldexpf), {"_modf", (void*)(double(*)(double, double*))modf}, STB_D(modff),
     STB_W(pthread_create), STB_D(pthread_join), STB_W(pthread_mutex_init), STB_W(pthread_mutex_lock), STB_W(pthread_mutex_unlock), STB_W(pthread_mutex_destroy), STB_W(pthread_cond_init), STB_W(pthread_cond_wait), STB_W(pthread_cond_signal), STB_W(pthread_cond_broadcast), STB_W(pthread_cond_destroy), STB_D(pthread_self), STB_D(pthread_equal), STB_W(pthread_once), STB_D(pthread_attr_init), STB_D(pthread_attr_destroy), STB_D(pthread_attr_setdetachstate), STB_W(pthread_attr_setstacksize), STB_W(pthread_mach_thread_np), STB_W(thread_get_state), STB_W(thread_set_state), STB_D(pthread_key_create), STB_D(pthread_key_delete), STB_D(pthread_setspecific), STB_D(pthread_getspecific),
     STB_D(sqlite3_open), STB_D(sqlite3_close), STB_D(sqlite3_prepare_v2), STB_D(sqlite3_step), STB_D(sqlite3_finalize), STB_D(sqlite3_bind_int), STB_D(sqlite3_bind_text), STB_D(sqlite3_free_table), STB_D(sqlite3_get_table),
-    STB_W(sel_getName), STB_W(sel_registerName), STB_W(setjmp), STB_D(qsort), STB_W(readdir), {"_realpath$DARWIN_EXTSN", (void*)wrap_realpath_darwin}, STB_D(sleep), STB_D(sched_yield),
+    STB_W(sel_getName), STB_W(sel_registerName), STB_W(setjmp), STB_W(qsort), STB_W(readdir), {"_realpath$DARWIN_EXTSN", (void*)wrap_realpath_darwin}, STB_D(sleep), STB_D(sched_yield),
     STB_W(socket), STB_W(send), STB_W(sendto), STB_W(recv), STB_W(recvfrom), STB_W(setsockopt),
     
     STB_D(acosf), STB_D(asinf), STB_D(strlcpy), STB_D(strtok), STB_D(strerror_r), STB_D(wcscmp), STB_D(wcscpy), STB_D(wcslen), {"_wcschr", (void*)(wchar_t*(*)(wchar_t*, wchar_t))wcschr}, STB_D(wcsncpy), STB_D(wcstombs), STB_D(wcstol), STB_W(memset_pattern16),
@@ -15590,6 +16326,608 @@ static void A6InstallPushShaderHook(uint32_t slide) {
     fn[1] = (uint32_t)(uintptr_t)&A6_PushShader;
     __builtin___clear_cache((char*)fn, (char*)fn + 8);
     A6Log("[A6-DIAG] хук на 0x5a34e0 установлен");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x58e0bc — detail::apply<SRenderState, CCommonGLDriver>(state&, drv*).
+// Решение «блендить или нет» и «писать ли глубину» движок принимает из слова 0 состояния:
+// бит 20 — блендинг, бит 29 — запись глубины. Считаем вызовы, чтобы отличить
+// «apply не позвали, осталось чужое состояние» от «apply позвали с другими флагами».
+static void (*g_a6ApplyOrig)(const void*, void*) = nullptr;
+extern "C" void A6_ApplyRenderState(const void* state, void* drv) {
+    uint32_t flags = *(const uint32_t*)state;
+    uint32_t addr = (uint32_t)(uintptr_t)state;
+    g_a6ApplyFlags = flags;
+    g_a6ApplyState = addr;
+    g_a6ApplyLr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    g_a6ApplyCount++;
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: не переписывает ли кто-то сам материал
+        static uint32_t keys[1024] = {0};
+        static uint32_t vals[1024];
+        static int changes = 0;
+        unsigned h = (addr >> 4) & 1023;
+        for (int i = 0; i < 8; i++) {
+            unsigned s = (h + i) & 1023;
+            if (keys[s] == 0) { keys[s] = addr; vals[s] = flags; break; }
+            if (keys[s] == addr) {
+                if (vals[s] != flags) {
+                    if (changes++ < 60) {
+                        char b[160];
+                        snprintf(b, sizeof(b), "[A6-RTT] PROBE-STATE %08x флаги %08x -> %08x кадр %d из %06x",
+                                 addr, vals[s], flags, g_a6FrameNo,
+                                 (unsigned)(uintptr_t)__builtin_return_address(0));
+                        LogToJava(b);
+                    }
+                    vals[s] = flags;
+                }
+                break;
+            }
+        }
+    }
+    g_a6ApplyOrig(state, drv);
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x58ee20 — функция драйвера, которая выбирает проход материала
+// и зовёт apply: состояние берётся как effect->[0x18] + [drv+0xd4]*12 + 8. Нужно понять,
+// отличается ли в сломанном кадре эффект или номер прохода.
+static void (*g_a6SetPassOrig)(void*) = nullptr;
+extern "C" void A6_SetPass(void* drv) {
+    const uint8_t* d = (const uint8_t*)drv;
+    uint32_t holder = *(const uint32_t*)(d + 0xc8);
+    g_a6PassHolder = holder;
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: чей код привязал материал к этой отрисовке
+        uint32_t fp = 0, sp = 0;
+        __asm__ volatile("mov %0, r7" : "=r"(fp));
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        memset(g_a6PassStack, 0, sizeof(g_a6PassStack));
+        for (int i = 0; i < 12; i++) {
+            if (fp < sp || (fp - sp) > 0x100000 || (fp & 3)) break;
+            const uint32_t* fr = (const uint32_t*)(uintptr_t)fp;
+            g_a6PassStack[i] = fr[1] & ~1u;
+            fp = fr[0];
+        }
+    }
+    g_a6PassIdx = d[0xd4];
+    g_a6PassEff = (holder > 0x1000) ? *(const uint32_t*)(uintptr_t)(holder + 4) : 0;
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: имя материала последней отрисовки — им опознаётся, чем на самом
+    // деле закрашен зал, когда его собственный материал до отрисовки не доходит.
+    if (A6Dbg() && g_a6PassEff > 0x1000) {
+        static uint32_t lastEff = 0;
+        if (g_a6PassEff != lastEff) {
+            lastEff = g_a6PassEff;
+            snprintf(g_a6LastMatName, sizeof(g_a6LastMatName), "%s", A6EffName(g_a6PassEff).c_str());
+        }
+    }
+    if (A6Dbg() && g_a6PassEff > 0x1000) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: порядок появления материалов
+        static std::set<uint32_t> seenEff;
+        static int effNo = 0;
+        if (effNo < 400 && seenEff.insert(g_a6PassEff).second) {
+            char b[160];
+            snprintf(b, sizeof(b), "[A6-RTT] PROBE-EFF #%d кадр %d eff=%08x holder=%08x hw0=%08x ",
+                     effNo++, g_a6FrameNo, (unsigned)g_a6PassEff, (unsigned)holder,
+                     (unsigned)*(const uint32_t*)(uintptr_t)holder);
+            LogToJava(b + A6EffName(g_a6PassEff));
+        }
+    }
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: по строке на каждый новый материал и не больше 60 строк за
+    // прогон. Построчный лог отрисовок сам сдвигает тайминги, а этот признак — нет.
+    if (g_isAsphalt6 && g_a6PassEff > 0x1000) {
+        static std::set<uint32_t> liteEff;
+        static std::set<std::string> liteNames;
+        static int liteCount = 0;
+        if (liteCount < 60 && liteEff.insert(g_a6PassEff).second) {
+            std::string n = A6EffName(g_a6PassEff);
+            if (liteNames.insert(n).second) {
+                liteCount++;
+                // Первый материал заодно опознаём по vtable: нужен класс, чей конструктор искать.
+                std::string extra;
+                if (liteCount == 1) {
+                    uint32_t w[8] = {0};
+                    if (A6SafeRead((const void*)(uintptr_t)g_a6PassEff, w, sizeof(w))) {
+                        char b[160];
+                        snprintf(b, sizeof(b), " eff=%08x vt=%08x w1=%08x w2=%08x w3=%08x",
+                                 (unsigned)g_a6PassEff, w[0], w[1], w[2], w[3]);
+                        extra = b + std::string(" | ") + GetModuleInfoForAddress(w[0]);
+                    }
+                }
+                char ep[48];
+                uint32_t hid = 0;
+                A6SafeRead((const void*)(uintptr_t)holder, &hid, 4);
+                snprintf(ep, sizeof(ep), " eff=%08x id=%u", (unsigned)g_a6PassEff, (unsigned)hid);
+                A6Log("[A6-MAT] " + n + ep + extra);
+            }
+        }
+    }
+    g_a6PassFlags[0] = g_a6PassFlags[1] = g_a6PassFlags[2] = 0;
+    if (g_a6PassEff > 0x1000) {
+        // Только через A6SafeRead: у части материалов гонки этих полей нет,
+        // и прямое разыменование роняло игру на загрузке трассы.
+        uint32_t arr = 0;
+        A6SafeRead((const void*)(uintptr_t)(g_a6PassEff + 0x18), &arr, 4);
+        if (arr > 0x1000) {
+            for (int i = 0; i < 3; i++) {
+                uint32_t st = 0;
+                A6SafeRead((const void*)(uintptr_t)(arr + i * 12 + 8), &st, 4);
+                if (st > 0x1000) A6SafeRead((const void*)(uintptr_t)st, &g_a6PassFlags[i], 4);
+            }
+        }
+    }
+    g_a6SetPassOrig(drv);
+}
+
+static void A6InstallSetPassHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x58ee20 + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c || fn[2] != 0xe52d8004) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x58ee28 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6SetPassOrig = (void (*)(void*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_SetPass;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-DIAG] хук на 0x58ee20 установлен");
+}
+
+static void A6InstallApplyHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x58e0bc + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;                               // ldr pc, [pc, #-4]
+    tr[3] = 0x58e0c4 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6ApplyOrig = (void (*)(const void*, void*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_ApplyRenderState;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-DIAG] хук на 0x58e0bc установлен");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x56fa98 — регистрация материала по имени в SIDedCollection
+// менеджера рендереров. Возврат pair<iterator,bool> идёт через скрытый r0, this в r1, сама
+// пара имя/идентификатор в r2. Идентификатор короткий, и в holder на отрисовке лежит именно он.
+static void* (*g_a6RegOrig)(void*, void*, const void*) = nullptr;
+extern "C" void* A6_RegisterMatName(void* sret, void* self, const void* v) {
+    void* r = g_a6RegOrig(sret, self, v);
+    if (A6Dbg()) {
+        uint32_t w[3] = {0};
+        A6SafeRead(v, w, sizeof(w));
+        uint8_t ok = 0;
+        A6SafeRead((const uint8_t*)sret + 4, &ok, 1);
+        char b[48];
+        snprintf(b, sizeof(b), "%08x/%08x", (unsigned)w[1], (unsigned)w[2]);
+        A6Log("[A6-REG] " + std::string(b) + (ok ? " новый " : " ЗАНЯТО ") + A6SafeStr(w[0]));
+    }
+    return r;
+}
+
+static void A6InstallRegisterHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x56fa98 + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x56faa0 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6RegOrig = (void* (*)(void*, void*, const void*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_RegisterMatName;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-DIAG] хук на 0x56fa98 установлен");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x43d04c — collada::createMaterialRendererForProfile<SProfileGLESTraits>.
+// Возвращает intrusive_ptr через скрытый первый аргумент, имя материала лежит в r3, список
+// эффектов приходит стеком. Пустой список — единственный ранний выход с нулём, и по этой
+// строке видно, дошло ли дело до создания рендерера для потерянного материала зала.
+static void* (*g_a6MatRendOrig)(void*, void*, void*, const char*, void*, void*, void*) = nullptr;
+uint32_t g_a6GarageRend = 0;   // рендерер материала зала, каким его отдала загрузка
+uint32_t g_a6GarageFile = 0;   // rend+4 — общий для всех материалов одного collada-файла
+extern "C" void* A6_CreateMatRenderer(void* ret, void* db, void* drv, const char* name,
+                                      void* effList, void* rootNode, void* factory) {
+    void* r = g_a6MatRendOrig(ret, db, drv, name, effList, rootNode, factory);
+    if (A6Dbg()) {
+        uint32_t head = 0;
+        bool emptyList = A6SafeRead(effList, &head, 4) && head == (uint32_t)(uintptr_t)effList;
+        uint32_t made = 0;
+        A6SafeRead(ret, &made, 4);
+        // Адрес рендерера печатаем нарочно: если движок сортирует список отрисовки по
+        // указателям, порядок материалов меняется от запуска к запуску вместе с адресами.
+        if (made && name && strstr(name, "Multi_TextureMaps1")) {
+            g_a6GarageRend = made;
+            A6SafeRead((const void*)(uintptr_t)(made + 4), &g_a6GarageFile, 4);
+        }
+        char p[24];
+        snprintf(p, sizeof(p), " rend=%08x", (unsigned)made);
+        A6Log("[A6-MATR] " + std::string(name ? name : "<null>") +
+              " список=" + (emptyList ? "пуст" : "есть") +
+              " результат=" + (made ? "есть" : "НЕТ") + p);
+    }
+    return r;
+}
+
+static void A6InstallMatRendererHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x43d04c + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x43d054 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6MatRendOrig = (void* (*)(void*, void*, void*, const char*, void*, void*, void*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_CreateMatRenderer;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-DIAG] хук на 0x43d04c установлен");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x58e3a8 — CCommonGLDriver<COpenGLESDriver>::commitMaterialRenderer.
+// Именно сюда движок отдаёт рендерер материала перед отрисовкой, так что последний вызов
+// перед glDrawElements зала показывает, какой материал реально выбран для этой партии.
+// Драйверов в движке два — фиксированный (0x58e3a8) и программируемый (0x57aeec), какой из
+// них живой, заранее не видно, поэтому перехватываем оба и запоминаем, кто сработал.
+static void (*g_a6CommitOrigFixed)(void*, void*) = nullptr;
+static void (*g_a6CommitOrigProg)(void*, void*) = nullptr;
+uint32_t g_a6LastCommitRend = 0;
+uint32_t g_a6CommitKind = 0;
+char g_a6CommitDiag[192] = "";   // хуки ставятся раньше, чем открывается лог, поэтому статус копим сюда
+extern "C" void A6_CommitMatRendererFixed(void* drv, void* rend) {
+    g_a6LastCommitRend = (uint32_t)(uintptr_t)rend;
+    g_a6CommitKind = 1;
+    g_a6CommitOrigFixed(drv, rend);
+}
+extern "C" void A6_CommitMatRendererProg(void* drv, void* rend) {
+    g_a6LastCommitRend = (uint32_t)(uintptr_t)rend;
+    g_a6CommitKind = 2;
+    g_a6CommitOrigProg(drv, rend);
+}
+
+static void A6InstallCommitHook(uint32_t slide, uint32_t addr, void* hook,
+                                void (**orig)(void*, void*)) {
+    uint32_t* fn = (uint32_t*)(addr + slide);
+    size_t dl = strlen(g_a6CommitDiag);
+    if (fn[0] != 0xe92d40b0 || fn[1] != 0xe28d7008) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl,
+                 " 0x%x:пролог=%08x/%08x", (unsigned)addr, (unsigned)fn[0], (unsigned)fn[1]);
+        return;
+    }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = addr + 8 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    *orig = (void (*)(void*, void*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " 0x%x:mprotect", (unsigned)addr);
+        return;
+    }
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)hook;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " 0x%x:ок", (unsigned)addr);
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0xe867c / 0xe2770 / 0xe9200 — heapsort очередей CSceneManager
+// (обычная, по дальности, прозрачная). Размеры очередей на кадре показывают, в какую корзину
+// попал зал: в сломанном заходе у отрисовки зала стоит blend=1, как у прозрачных.
+uint32_t g_a6SortDef = 0, g_a6SortDist = 0, g_a6SortTrans = 0;
+static void (*g_a6SortDefOrig)(void*, int) = nullptr;
+static void (*g_a6SortDistOrig)(void*, int) = nullptr;
+static void (*g_a6SortTransOrig)(void*, int) = nullptr;
+extern "C" void A6_SortDef(void* a, int n) {
+    g_a6SortDef = (uint32_t)n;
+    if (A6Dbg()) {
+        static int dumps = 0;
+        static int lastN = -1;
+        if (n != lastN && n > 0 && n < 64 && dumps < 6) {
+            lastN = n;
+            dumps++;
+            std::string s = "[A6-QDEF] n=" + std::to_string(n);
+            for (int i = 0; i < n && i < 16; i++) {
+                uint32_t w[4] = {0};
+                if (!A6SafeRead((const uint8_t*)a + i * 16, w, sizeof(w))) break;
+                char b[64];
+                snprintf(b, sizeof(b), " | %08x %08x %08x %08x", w[0], w[1], w[2], w[3]);
+                s += b;
+            }
+            A6Log(s);
+        }
+    }
+    g_a6SortDefOrig(a, n);
+}
+extern "C" void A6_SortDist(void* a, int n) { g_a6SortDist = (uint32_t)n; g_a6SortDistOrig(a, n); }
+extern "C" void A6_SortTrans(void* a, int n) { g_a6SortTrans = (uint32_t)n; g_a6SortTransOrig(a, n); }
+
+static void A6InstallSortHook(uint32_t slide, uint32_t addr, void* hook, void (**orig)(void*, int)) {
+    uint32_t* fn = (uint32_t*)(addr + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = addr + 8 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    *orig = (void (*)(void*, int))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)hook;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x56fa98 — вставка имя→id в карту коллекции материальных
+// рендереров. Здесь видно, какой именно id получает материал зала, а сравнение id
+// между заходами показывает, сдвинулась ли нумерация из-за переиспользования.
+uint32_t g_a6MapInserts = 0;
+static void A6LogMapInsert(const void* v, const void* caller) {
+    g_a6MapInserts++;
+    if (!A6Dbg()) return;
+    uint32_t w[2] = {0};
+    if (!A6SafeRead(v, w, sizeof(w))) return;
+    std::string name = A6SafeStr(w[0]);
+    char b[64];
+    snprintf(b, sizeof(b), " id=%u от 0x%x #%u", (unsigned)w[1],
+             (unsigned)((uintptr_t)caller - g_appSlide), (unsigned)g_a6MapInserts);
+    A6Log("[A6-MAP2] " + name + b);
+}
+
+static void* (*g_a6MapIns1Orig)(void*, void*, const void*) = nullptr;
+extern "C" void* A6_MapInsert1(void* sret, void* self, const void* v) {
+    A6LogMapInsert(v, __builtin_return_address(0));
+    return g_a6MapIns1Orig(sret, self, v);
+}
+
+static void A6InstallMapInsertHook(uint32_t slide, uint32_t addr, void* hook,
+                                   void* (**orig)(void*, void*, const void*)) {
+    uint32_t* fn = (uint32_t*)(addr + slide);
+    size_t dl = strlen(g_a6CommitDiag);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " map0x%x:пролог=%08x/%08x",
+                 (unsigned)addr, (unsigned)fn[0], (unsigned)fn[1]);
+        return;
+    }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = addr + 8 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    *orig = (void* (*)(void*, void*, const void*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " map0x%x:mprotect", (unsigned)addr);
+        return;
+    }
+    snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " map0x%x:ок", (unsigned)addr);
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)hook;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x56f210 — core::detail::createUniqueName<SHasMaterialRendererName>.
+// Если имя уже занято, движок дописывает к нему буквы A..Z и регистрирует рендерер под
+// ДРУГИМ именем. Меш потом ищет материал по исходному имени, не находит и получает
+// безымянный эффект — ровно то, что видно в сломанном заходе в зал.
+static char* (*g_a6UniqOrig)(const char*, unsigned, void*) = nullptr;
+extern "C" char* A6_UniqueName(const char* name, unsigned maxLen, void* pred) {
+    char* out = g_a6UniqOrig(name, maxLen, pred);
+    if (A6Dbg() && name && out && strcmp(name, out) != 0)
+        A6Log("[A6-UNIQ] '" + std::string(name) + "' занято, зарегистрировано как '" +
+              std::string(out) + "' лимит=" + std::to_string(maxLen));
+    return out;
+}
+
+static void A6InstallUniqueNameHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x56f210 + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x56f218 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6UniqOrig = (char* (*)(const char*, unsigned, void*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_UniqueName;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-DIAG] хук на 0x56f210 установлен");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0xdcbd0 — CustomSceneManager::registerNodeForRendering, единственная
+// дверь, через которую узел попадает в списки отрисовки. Ключ «vtable узла + проход + материал»
+// не зависит от адресов кучи, поэтому сигнатуру состава кадра можно сравнивать между заходами.
+// Отбираем только материалы того же collada-файла, что и зал (совпадает rend+4), — их
+// десятки, а не сотни тысяч, поэтому зонд не сдвигает тайминги, как сводка по всему кадру.
+static uint32_t (*g_a6RegNodeOrig)(void*, void*, uint32_t*, void*, uint32_t, void*, int) = nullptr;
+
+extern "C" uint32_t A6_RegNodeForRendering(void* self, void* node, uint32_t* mat, void* p3,
+                                           uint32_t pass, void* pos, int order) {
+    uint32_t r = g_a6RegNodeOrig(self, node, mat, p3, pass, pos, order);
+    if (!A6Dbg() || !g_a6GarageFile) return r;
+    uint32_t m = (mat && (uintptr_t)mat > 0x1000) ? *mat : 0;
+    if (m <= 0x1000) return r;
+    uint32_t rend = *(const uint32_t*)(uintptr_t)(m + 4);
+    if (rend <= 0x1000 || *(const uint32_t*)(uintptr_t)(rend + 4) != g_a6GarageFile) return r;
+
+    // Ключ — рендерер, а не узел: узлов зала сотни, а рендереров единицы, и новый
+    // рендерер (подменённый компиляцией батчей) должен попасть в лог в любом кадре.
+    static std::set<uint32_t> seen;
+    static int lines = 0;
+    if (lines >= 80 || !seen.insert(rend).second) return r;
+    lines++;
+    uint32_t st0 = 0, arr = *(const uint32_t*)(uintptr_t)(rend + 0x18);
+    if (arr > 0x1000) {
+        uint32_t s = *(const uint32_t*)(uintptr_t)(arr + 8);
+        if (s > 0x1000) st0 = *(const uint32_t*)(uintptr_t)s;
+    }
+    char b[224];
+    snprintf(b, sizeof(b), "[A6-RTT] PROBE-REGN кадр %d узел=%08x vt=%08x проход=%u мат=%08x id=%u "
+                           "rend=%08x проходов=%u флаги=%08x ok=%u ",
+             g_a6FrameNo, (unsigned)(uintptr_t)node,
+             (unsigned)((uintptr_t)node > 0x1000 ? *(const uint32_t*)node : 0), (unsigned)pass,
+             (unsigned)m, (unsigned)*(const uint32_t*)(uintptr_t)m, (unsigned)rend,
+             (unsigned)*(const uint8_t*)(uintptr_t)(rend + 0x10), (unsigned)st0,
+             (unsigned)r);
+    A6Log(b + A6EffName(rend));
+    return r;
+}
+
+static void A6InstallRegNodeHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0xdcbd0 + slide);
+    size_t dl = strlen(g_a6CommitDiag);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " regn:пролог=%08x", (unsigned)fn[0]);
+        return;
+    }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0xdcbd8 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6RegNodeOrig = (uint32_t (*)(void*, void*, uint32_t*, void*, uint32_t, void*, int))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " regn:mprotect");
+        return;
+    }
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_RegNodeForRendering;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " regn:ок");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x53433c — glitch::core::randomString. Компиляция батчей даёт
+// каждому собранному рендереру случайное имя; если строка выходит пустой, все они сходятся
+// в один рендерер, и состояние последнего достаётся всем остальным.
+static void* (*g_a6RandStrOrig)(void*, int) = nullptr;
+
+extern "C" void* A6_RandomString(void* ret, int n) {
+    void* r = g_a6RandStrOrig(ret, n);
+    if (A6Dbg()) {
+        static int lines = 0;
+        if (lines < 12) {
+            lines++;
+            const char* s = ret ? *(const char* const*)ret : nullptr;
+            uint32_t len = 0;
+            if (s) len = ((const uint32_t*)s)[-3];   // LibStdStringRep::length
+            char b[160];
+            snprintf(b, sizeof(b), "[A6-RTT] PROBE-RAND n=%d длина=%u строка='%.40s'",
+                     n, (unsigned)len, s ? s : "<null>");
+            A6Log(b);
+        }
+    }
+    return r;
+}
+
+static void A6InstallRandStrHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x53433c + slide);
+    size_t dl = strlen(g_a6CommitDiag);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " rand:пролог=%08x", (unsigned)fn[0]);
+        return;
+    }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x534344 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6RandStrOrig = (void* (*)(void*, int))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " rand:mprotect");
+        return;
+    }
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_RandomString;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " rand:ок");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x501170 — CBatchMesh::setBuffer, единственное место, где материал
+// батча заменяется после загрузки. Компиляция батчей (0x53478c) зовёт её с новым однопроходным
+// рендерером, состояние которого взято из дерева компиляции, а не из исходного материала.
+static void (*g_a6SetBufferOrig)(void*, uint32_t, void*, uint32_t*) = nullptr;
+
+extern "C" void A6_SetBuffer(void* mesh, uint32_t idx, void* buf, uint32_t* matp) {
+    if (A6Dbg()) {
+        static int lines = 0;
+        uint32_t m = (matp && (uintptr_t)matp > 0x1000) ? *matp : 0;
+        uint32_t rend = (m > 0x1000) ? *(const uint32_t*)(uintptr_t)(m + 4) : 0;
+        if (lines < 60) {
+            lines++;
+            uint32_t st0 = 0, tech = 0;
+            if (rend > 0x1000) {
+                tech = *(const uint8_t*)(uintptr_t)(rend + 0x10);
+                uint32_t arr = *(const uint32_t*)(uintptr_t)(rend + 0x18);
+                if (arr > 0x1000) {
+                    uint32_t ps = *(const uint32_t*)(uintptr_t)(arr + 8);
+                    if (ps > 0x1000) st0 = *(const uint32_t*)(uintptr_t)ps;
+                }
+            }
+            char b[224];
+            snprintf(b, sizeof(b), "[A6-RTT] PROBE-SETBUF кадр %d меш=%08x батч=%u мат=%08x rend=%08x "
+                                   "техник=%u флаги=%08x ",
+                     g_a6FrameNo, (unsigned)(uintptr_t)mesh, (unsigned)idx, (unsigned)m,
+                     (unsigned)rend, (unsigned)tech, (unsigned)st0);
+            A6Log(b + (rend > 0x1000 ? A6EffName(rend) : std::string("-")));
+        }
+    }
+    g_a6SetBufferOrig(mesh, idx, buf, matp);
+}
+
+static void A6InstallSetBufferHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x501170 + slide);
+    size_t dl = strlen(g_a6CommitDiag);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " setbuf:пролог=%08x", (unsigned)fn[0]);
+        return;
+    }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x501178 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6SetBufferOrig = (void (*)(void*, uint32_t, void*, uint32_t*))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " setbuf:mprotect");
+        return;
+    }
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_SetBuffer;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " setbuf:ок");
 }
 
 static void A6InstallStageHook(uint32_t slide) {
@@ -16313,6 +17651,20 @@ void LoadMachO(const std::string& bundlePath) {
     if (g_isAsphalt6) {
         A6InstallStageHook(g_appSlide);
         A6InstallPushShaderHook(g_appSlide);
+        A6InstallApplyHook(g_appSlide);
+        A6InstallSetPassHook(g_appSlide);
+        A6InstallMatRendererHook(g_appSlide);
+        A6InstallUniqueNameHook(g_appSlide);
+        A6InstallRegisterHook(g_appSlide);
+        A6InstallCommitHook(g_appSlide, 0x58e3a8, (void*)&A6_CommitMatRendererFixed, &g_a6CommitOrigFixed);
+        A6InstallCommitHook(g_appSlide, 0x57aeec, (void*)&A6_CommitMatRendererProg, &g_a6CommitOrigProg);
+        A6InstallMapInsertHook(g_appSlide, 0x56fa98, (void*)&A6_MapInsert1, &g_a6MapIns1Orig);
+        A6InstallSortHook(g_appSlide, 0xe867c, (void*)&A6_SortDef, &g_a6SortDefOrig);
+        A6InstallSortHook(g_appSlide, 0xe2770, (void*)&A6_SortDist, &g_a6SortDistOrig);
+        A6InstallSortHook(g_appSlide, 0xe9200, (void*)&A6_SortTrans, &g_a6SortTransOrig);
+        A6InstallRegNodeHook(g_appSlide);
+        A6InstallSetBufferHook(g_appSlide);
+        A6InstallRandStrHook(g_appSlide);
     }
 
     // --- ПАРСИНГ __objc_classlist (Восстановление скрытых/stripped классов) ---
@@ -16428,6 +17780,8 @@ void* NativeExecutionThread(void* arg) {
 }
 
 // --- ЗАГЛУШКИ C++ ABI ДЛЯ STD::STRING (libstdc++ GCC 4.2) ---
+// ВРЕМЕННЫЙ ОПЫТ A6: 1 — не отдавать буфер строки обратно в кучу.
+#define A6_NO_STRING_FREE 0
 struct LibStdStringRep {
     size_t length;
     size_t capacity;
@@ -16456,36 +17810,40 @@ extern "C" void* wrap_cxx_string_default_ctor(void* this_ptr) {
 }
 
 extern "C" void* wrap_cxx_string_ctor(void* this_ptr, void* str_ptr, void* alloc) {
-    uint32_t lr = (uint32_t)__builtin_return_address(0);
     const char* input_str = (const char*)str_ptr;
-    std::string preview = input_str ? std::string(input_str, strnlen(input_str, 256)) : "null";
-    std::string hex = input_str ? DumpHexToString(input_str, strnlen(input_str, 32)) : "null";
-    LogToJava("C-API-DEBUG: [cxx_string_ctor] this=" + std::to_string((uintptr_t)this_ptr) + " string(const char*). Preview: [" + preview + "] HEX: (" + hex + ") Caller: " + GetModuleInfoForAddress(lr));
-    
+    // Превью, hex и поиск символа по адресу стоят дороже самой строки, а вызывается это на
+    // каждое её создание. Без проверки категории игра платила за лог, который потом выбрасывается.
+    if (LogCatOn(LOG_OTHER)) {
+        uint32_t lr = (uint32_t)__builtin_return_address(0);
+        std::string preview = input_str ? std::string(input_str, strnlen(input_str, 256)) : "null";
+        std::string hex = input_str ? DumpHexToString(input_str, strnlen(input_str, 32)) : "null";
+        LogToJava("C-API-DEBUG: [cxx_string_ctor] this=" + std::to_string((uintptr_t)this_ptr) + " string(const char*). Preview: [" + preview + "] HEX: (" + hex + ") Caller: " + GetModuleInfoForAddress(lr));
+    }
+
     char** str_obj = (char**)this_ptr;
     *str_obj = AllocateLibStdString(input_str);
     return this_ptr;
 }
 extern "C" void* wrap_cxx_string_copy_ctor(void* this_ptr, void* other_ptr) {
-    uint32_t lr = (uint32_t)__builtin_return_address(0);
     char** src = (char**)other_ptr;
-    std::string preview = "null";
-    int ref_count = -999;
-    size_t len = 0;
-    
-    if (src && *src) {
-        char* c_str = *src;
-        LibStdStringRep* rep = (LibStdStringRep*)c_str - 1;
-        ref_count = rep->refcount;
-        len = rep->length;
-        
-        // Читаем безопасно, чтобы не улететь в Segfault если len = 4 миллиарда
-        size_t safe_len = (len < 256) ? len : 256;
-        preview = std::string(c_str, strnlen(c_str, safe_len));
+    if (LogCatOn(LOG_OTHER)) {
+        uint32_t lr = (uint32_t)__builtin_return_address(0);
+        std::string preview = "null";
+        int ref_count = -999;
+        size_t len = 0;
+        if (src && *src) {
+            char* c_str = *src;
+            LibStdStringRep* rep = (LibStdStringRep*)c_str - 1;
+            ref_count = rep->refcount;
+            len = rep->length;
+            // Читаем безопасно, чтобы не улететь в Segfault если len = 4 миллиарда
+            size_t safe_len = (len < 256) ? len : 256;
+            preview = std::string(c_str, strnlen(c_str, safe_len));
+        }
+        std::string hex = (src && *src) ? DumpHexToString(*src, 32) : "null";
+        LogToJava("C-API-DEBUG: [cxx_string_copy_ctor] this=" + std::to_string((uintptr_t)this_ptr) + " src=" + std::to_string((uintptr_t)other_ptr) + " len=" + std::to_string(len) + " ref=" + std::to_string(ref_count) + " Preview: [" + preview + "] HEX: (" + hex + ") Caller: " + GetModuleInfoForAddress(lr));
     }
-    std::string hex = (src && *src) ? DumpHexToString(*src, 32) : "null";
-    LogToJava("C-API-DEBUG: [cxx_string_copy_ctor] this=" + std::to_string((uintptr_t)this_ptr) + " src=" + std::to_string((uintptr_t)other_ptr) + " len=" + std::to_string(len) + " ref=" + std::to_string(ref_count) + " Preview: [" + preview + "] HEX: (" + hex + ") Caller: " + GetModuleInfoForAddress(lr));
-    
+
     char** dest = (char**)this_ptr;
     if (src && *src) {
         LibStdStringRep* rep = (LibStdStringRep*)(*src) - 1;
@@ -16505,7 +17863,7 @@ extern "C" void* wrap_cxx_string_dtor(void* this_ptr) {
         // Защита от мусора
         if (rep->length < 0x100000 && rep->refcount > 0 && rep->refcount < 100000) {
             if (__sync_sub_and_fetch(&rep->refcount, 1) <= 0) {
-                free(rep);
+                if (!A6_NO_STRING_FREE) free(rep);
             }
         }
     }
@@ -18191,22 +19549,42 @@ extern "C" int wrap_lcxx_deflateInit_(z_streamp strm, int level, const char* ver
 extern "C" void* wrap_lcxx_new_nothrow(size_t n, const void* nt) { (void)nt; return wrap_malloc(n); }
 extern "C" int wrap_lcxx_cxa_atexit(void* f, void* arg, void* dso) { (void)f; (void)arg; (void)dso; return 0; }
 extern "C" void wrap_lcxx_cxa_end_catch() {}
-extern "C" void wrap_lcxx_cxa_guard_abort(void* g) { if (g) *(uint32_t*)g = 0; }
+extern "C" void wrap_lcxx_cxa_guard_abort(void* guard) {
+    if (!guard) return;
+    char* g = (char*)guard;
+    pthread_mutex_lock(&g_guardLock);
+    g[0] = 0;
+    g[1] = 0;
+    pthread_cond_broadcast(&g_guardCond);
+    pthread_mutex_unlock(&g_guardLock);
+}
 extern "C" void wrap_lcxx_objc_end_catch() {}
 
 // --- HLE std::stringstream ---
 // В libstdc++ гостя istream-подобъект лежит по базе объекта, ostream-подобъект по базе+8,
 // а basic_ios гость находит сам: читает смещение виртуальной базы из [vptr-12]. Поэтому
 // конструктор подставляет свою таблицу, у которой там ноль — тогда basic_ios* == база.
-struct HleStringStream { std::string data; size_t pos = 0; bool fail = false; };
+struct HleStringStream {
+    std::string data; size_t pos = 0; bool fail = false;
+    // Буфер, видимый гостю через указатели stringbuf. Своя mmap-область, а не куча:
+    // так промах мимо живого объекта не рвёт заголовок чанка чужой аллокации.
+    char* gbuf = nullptr;
+    size_t gcap = 0;
+    size_t gsynced = 0;      // сколько байт data уже скопировано в gbuf
+    ~HleStringStream() { if (gbuf) munmap(gbuf, gcap); }
+};
 static uint32_t g_hleStreamVTable[8] = {0};
 static std::map<void*, HleStringStream*> g_hleStreams;
 
-static HleStringStream* HleFindStream(void* p) {
+static void HleStreamPull(HleStringStream* st, void* obj);
+static HleStringStream* HleFindStream(void* p, void** key = nullptr) {
     if (!p) return nullptr;
     auto it = g_hleStreams.find(p);
     if (it == g_hleStreams.end()) it = g_hleStreams.find((void*)((char*)p - 8));
-    return it == g_hleStreams.end() ? nullptr : it->second;
+    if (it == g_hleStreams.end()) return nullptr;
+    if (key) *key = it->first;
+    HleStreamPull(it->second, it->first);
+    return it->second;
 }
 static HleStringStream* HleStreamCreate(void* this_ptr) {
     auto it = g_hleStreams.find(this_ptr);
@@ -18224,9 +19602,55 @@ static void HleStreamAttach(void* obj) {
     if (it != g_hleStreams.end()) { delete it->second; g_hleStreams.erase(it); }
     g_hleStreams[obj] = new HleStringStream();
 }
+// Часть гостевого кода читает содержимое ostringstream не через str(), а прямо по
+// указателям stringbuf: конструктор потока компилятор игры заинлайнил. Держим эти
+// указатели в согласии с нашим буфером, иначе str() отдаёт пустую строку.
+// obj берётся из текущего вызова, а не из записи в карте: потоки игра заводит на стеке,
+// дтор у них заинлайнен, поэтому записи в карте переживают сам объект. Запись по такому
+// адресу попадала уже в чужую память — стек умершего треда переиспользуется под кучу.
+static void HleStreamSyncGuest(HleStringStream* st, void* obj) {
+    if (!st || !obj) return;
+    uint32_t* f = (uint32_t*)obj;
+    bool mine = st->gbuf && f[5] == (uint32_t)(uintptr_t)st->gbuf;
+    bool pristine = (f[2] | f[3] | f[4] | f[5] | f[6] | f[7]) == 0;
+    if (!mine && !pristine) return;   // чужой поток с настоящим буфером не трогаем
+    size_t len = st->data.size();
+    if (len + 2 > st->gcap) {
+        size_t cap = ((len + 2) * 2 + 4095) & ~(size_t)4095;
+        void* nb = mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (nb == MAP_FAILED) return;
+        if (st->gbuf) { memcpy(nb, st->gbuf, st->gsynced); munmap(st->gbuf, st->gcap); }
+        st->gbuf = (char*)nb; st->gcap = cap;
+    }
+    if (st->gsynced > len) st->gsynced = len;
+    if (len > st->gsynced) memcpy(st->gbuf + st->gsynced, st->data.data() + st->gsynced, len - st->gsynced);
+    st->gsynced = len;
+    st->gbuf[len] = 0;
+    f[4] = 0;                                        // egptr: str() возьмёт (pbase,pptr)
+    f[5] = (uint32_t)(uintptr_t)st->gbuf;                  // pbase
+    f[6] = (uint32_t)(uintptr_t)(st->gbuf + len);          // pptr
+    // epptr — реальный конец нашей области, а не pptr. Если оставить put-область «полной»,
+    // гость на каждый символ уходит в свой basic_stringbuf::overflow, а тот копирует
+    // epptr-pbase байт из своей (пустой) строки и переставляет pptr по нашей длине —
+    // отсюда и рвался заголовок чанка. С запасом места гость пишет прямо к нам.
+    f[7] = (uint32_t)(uintptr_t)(st->gbuf + st->gcap - 1); // epptr
+}
+// Гость мог дописать символы в нашу область сам, минуя перехваты: забираем их в data.
+static void HleStreamPull(HleStringStream* st, void* obj) {
+    if (!st || !obj || !st->gbuf) return;
+    uint32_t* f = (uint32_t*)obj;
+    if (f[5] != (uint32_t)(uintptr_t)st->gbuf) return;
+    char* p = (char*)(uintptr_t)f[6];
+    char* from = st->gbuf + st->gsynced;
+    if (p > from && p <= st->gbuf + st->gcap - 1) {
+        st->data.append(from, (size_t)(p - from));
+        st->gsynced = (size_t)(p - st->gbuf);
+    }
+}
 static void* HleStreamAppend(void* this_ptr, const char* s, size_t n) {
-    HleStringStream* st = HleFindStream(this_ptr);
-    if (st && s) st->data.append(s, n);
+    void* key = nullptr;
+    HleStringStream* st = HleFindStream(this_ptr, &key);
+    if (st && s) { st->data.append(s, n); HleStreamSyncGuest(st, key); }
     return this_ptr;
 }
 
@@ -18248,7 +19672,7 @@ extern "C" void* wrap_cxx_stringstream_ctor(void* this_ptr, void* str_ptr, int m
     if (!this_ptr) return this_ptr;
     HleStringStream* st = HleStreamCreate(this_ptr);
     char** s = (char**)str_ptr;
-    if (s && *s) st->data.assign(*s, ((LibStdStringRep*)(*s) - 1)->length);
+    if (s && *s) { st->data.assign(*s, ((LibStdStringRep*)(*s) - 1)->length); HleStreamSyncGuest(st, this_ptr); }
     return this_ptr;
 }
 extern "C" void* wrap_cxx_stringstream_ctor_mode(void* this_ptr, int mode) {
@@ -18358,14 +19782,24 @@ extern "C" void* wrap_cxx_ostream_insert_double(void* this_ptr, double d) { if (
 extern "C" void* wrap_cxx_ostream_insert_float(void* this_ptr, float f) { std::string s = std::to_string(f); return HleStreamAppend(this_ptr, s.data(), s.size()); }
 extern "C" void* wrap_cxx_ostream_insert_short(void* this_ptr, short v) { std::string s = std::to_string((int)v); return HleStreamAppend(this_ptr, s.data(), s.size()); }
 extern "C" void* wrap_cxx_ostream_insert_longlong(void* this_ptr, long long v) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { LogToJava("GAME-COUT: " + std::to_string(v)); } std::string s = std::to_string(v); return HleStreamAppend(this_ptr, s.data(), s.size()); }
-extern "C" void* wrap_cxx_ostream_insert_char_ptr(void* this_ptr, const char* s, int n) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { std::string str(s?s:"", n); LogToJava("GAME-COUT: " + str); } return HleStreamAppend(this_ptr, s, n < 0 ? 0 : (size_t)n); }
+extern "C" void* wrap_cxx_ostream_insert_char_ptr(void* this_ptr, const char* s, int n) { if (this_ptr == &wrap_ZSt4cout || this_ptr == &wrap_ZSt4cerr) { std::string str(s?s:"", n); LogToJava("GAME-COUT: " + str); }
+    return HleStreamAppend(this_ptr, s, n < 0 ? 0 : (size_t)n); }
 extern "C" void* wrap_cxx_basic_stringbuf_str(void* ret_ptr, void* this_ptr) {
     wrap_cxx_string_default_ctor(ret_ptr);
     HleStringStream* st = HleFindStream(this_ptr);
     if (st && !st->data.empty()) wrap_cxx_string_assign_ptr_len(ret_ptr, st->data.data(), st->data.size());
     return ret_ptr;
 }
-extern "C" void* wrap_cxx_string_Rep_S_create(size_t cap, size_t old_cap, void* alloc) { LibStdStringRep* rep = (LibStdStringRep*)malloc(sizeof(LibStdStringRep) + cap + 1); rep->length=0; rep->capacity=cap; rep->refcount=1; ((char*)(rep+1))[0]=0; return (char*)(rep+1); }
+// Отдаём именно _Rep*, а не указатель на данные: гость после вызова сам считает
+// данные как _Rep+1 и пишет туда строку. С указателем на данные всё съезжало на
+// 12 байт — запись уходила за конец блока, а free приходил на его середину.
+extern "C" void* wrap_cxx_string_Rep_S_create(size_t cap, size_t old_cap, void* alloc) {
+    if (cap > old_cap && cap < 2 * old_cap) cap = 2 * old_cap;
+    LibStdStringRep* rep = (LibStdStringRep*)malloc(sizeof(LibStdStringRep) + cap + 1);
+    rep->length = 0; rep->capacity = cap; rep->refcount = 0;   // 0 — единственная ссылка
+    ((char*)(rep + 1))[0] = 0;
+    return rep;
+}
 
 // --- ТРЕЙСИНГ C-API ФУНКЦИЙ (СЕТЬ И ВРЕМЯ) ---
 extern bool g_machOLoaded;
@@ -18524,6 +19958,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     g_workDir = wd;
     snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%sdamn32_log.txt", wd);
     env->ReleaseStringUTFChars(workDir, wd);
+    g_a6DebugEnabled = (access((g_workDir + "a6debug").c_str(), F_OK) == 0);
     // Java удаляет damn32_log.txt перед запуском — старый fd указывал бы на удалённый инод.
     ResetLogFile();
 
@@ -18756,7 +20191,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     else if (isMove) method = "touchesMoved:withEvent:";
     else if (isCancel) method = "touchesCancelled:withEvent:";
 
-    if (method) { 
+    if (method) {
+        if (A6Dbg()) {
+            bool hasImp = FindMethodIMP(((uint32_t*)activeView)[0], method) != 0;
+            A6Log(std::string("[A6-TOUCH] -> ") + method + " view=" + GetObjCClassName(activeView) +
+                  " ptr=" + std::to_string((uintptr_t)activeView) + " imp=" + std::to_string((int)hasImp) +
+                  " queue=" + std::to_string(g_mainQueue.size()));
+        }
         pthread_mutex_lock(&g_mainQueueMutex);
         // Отправляем тач во View
         g_mainQueue.push_back({activeView, method, (void*)set, nullptr, true});

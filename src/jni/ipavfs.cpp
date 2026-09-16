@@ -471,10 +471,28 @@ int IpaOpenFd(const std::string& vpath) {
     return fd;
 }
 
+// read()/pread() на обычном файле отдают меньше запрошенного только на EOF. Внутри же
+// архива данные приходят порциями: inflate отдаёт столько, сколько влезло в окно, а
+// pread64 по FUSE тоже вправе вернуть хвост короче. Игра рассчитывает на семантику
+// обычного файла, поэтому дочитываем до конца сами.
+long g_ipaShortReadFixups = 0;
+
+static ssize_t StreamReadFull(IpaStream* s, void* buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = StreamRead(s, (char*)buf + done, n - done);
+        if (r < 0) return done ? (ssize_t)done : -1;
+        if (r == 0) break;
+        done += (size_t)r;
+        if (done < n) g_ipaShortReadFixups++;
+    }
+    return (ssize_t)done;
+}
+
 ssize_t IpaRead(int fd, void* buf, size_t n) {
     IpaStream* s = VfdGet(fd);
     if (!s) { errno = EBADF; return -1; }
-    return StreamRead(s, buf, n);
+    return StreamReadFull(s, buf, n);
 }
 
 ssize_t IpaPread(int fd, void* buf, size_t n, off64_t off) {
@@ -482,7 +500,7 @@ ssize_t IpaPread(int fd, void* buf, size_t n, off64_t off) {
     if (!s) { errno = EBADF; return -1; }
     uint64_t save = s->pos;
     s->pos = (uint64_t)off;
-    ssize_t r = StreamRead(s, buf, n);
+    ssize_t r = StreamReadFull(s, buf, n);
     s->pos = save;
     return r;
 }
