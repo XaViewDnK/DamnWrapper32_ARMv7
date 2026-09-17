@@ -124,6 +124,48 @@ extern bool g_isAsphalt6;
 // На скорость загрузки белый зал не завязан: с выключенными категориями лога он всё равно
 // выпадает 4 раза из 6, ровно как и с включёнными.
 extern bool g_a6DebugEnabled;
+// ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: маркер a6nomip запрещает выборку из мипов на GPU-пути,
+// a6nogamemip выкидывает присланные игрой уровни и оставляет свои от glGenerateMipmap.
+extern bool g_a6NoMip;
+extern bool g_a6SkipGameMips;
+// a6colormip заливает каждый мип-уровень своим цветом — видно, какой LOD берёт драйвер.
+extern bool g_a6ColorMips;
+// a6cpumip строит мипы сами, сохраняя альфу.
+extern bool g_a6CpuMips;
+// a6aref0 обнуляет порог альфа-теста: проверка, не мип-альфа ли осыпает дальние объекты.
+extern bool g_a6AlphaRef0;
+// a6noat выключает альфа-тест целиком.
+extern bool g_a6NoAlphaTest;
+// a6opaque выставляет альфу фрагмента в 1: отделяет дыры от альфы.
+extern bool g_a6ForceOpaque;
+// a6atshow красит отбракованные альфа-тестом фрагменты в пурпур.
+extern bool g_a6AtShow;
+// a6notex / a6stage0 / a6ashow выбирают режим отладки выборки текстур.
+extern int g_a6TexDbg;
+// a6clean снимает глубину, трафарет, блендинг, ножницы, отсечение граней и маску цвета.
+extern bool g_a6Clean;
+extern bool g_a6NoCull, g_a6NoStencil, g_a6NoBlend, g_a6NoScissor;
+// a6splitmvp множит проекцию и модельвью по отдельности прямо в шейдере.
+extern bool g_a6SplitMvp;
+// a6nodepth выключает тест глубины целиком.
+extern bool g_a6NoDepth;
+extern bool g_a6Depth24;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+extern bool g_a6ZClear;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+extern bool g_a6LogZ;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+extern float g_a6FarX;  // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+extern bool g_a6ZLess;  // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+extern bool g_a6DrawDump;   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+extern bool g_a6FarTint;    // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+extern int  g_a6TintClass;  // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+extern bool g_a6SkyMask;    // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+extern bool g_a6FarClear;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+extern int  g_a6DumpFrame;  // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+extern int  g_a6DumpSeq;    // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+extern int  g_a6DrawCount;  // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+// a6submip перестраивает мип-цепочку после glTexSubImage2D нулевого уровня.
+extern bool g_a6SubMips;
+// a6lodbias сдвигает выбранный мип-уровень: маркер a6lodbias даёт -2, a6lodbias1 даёт -1.
+extern float g_a6LodBias;
 void A6ScanGuestMemory(const char* needle);
 static inline bool A6Dbg() { return A6_DEBUG_LOG && g_isAsphalt6 && g_a6DebugEnabled; }
 #define A6Log(msg) do { if (A6Dbg()) _LogToJava(msg); } while(0)
@@ -893,6 +935,34 @@ uint32_t g_logMask = 0;
 uint32_t g_spamMask = 0;
 bool g_nativeRootMmap = false;
 bool g_a6DebugEnabled = false;
+bool g_a6NoMip = false;
+bool g_a6SkipGameMips = false;
+bool g_a6ColorMips = false;
+bool g_a6CpuMips = false;
+bool g_a6AlphaRef0 = false;
+bool g_a6NoAlphaTest = false;
+bool g_a6ForceOpaque = false;
+bool g_a6AtShow = false;
+int g_a6TexDbg = 0;
+bool g_a6Clean = false;
+bool g_a6NoCull = false, g_a6NoStencil = false, g_a6NoBlend = false, g_a6NoScissor = false;
+bool g_a6SplitMvp = false;
+bool g_a6NoDepth = false;
+bool g_a6Depth24 = false;
+bool g_a6ZClear = false;
+bool g_a6LogZ = false;
+float g_a6FarX = 1.0f;
+bool g_a6ZLess = false;
+bool g_a6DrawDump = false;
+bool g_a6FarTint = false;
+int  g_a6TintClass = 0;
+bool g_a6SkyMask = false;
+bool g_a6FarClear = false;
+int  g_a6DumpFrame = -1;
+int  g_a6DumpSeq = 0;
+int  g_a6DrawCount = 0;
+bool g_a6SubMips = false;
+float g_a6LodBias = 0.0f;
 bool g_disableLogging = true;
 bool g_logUiVisible = true;   // пока игра рисует, лог-вью не на экране и JNI-мост не нужен
 
@@ -1829,6 +1899,35 @@ void ForceSafeGLState() {
     // Пусто
 }
 
+// На iOS игра рисует в собственный renderbuffer, который живёт между кадрами, и потому вправе
+// не чистить глубину в начале кадра. Окно EGL после eglSwapBuffers отдаёт глубину и трафарет
+// неопределёнными, и первый же слой с тестом глубины выедается мусором. Возвращаем инвариант
+// глубина=1.0, трафарет=0 — но лениво, перед первой работой следующего кадра: сразу после
+// swap задний буфер ещё не получен, и glClear роняет драйвер Adreno.
+static bool g_winDepthUndefined = false;
+static void ResetWindowDepthStencil() {
+    if (!g_winDepthUndefined) return;
+    g_winDepthUndefined = false;
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    if (prevFbo != 0) glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    GLboolean depthMask = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLint stencilMask = 0;
+    glGetIntegerv(GL_STENCIL_WRITEMASK, &stencilMask);
+    if (!depthMask) glDepthMask(GL_TRUE);
+    if (stencilMask != (GLint)0xFFFFFFFF) glStencilMask(0xFFFFFFFF);
+    if (scissor) glDisable(GL_SCISSOR_TEST);
+    glClearDepthf(1.0f);
+    glClearStencil(0);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+    if (stencilMask != (GLint)0xFFFFFFFF) glStencilMask((GLuint)stencilMask);
+    if (!depthMask) glDepthMask(GL_FALSE);
+    if (prevFbo != 0) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+}
+
 extern "C" void Stub_glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {
     g_cpuClearColor[0] = red; g_cpuClearColor[1] = green; g_cpuClearColor[2] = blue; g_cpuClearColor[3] = alpha;
     if (g_gpuOffloadMask & 2) {
@@ -1841,6 +1940,14 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
     // ФИКС ВЫЛЕТА (Signal 11 в драйвере): Очищаем мусорные биты расширений iOS (например 0x16640),
     // от которых Android-драйвер крашится при аппаратном рендере
     mask &= (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    if (g_a6DrawDump && A6Dbg() && (g_a6FrameNo % 200) == 0) {
+        if (g_a6DumpFrame != g_a6FrameNo) { g_a6DumpFrame = g_a6FrameNo; g_a6DumpSeq = 0; }
+        char cb[128];   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: очистка в общем потоке с отрисовками
+        snprintf(cb, sizeof(cb), "[A6-DRAW] к=%d n=%03d ОЧИСТКА mask=0x%x маска_глубины=%d",
+                 g_a6FrameNo, g_a6DumpSeq, (unsigned)mask, (int)g_depthMask);
+        _LogToJava(cb);
+        g_a6DumpSeq++;
+    }
     if (A6Dbg()) {
         A6Log("[A6-RTT] glClear mask=" + std::to_string((unsigned)mask) + " fbo=" + std::to_string(g_lastActiveFBO) +
                   " depthMask=" + std::to_string((int)g_depthMask) +
@@ -1848,6 +1955,16 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
                   std::to_string((int)g_colorMask[2]) + std::to_string((int)g_colorMask[3]) +
                   " clr=" + std::to_string(g_cpuClearColor[0]) + "," + std::to_string(g_cpuClearColor[1]) + "," +
                   std::to_string(g_cpuClearColor[2]) + "," + std::to_string(g_cpuClearColor[3]));
+        if ((g_a6FrameNo % 200) == 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: порядок событий внутри кадра
+            GLboolean sc = glIsEnabled(GL_SCISSOR_TEST);
+            GLint box[4] = {0,0,0,0}; glGetIntegerv(GL_SCISSOR_BOX, box);
+            GLint hwdm = 0; glGetIntegerv(GL_DEPTH_WRITEMASK, &hwdm);
+            char bb[200];
+            snprintf(bb, sizeof(bb), "[A6-SEQ] кадр=%d ОЧИСТКА mask=0x%x fbo=%d маска_глубины=%d ножницы=%d %d,%d,%dx%d",
+                     g_a6FrameNo, (unsigned)mask, g_lastActiveFBO, (int)hwdm, (int)sc,
+                     (int)box[0], (int)box[1], (int)box[2], (int)box[3]);
+            _LogToJava(bb);
+        }
         static int a6DepthClears = 0;
         if (mask & GL_COLOR_BUFFER_BIT) a6DepthClears = 0;
         if (mask & GL_DEPTH_BUFFER_BIT) a6DepthClears++;
@@ -2241,6 +2358,8 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
 
         SyncLog("[RENDER] Отправка буфера на экран (GPU eglSwapBuffers)...");
         res = eglSwapBuffers(g_eglDisplay, g_eglSurface);
+
+        if (g_gpuOffloadMask & 16) g_winDepthUndefined = true;
     } else if (g_nativeWindow) {
         SyncLog("[RENDER] Отправка буфера на экран (ANativeWindow)...");
         ANativeWindow_Buffer buffer;
@@ -2543,6 +2662,17 @@ extern "C" void Stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment,
 }
 extern "C" void Stub_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) { 
     GLint bound_rbo = 0; glGetIntegerv(GL_RENDERBUFFER_BINDING, &bound_rbo); if (bound_rbo == 0) return; 
+    // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: поднять 16-битную глубину до 24, чтобы проверить z-fighting.
+    if (g_a6Depth24 && internalformat == 0x81A5) internalformat = 0x81A6;
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: какой буфер на самом деле просит игра
+        static std::set<uint64_t> seenRb;
+        uint64_t k = ((uint64_t)internalformat << 32) | ((uint64_t)width << 16) | (uint64_t)height;
+        if (seenRb.size() < 16 && seenRb.insert(k).second) {
+            char b[128];
+            snprintf(b, sizeof(b), "[A6-RBST] rb=%d fmt=0x%x %dx%d", (int)bound_rbo, (unsigned)internalformat, (int)width, (int)height);
+            _LogToJava(b);
+        }
+    }
     if (g_gpuOffloadMask & 64) glRenderbufferStorage(target, internalformat, width, height); 
 }
 extern "C" GLenum Stub_glCheckFramebufferStatus(GLenum target) { 
@@ -3165,24 +3295,169 @@ static bool HandleTexParameter(GLenum target, GLenum pname, GLint param) {
     return false;
 }
 
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: как у каждой текстуры набирается мип-цепочка.
+struct A6MipInfo {
+    int w = 0, h = 0;
+    uint32_t lvlMask = 0, cmpMask = 0, failMask = 0;
+    int gen = 0, subAfterGen = 0, subTotal = 0;
+    int badDim = 0, badFmt = 0, meanLogged = 0;
+    bool emptyL0 = false;
+    unsigned minF = 0, fmt = 0, type0 = 0;
+    float mean0[4] = {-1, -1, -1, -1};
+};
+static int g_a6MeanTexLogged = 0;
+static std::map<GLuint, A6MipInfo> g_a6Mip;
+static inline A6MipInfo* A6Mip(GLuint tex) {
+    if (!A6Dbg() || !tex) return nullptr;
+    return &g_a6Mip[tex];
+}
+
 static void ApplyAutoMipmap(GLenum target, GLint level) {
     if (!(g_gpuOffloadMask & 8) || target != GL_TEXTURE_2D || level != 0) return;
     GLenum minF = GL_NEAREST_MIPMAP_LINEAR; // умолчание GL
     auto it = g_cpuTexMinFilter.find(g_cpuActiveTexture);
     if (it != g_cpuTexMinFilter.end()) minF = it->second;
-    if (g_texAutoMipmap.count(g_cpuActiveTexture) || MinFilterNeedsMipmaps(minF)) glGenerateMipmap(target);
+    if (g_texAutoMipmap.count(g_cpuActiveTexture) || MinFilterNeedsMipmaps(minF)) {
+        glGenerateMipmap(target);
+        if (A6MipInfo* m = A6Mip(g_cpuActiveTexture)) m->gen++;
+    }
+}
+
+// ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: свои мип-уровни. RGB усредняется с весом альфы (иначе
+// прозрачные чёрные тексели затемняют край), альфа берётся максимумом по блоку —
+// так вырезанные по альфе объекты не растворяются на дальних уровнях.
+static bool A6BuildMipsKeepAlpha(const void* pixels, int w, int h, GLenum format, GLenum type) {
+    if (!pixels || format != GL_RGBA || type != GL_UNSIGNED_BYTE || w < 2 || h < 2) {
+        static std::set<uint64_t> seenSkip;   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+        uint64_t k = ((uint64_t)format << 32) ^ (uint64_t)type ^ (pixels ? 0 : (0xfull << 60));
+        if (A6Dbg() && seenSkip.size() < 12 && seenSkip.insert(k).second) {
+            char b[160];
+            snprintf(b, sizeof(b), "[A6-MIP] свой генератор пропустил: format=0x%x type=0x%x %dx%d pixels=%d",
+                     (unsigned)format, (unsigned)type, w, h, pixels ? 1 : 0);
+            _LogToJava(b);
+        }
+        return false;
+    }
+    std::vector<uint8_t> src((const uint8_t*)pixels, (const uint8_t*)pixels + (size_t)w * h * 4);
+    std::vector<uint8_t> dst;
+    int sw = w, sh = h;
+    for (int lvl = 1; sw > 1 || sh > 1; lvl++) {
+        int dw = sw > 1 ? sw / 2 : 1, dh = sh > 1 ? sh / 2 : 1;
+        dst.resize((size_t)dw * dh * 4);
+        for (int y = 0; y < dh; y++) {
+            int y0 = y * 2, y1 = (sh > 1) ? y0 + 1 : y0;
+            for (int x = 0; x < dw; x++) {
+                int x0 = x * 2, x1 = (sw > 1) ? x0 + 1 : x0;
+                const uint8_t* p[4] = {
+                    &src[((size_t)y0 * sw + x0) * 4], &src[((size_t)y0 * sw + x1) * 4],
+                    &src[((size_t)y1 * sw + x0) * 4], &src[((size_t)y1 * sw + x1) * 4],
+                };
+                unsigned aw = 0, amax = 0, acc[3] = {0, 0, 0};
+                for (int k = 0; k < 4; k++) {
+                    unsigned a = p[k][3];
+                    aw += a;
+                    if (a > amax) amax = a;
+                    acc[0] += p[k][0] * a; acc[1] += p[k][1] * a; acc[2] += p[k][2] * a;
+                }
+                uint8_t* o = &dst[((size_t)y * dw + x) * 4];
+                if (aw) {
+                    o[0] = (uint8_t)(acc[0] / aw); o[1] = (uint8_t)(acc[1] / aw); o[2] = (uint8_t)(acc[2] / aw);
+                } else {
+                    for (int c = 0; c < 3; c++)
+                        o[c] = (uint8_t)((p[0][c] + p[1][c] + p[2][c] + p[3][c]) / 4);
+                }
+                o[3] = (uint8_t)amax;
+            }
+        }
+        glTexImage2D(GL_TEXTURE_2D, lvl, GL_RGBA, dw, dh, 0, GL_RGBA, GL_UNSIGNED_BYTE, dst.data());
+        src.swap(dst);
+        sw = dw; sh = dh;
+    }
+    static int done = 0;   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+    ++done;
+    if (A6Dbg() && (done <= 3 || done % 100 == 0)) {
+        char b[128];
+        snprintf(b, sizeof(b), "[A6-MIP] свой генератор построил цепочку для %dx%d (всего %d)", w, h, done);
+        _LogToJava(b);
+    }
+    return true;
+}
+
+// ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: заливка уровней >0 цветом-маркером — прямой показ выбранного LOD.
+static void A6PaintMipLevels(int w, int h) {
+    static const uint32_t kLvlColor[10] = {
+        0, 0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFF00FFFFu, 0xFFFF00FFu,
+        0xFFFFFF00u, 0xFFFFFFFFu, 0xFF0080FFu, 0xFF800080u,
+    };
+    static std::vector<uint32_t> buf;
+    for (int lvl = 1; lvl < 16; lvl++) {
+        int lw = w >> lvl, lh = h >> lvl;
+        if (lw < 1) lw = 1;
+        if (lh < 1) lh = 1;
+        uint32_t col = kLvlColor[lvl < 10 ? lvl : 9];
+        buf.assign((size_t)lw * lh, col);
+        glTexImage2D(GL_TEXTURE_2D, lvl, GL_RGBA, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        if (lw == 1 && lh == 1) break;
+    }
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: средний цвет уровня. Мусорный уровень уезжает от базового.
+static void A6LevelMean(const void* pixels, int w, int h, GLenum format, GLenum type, float out[4]) {
+    out[0] = out[1] = out[2] = out[3] = -1.0f;
+    if (!pixels || w <= 0 || h <= 0) return;
+    const uint8_t* p = (const uint8_t*)pixels;
+    int bpp = 0;
+    if (format == GL_RGBA && type == GL_UNSIGNED_BYTE) bpp = 4;
+    else if (format == GL_RGB && type == GL_UNSIGNED_BYTE) bpp = 3;
+    else return;
+    double s[4] = {0, 0, 0, 0};
+    size_t n = (size_t)w * h;
+    for (size_t i = 0; i < n; i++) {
+        s[0] += p[i * bpp + 0]; s[1] += p[i * bpp + 1]; s[2] += p[i * bpp + 2];
+        s[3] += (bpp == 4) ? p[i * bpp + 3] : 255;
+    }
+    for (int k = 0; k < 4; k++) out[k] = (float)(s[k] / (double)n);
+}
+
+// ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: снести мип-выборку, чтобы проверить, в мипах ли сыпь вдали.
+static GLint A6PatchMinFilter(GLenum pname, GLint param) {
+    if (g_a6NoMip && pname == GL_TEXTURE_MIN_FILTER && MinFilterNeedsMipmaps((GLenum)param))
+        return (param == GL_NEAREST_MIPMAP_NEAREST || param == GL_NEAREST_MIPMAP_LINEAR) ? GL_NEAREST : GL_LINEAR;
+    return param;
+}
+
+void A6MipDump() {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+    if (!A6Dbg()) return;
+    A6Log("[A6-MIP] ===== сводка мип-цепочек, текстур=" + std::to_string(g_a6Mip.size()) + " =====");
+    int printed = 0;
+    for (auto& kv : g_a6Mip) {
+        const A6MipInfo& m = kv.second;
+        if (m.lvlMask <= 1 && m.gen == 0) continue;
+        if (++printed > 80) break;
+        unsigned minF = 0;
+        auto f = g_cpuTexMinFilter.find(kv.first);
+        if (f != g_cpuTexMinFilter.end()) minF = (unsigned)f->second;
+        char b[224];
+        snprintf(b, sizeof(b), "[A6-MIP] tex=%u %dx%d fmt=0x%x lvl=0x%x cmp=0x%x fail=0x%x gen=%d sub=%d/%d minF=0x%x empty=%d bad=%d/%d",
+                 (unsigned)kv.first, m.w, m.h, m.fmt, m.lvlMask, m.cmpMask, m.failMask,
+                 m.gen, m.subTotal, m.subAfterGen, minF, m.emptyL0 ? 1 : 0, m.badDim, m.badFmt);
+        _LogToJava(b);
+    }
+    A6Log("[A6-MIP] ===== конец сводки, строк=" + std::to_string(printed) + " =====");
 }
 
 extern "C" void Stub_glTexParameteri(GLenum target, GLenum pname, GLint param) {
     RememberTexFilter(target, pname, param);
     if (HandleTexParameter(target, pname, param)) return;
-    if (g_gpuOffloadMask & 8) glTexParameteri(target, pname, param);
+    if (g_gpuOffloadMask & 8) glTexParameteri(target, pname, A6PatchMinFilter(pname, param));
 }
 
 extern "C" void Stub_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
     RememberTexFilter(target, pname, (GLint)param);
     if (HandleTexParameter(target, pname, (GLint)param)) return;
-    if (g_gpuOffloadMask & 8) glTexParameterf(target, pname, param);
+    if (!(g_gpuOffloadMask & 8)) return;
+    if (pname == GL_TEXTURE_MIN_FILTER) glTexParameteri(target, pname, A6PatchMinFilter(pname, (GLint)param));
+    else glTexParameterf(target, pname, param);
 }
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
@@ -3394,8 +3669,56 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
         LogToJava(b);
     }
     if (g_gpuOffloadMask & 8) {
+        if (A6MipInfo* m = A6Mip(g_cpuActiveTexture)) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            if (target == GL_TEXTURE_2D) {
+                if (level >= 0 && level < 32) m->lvlMask |= (1u << level);
+                if (level == 0) {
+                    m->w = width; m->h = height; m->fmt = (unsigned)hw_internalformat;
+                    m->type0 = (unsigned)type; m->emptyL0 = (pixels == nullptr);
+                    A6LevelMean(pixels, width, height, format, type, m->mean0);
+                } else if (m->w > 0) {
+                    if (m->mean0[0] >= 0 && (m->meanLogged > 0 || g_a6MeanTexLogged < 8)) {
+                        float mn[4];
+                        A6LevelMean(pixels, width, height, format, type, mn);
+                        if (mn[0] >= 0) {
+                            if (m->meanLogged++ == 0) g_a6MeanTexLogged++;
+                            char b[208];
+                            snprintf(b, sizeof(b), "[A6-MIP] tex=%u lvl=%d %dx%d среднее %.0f/%.0f/%.0f/%.0f, база %.0f/%.0f/%.0f/%.0f",
+                                     (unsigned)g_cpuActiveTexture, level, width, height,
+                                     mn[0], mn[1], mn[2], mn[3], m->mean0[0], m->mean0[1], m->mean0[2], m->mean0[3]);
+                            _LogToJava(b);
+                        }
+                    }
+                    int ew = m->w >> level, eh = m->h >> level;
+                    if (ew < 1) ew = 1;
+                    if (eh < 1) eh = 1;
+                    if (width != ew || height != eh) {
+                        if (m->badDim++ < 3) {
+                            char b[176];
+                            snprintf(b, sizeof(b), "[A6-MIP] tex=%u уровень %d пришёл %dx%d, ждали %dx%d (база %dx%d)",
+                                     (unsigned)g_cpuActiveTexture, level, width, height, ew, eh, m->w, m->h);
+                            _LogToJava(b);
+                        }
+                    }
+                    if ((unsigned)hw_internalformat != m->fmt || (unsigned)type != m->type0) {
+                        if (m->badFmt++ < 3) {
+                            char b[176];
+                            snprintf(b, sizeof(b), "[A6-MIP] tex=%u уровень %d формат 0x%x/0x%x против уровня 0 0x%x/0x%x",
+                                     (unsigned)g_cpuActiveTexture, level, (unsigned)hw_internalformat, (unsigned)type, m->fmt, m->type0);
+                            _LogToJava(b);
+                        }
+                    }
+                }
+            }
+        }
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: выкинуть присланные игрой мипы, оставив свои от glGenerateMipmap.
+        if ((g_a6SkipGameMips || g_a6ColorMips || g_a6CpuMips) && target == GL_TEXTURE_2D && level > 0) return;
         glTexImage2D(target, level, hw_internalformat, width, height, border, hw_format, type, safe_pixels);
         ApplyAutoMipmap(target, level);
+        if (g_a6CpuMips && target == GL_TEXTURE_2D && level == 0)
+            A6BuildMipsKeepAlpha(safe_pixels, width, height, hw_format, type);
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: залить уровни >0 цветом-маркером, чтобы увидеть выбранный LOD.
+        if (g_a6ColorMips && target == GL_TEXTURE_2D && level == 0) A6PaintMipLevels(width, height);
     }
 }
 
@@ -3576,6 +3899,10 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
         }
     }
     if (g_gpuOffloadMask & 8) {
+        if (A6MipInfo* m = A6Mip(g_cpuActiveTexture)) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            m->subTotal++;
+            if (m->gen > 0) m->subAfterGen++;
+        }
         // Adreno не берёт GL_BGRA_EXT как format при RGBA-текстуре: уровень остаётся
         // неопределённым и выборка даёт мусор. Переставляем каналы сами.
         std::vector<uint8_t> swapped;
@@ -3591,6 +3918,18 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
             glTexSubImage2D(target, level, xoffset, yoffset, width, height, GL_RGBA, type, swapped.data());
         } else {
             glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+        }
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: правка нулевого уровня делает старую мип-цепочку
+        // недействительной — проверяем, не от этого ли осыпается дальний план.
+        if (g_a6SubMips && target == GL_TEXTURE_2D && level == 0) {
+            ApplyAutoMipmap(target, level);
+            static int n = 0;   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+            if (A6Dbg() && (++n <= 3 || n % 200 == 0)) {
+                char b[128];
+                snprintf(b, sizeof(b), "[A6-MIP] перестроил мипы после subimage tex=%u (всего %d)",
+                         (unsigned)g_cpuActiveTexture, n);
+                _LogToJava(b);
+            }
         }
     }
 }
@@ -3870,6 +4209,11 @@ extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum i
         }
     }
     if (g_gpuOffloadMask & 8) {
+        A6MipInfo* m = A6Mip(g_cpuActiveTexture);   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+        if (m && target == GL_TEXTURE_2D && level >= 0 && level < 32) {
+            m->lvlMask |= (1u << level); m->cmpMask |= (1u << level);
+            if (level == 0) { m->w = width; m->h = height; m->fmt = (unsigned)internalformat; }
+        }
         int bpp = 0; bool alpha = false;
         std::vector<uint32_t> rgba;
         if (PvrtcFormatInfo(internalformat, bpp, alpha) && !DeviceSupportsPVRTC() && data && width > 0 && height > 0) {
@@ -3879,6 +4223,7 @@ extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum i
                 ApplyAutoMipmap(target, level);
                 return;
             }
+            if (m && level >= 0 && level < 32) m->failMask |= (1u << level);
         }
         glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
         ApplyAutoMipmap(target, level);
@@ -5424,6 +5769,15 @@ static GLint g_ffLocTexFmt = -1;
 static GLint g_ffLocEnvMode = -1, g_ffLocEnvColor = -1, g_ffLocCombRGB = -1, g_ffLocCombA = -1;
 static GLint g_ffLocSrcRGB = -1, g_ffLocSrcA = -1, g_ffLocOpRGB = -1, g_ffLocOpA = -1;
 static GLint g_ffLocScaleRGB = -1, g_ffLocScaleA = -1;
+static GLint g_ffLocLodBias = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocForceOpaque = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocAtShow = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocTexDbg = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocBlendId = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocZSplit = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocLogZ = -1, g_ffLocZNear = -1, g_ffLocZFar = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocProj = -1, g_ffLocSplitMvp = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+static GLint g_ffLocA6Tint = -1;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
 static uint32_t g_ffEnvUploaded = 0, g_ffLightUploaded = 0;
 static bool g_ffFailed = false;
 
@@ -5444,6 +5798,13 @@ static bool EnsureFixedFunctionProgram() {
         "attribute vec2 a_uv1;\n"
         "attribute vec3 a_normal;\n"
         "uniform mat4 u_mvp;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: раздельные матрицы против потери точности глубины.
+        "uniform mat4 u_proj;\n"
+        "uniform float u_splitMvp;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: логарифмическая глубина против z-fighting дальнего плана.
+        "uniform float u_logZ;\n"
+        "uniform float u_zNear;\n"
+        "uniform float u_zFar;\n"
         "uniform mat4 u_mv;\n"
         "uniform mat4 u_texMat0;\n"
         "uniform mat4 u_texMat1;\n"
@@ -5469,8 +5830,8 @@ static bool EnsureFixedFunctionProgram() {
         "uniform vec4 u_spotDir[8];\n"
         "uniform vec4 u_lightAtt[8];\n"
         "varying vec4 v_color;\n"
-        "varying vec2 v_uv;\n"
-        "varying vec2 v_uv1;\n"
+        "varying highp vec2 v_uv;\n"
+        "varying highp vec2 v_uv1;\n"
         "vec4 computeLighting(vec4 vcolor, vec4 eye) {\n"
         "  vec3 n = normalize(u_nrm * a_normal);\n"
         "  vec3 ep = eye.xyz;\n"
@@ -5515,7 +5876,10 @@ static bool EnsureFixedFunctionProgram() {
         "  v_color = (u_lighting > 0.5) ? computeLighting(vcolor, eye) : vcolor;\n"
         "  v_uv = (u_texMat0 * vec4(a_uv, 0.0, 1.0)).xy;\n"
         "  v_uv1 = (u_texMat1 * vec4(a_uv1, 0.0, 1.0)).xy;\n"
-        "  vec4 p = u_mvp * a_pos;\n"
+        "  vec4 p = (u_splitMvp > 0.5) ? (u_proj * (u_mv * a_pos)) : (u_mvp * a_pos);\n"
+        "  if (u_logZ > 0.5 && p.w > u_zNear) {\n"
+        "    p.z = (2.0 * log2(p.w / u_zNear) / log2(u_zFar / u_zNear) - 1.0) * p.w;\n"
+        "  }\n"
         "  if (u_rot > 0.5) {\n"
         "    if (u_rot < 1.5) p.xy = vec2(-p.y, p.x);\n"
         "    else if (u_rot < 2.5) p.xy = -p.xy;\n"
@@ -5527,8 +5891,11 @@ static bool EnsureFixedFunctionProgram() {
     const char* fs =
         "precision mediump float;\n"
         "varying vec4 v_color;\n"
-        "varying vec2 v_uv;\n"
-        "varying vec2 v_uv1;\n"
+        // Текстурные координаты обязаны быть highp: из mediump-варьирующей драйвер
+        // считает производные с катастрофической потерей точности и берёт случайный
+        // мип-уровень — дальние объекты рассыпались кашей.
+        "varying highp vec2 v_uv;\n"
+        "varying highp vec2 v_uv1;\n"
         "uniform sampler2D u_tex;\n"
         "uniform sampler2D u_tex1;\n"
         "uniform float u_texEnable;\n"
@@ -5548,6 +5915,21 @@ static bool EnsureFixedFunctionProgram() {
         "uniform ivec3 u_opA[2];\n"
         "uniform vec2 u_scaleRGB;\n"
         "uniform vec2 u_scaleA;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: сдвиг выбранного мип-уровня.
+        "uniform float u_lodBias;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: убрать вклад альфы совсем.
+        "uniform float u_forceOpaque;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: показать отбракованные альфа-тестом фрагменты.
+        "uniform float u_atShow;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: 1 — выкинуть текстуры и оставить цвет вершин,
+        // 2 — оставить только первую стадию, 3 — показать альфу серым.
+        "uniform int u_texDbg;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: номер режима блендинга для раскраски.
+        "uniform int u_blendId;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: граница деления экрана для показа глубины.
+        "uniform float u_zSplit;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: подкраска слоя, rgb — цвет, a — сила.
+        "uniform vec4 u_a6Tint;\n"
         "vec4 pickSrc(int src, vec4 t, vec4 cst, vec4 prim, vec4 prev) {\n"
         "  if (src == 0) return t;\n"
         "  if (src == 1) return cst;\n"
@@ -5610,23 +5992,43 @@ static bool EnsureFixedFunctionProgram() {
         "void main() {\n"
         "  vec4 c = v_color;\n"
         "  if (u_texEnable > 0.5) {\n"
-        "    c = texStage(u_envMode[0], u_texFmt[0], c, texture2D(u_tex, v_uv), v_color, u_envColor[0],\n"
+        "    vec4 t0 = (u_texDbg == 1) ? vec4(1.0) : texture2D(u_tex, v_uv, u_lodBias);\n"
+        "    c = texStage(u_envMode[0], u_texFmt[0], c, t0, v_color, u_envColor[0],\n"
         "                 u_combRGB[0], u_combA[0], u_srcRGB[0], u_srcA[0], u_opRGB[0], u_opA[0],\n"
         "                 u_scaleRGB.x, u_scaleA.x);\n"
         "  }\n"
-        "  if (u_stage1 > 0) {\n"
-        "    vec4 t1 = (u_stage1 == 1) ? texture2D(u_tex1, v_uv1) : vec4(0.0);\n"
+        "  if (u_stage1 > 0 && u_texDbg != 2) {\n"
+        "    vec4 t1 = (u_stage1 == 1) ? ((u_texDbg == 1) ? vec4(1.0) : texture2D(u_tex1, v_uv1, u_lodBias)) : vec4(0.0);\n"
         "    c = texStage(u_envMode[1], (u_stage1 == 1) ? u_texFmt[1] : 0, c, t1, v_color, u_envColor[1],\n"
         "                 u_combRGB[1], u_combA[1], u_srcRGB[1], u_srcA[1], u_opRGB[1], u_opA[1],\n"
         "                 u_scaleRGB.y, u_scaleA.y);\n"
         "  }\n"
-        "  if (u_alphaFunc == 0) discard;\n"
-        "  else if (u_alphaFunc == 1 && !(c.a <  u_alphaRef)) discard;\n"
-        "  else if (u_alphaFunc == 2 && !(c.a == u_alphaRef)) discard;\n"
-        "  else if (u_alphaFunc == 3 && !(c.a <= u_alphaRef)) discard;\n"
-        "  else if (u_alphaFunc == 4 && !(c.a >  u_alphaRef)) discard;\n"
-        "  else if (u_alphaFunc == 5 && !(c.a != u_alphaRef)) discard;\n"
-        "  else if (u_alphaFunc == 6 && !(c.a >= u_alphaRef)) discard;\n"
+        "  if (u_texDbg == 3) { gl_FragColor = vec4(c.a, c.a, c.a, 1.0); return; }\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: слева глубина с тройным увеличением контраста, справа обычный кадр.
+        "  if (u_texDbg == 5 && gl_FragCoord.x < u_zSplit) { float z = gl_FragCoord.z;\n"
+        "    gl_FragColor = vec4(clamp((z - 0.95) * 20.0, 0.0, 1.0), clamp((z - 0.99) * 100.0, 0.0, 1.0),\n"
+        "                        clamp((z - 0.999) * 1000.0, 0.0, 1.0), 1.0); return; }\n"
+        "  if (u_texDbg == 4) {\n"
+        "    vec3 pal[8];\n"
+        "    pal[0] = vec3(0.2,0.2,0.2); pal[1] = vec3(1.0,0.0,0.0); pal[2] = vec3(0.0,1.0,0.0);\n"
+        "    pal[3] = vec3(0.0,0.0,1.0); pal[4] = vec3(1.0,1.0,0.0); pal[5] = vec3(1.0,0.0,1.0);\n"
+        "    pal[6] = vec3(0.0,1.0,1.0); pal[7] = vec3(1.0,1.0,1.0);\n"
+        "    for (int i = 0; i < 8; i++) { if (i == u_blendId) { gl_FragColor = vec4(pal[i], 1.0); return; } }\n"
+        "    gl_FragColor = vec4(0.5, 0.5, 0.5, 1.0); return;\n"
+        "  }\n"
+        "  bool atFail = false;\n"
+        "  if (u_alphaFunc == 0) atFail = true;\n"
+        "  else if (u_alphaFunc == 1 && !(c.a <  u_alphaRef)) atFail = true;\n"
+        "  else if (u_alphaFunc == 2 && !(c.a == u_alphaRef)) atFail = true;\n"
+        "  else if (u_alphaFunc == 3 && !(c.a <= u_alphaRef)) atFail = true;\n"
+        "  else if (u_alphaFunc == 4 && !(c.a >  u_alphaRef)) atFail = true;\n"
+        "  else if (u_alphaFunc == 5 && !(c.a != u_alphaRef)) atFail = true;\n"
+        "  else if (u_alphaFunc == 6 && !(c.a >= u_alphaRef)) atFail = true;\n"
+        // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: вместо отбрасывания красим в пурпур,
+        // чтобы увидеть, кто именно выедает дыры.
+        "  if (atFail) { if (u_atShow > 0.5) c = vec4(1.0, 0.0, 1.0, 1.0); else discard; }\n"
+        "  if (u_forceOpaque > 0.5) c.a = 1.0;\n"
+        "  if (u_a6Tint.a > 0.0) c.rgb = mix(c.rgb, u_a6Tint.rgb, u_a6Tint.a);\n"
         "  gl_FragColor = c;\n"
         "}\n";
 
@@ -5657,6 +6059,8 @@ static bool EnsureFixedFunctionProgram() {
 
     g_ffProgram = prog;
     g_ffLocMvp           = glGetUniformLocation(prog, "u_mvp");
+    g_ffLocProj          = glGetUniformLocation(prog, "u_proj");
+    g_ffLocSplitMvp      = glGetUniformLocation(prog, "u_splitMvp");
     g_ffLocTexEnable     = glGetUniformLocation(prog, "u_texEnable");
     g_ffLocTex           = glGetUniformLocation(prog, "u_tex");
     g_ffLocConstColor    = glGetUniformLocation(prog, "u_constColor");
@@ -5696,6 +6100,16 @@ static bool EnsureFixedFunctionProgram() {
     g_ffLocOpA           = glGetUniformLocation(prog, "u_opA");
     g_ffLocScaleRGB      = glGetUniformLocation(prog, "u_scaleRGB");
     g_ffLocScaleA        = glGetUniformLocation(prog, "u_scaleA");
+    g_ffLocLodBias       = glGetUniformLocation(prog, "u_lodBias");
+    g_ffLocForceOpaque   = glGetUniformLocation(prog, "u_forceOpaque");
+    g_ffLocAtShow        = glGetUniformLocation(prog, "u_atShow");
+    g_ffLocTexDbg        = glGetUniformLocation(prog, "u_texDbg");
+    g_ffLocBlendId       = glGetUniformLocation(prog, "u_blendId");
+    g_ffLocZSplit        = glGetUniformLocation(prog, "u_zSplit");
+    g_ffLocLogZ          = glGetUniformLocation(prog, "u_logZ");
+    g_ffLocZNear         = glGetUniformLocation(prog, "u_zNear");
+    g_ffLocZFar          = glGetUniformLocation(prog, "u_zFar");
+    g_ffLocA6Tint        = glGetUniformLocation(prog, "u_a6Tint");
     g_ffEnvUploaded = 0;
     g_ffLightUploaded = 0;
     SyncLog("[RENDER] FFP: программа эмуляции ES 1.1 готова, prog=" + std::to_string(prog)
@@ -5779,6 +6193,23 @@ static void UploadFFTexEnv() {
     glUniform4fv(g_ffLocEnvColor, 2, envColor);
     glUniform2fv(g_ffLocScaleRGB, 1, scaleRGB);
     glUniform2fv(g_ffLocScaleA, 1, scaleA);
+    if (g_ffLocLodBias >= 0) glUniform1f(g_ffLocLodBias, g_a6LodBias);
+    if (g_ffLocForceOpaque >= 0) glUniform1f(g_ffLocForceOpaque, g_a6ForceOpaque ? 1.0f : 0.0f);
+    if (g_ffLocAtShow >= 0) glUniform1f(g_ffLocAtShow, g_a6AtShow ? 1.0f : 0.0f);
+    if (g_ffLocTexDbg >= 0) glUniform1i(g_ffLocTexDbg, g_a6TexDbg);
+    if (g_ffLocZSplit >= 0) glUniform1f(g_ffLocZSplit, (float)g_surfaceWidth * 0.5f);
+    if (g_ffLocBlendId >= 0) {   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+        int bid = 0;
+        if (g_blendEnabled) {
+            if (g_blendSrc == 0x302 && g_blendDst == 0x303) bid = 1;
+            else if (g_blendSrc == 1 && g_blendDst == 1) bid = 2;
+            else if (g_blendSrc == 1 && g_blendDst == 0x301) bid = 3;
+            else if (g_blendSrc == 0x302 && g_blendDst == 1) bid = 4;
+            else bid = 5;
+        }
+        if (g_alphaTestEnabled) bid = (bid == 0) ? 6 : 7;
+        glUniform1i(g_ffLocBlendId, bid);
+    }
 }
 
 static void UploadFFLighting() {
@@ -5815,6 +6246,20 @@ static void UploadFFLighting() {
     glUniform4fv(g_ffLocLightAtt, 8, att);
 }
 
+// ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: отодвинуть дальнюю плоскость проекции в g_a6FarX раз.
+// Соглашение Asphalt 6: P11 = +1, w = +z_eye, отсюда near = -P14/(1+P10), far = P14/(1-P10).
+static const float* A6AdjustProjection(const float* P, float* out16) {
+    if (g_a6FarX <= 1.0f || P[11] <= 0.5f || P[10] <= 1.0f) return P;
+    float nr = -P[14] / (1.0f + P[10]);
+    float fr =  P[14] / (1.0f - P[10]);
+    if (!(nr > 1e-4f) || !(fr > nr * 2.0f)) return P;
+    fr *= g_a6FarX;
+    memcpy(out16, P, 16 * sizeof(float));
+    out16[10] = (fr + nr) / (fr - nr);
+    out16[14] = -2.0f * nr * fr / (fr - nr);
+    return out16;
+}
+
 // Возвращает true, если кадр рисуется нашей fixed-function программой.
 static bool ApplyFixedFunctionState(int rotQuarters) {
     if (g_activeESVersion != 1) return false;
@@ -5825,10 +6270,117 @@ static bool ApplyFixedFunctionState(int rotQuarters) {
     if (!EnsureFixedFunctionProgram()) return false;
 
     glUseProgram(g_ffProgram);
+    if (g_a6NoDepth) glDisable(GL_DEPTH_TEST);   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+    if (g_a6Clean) {   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: снять разом все отбраковки фрагмента
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: какие сочетания блендинга реально идут в кадр
+        static std::set<uint64_t> seen;
+        GLint hwSrc = 0, hwDst = 0, hwEq = 0;
+        glGetIntegerv(GL_BLEND_SRC_RGB, &hwSrc);
+        glGetIntegerv(GL_BLEND_DST_RGB, &hwDst);
+        glGetIntegerv(GL_BLEND_EQUATION_RGB, &hwEq);
+        GLboolean hwOn = glIsEnabled(GL_BLEND);
+        uint64_t key = ((uint64_t)g_blendEnabled << 56) | ((uint64_t)hwOn << 48) | ((uint64_t)hwSrc << 32) |
+                       ((uint64_t)hwDst << 16) | (uint64_t)(g_alphaTestEnabled ? g_alphaFunc : 0);
+        static long calls = 0, blendOnCalls = 0;
+        ++calls; if (hwOn) ++blendOnCalls;
+        if ((seen.insert(key).second && seen.size() <= 40) || (calls % 20000) == 0) {
+            char b[256];
+            snprintf(b, sizeof(b), "[A6-BLEND] тень blend=%d src=0x%x dst=0x%x | железо blend=%d src=0x%x dst=0x%x eq=0x%x "
+                     "| at=%d func=0x%x ref=%.3f вкл.из игры=0x%08x",
+                     (int)g_blendEnabled, (unsigned)g_blendSrc, (unsigned)g_blendDst,
+                     (int)hwOn, (unsigned)hwSrc, (unsigned)hwDst, (unsigned)hwEq,
+                     (int)g_alphaTestEnabled, (unsigned)g_alphaFunc, g_alphaRef, g_a6BlendGameLr);
+            char b2[128];
+            snprintf(b2, sizeof(b2), " | вызовов=%ld сблендом=%ld разных=%d", calls, blendOnCalls, (int)seen.size());
+            strncat(b, b2, sizeof(b) - strlen(b) - 1);
+            _LogToJava(b);
+        }
+    }
+    if (g_a6NoCull) glDisable(GL_CULL_FACE);       // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+    if (g_a6NoStencil) glDisable(GL_STENCIL_TEST);  // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+    if (g_a6NoBlend) glDisable(GL_BLEND);           // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+    if (g_a6NoScissor) glDisable(GL_SCISSOR_TEST);  // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
 
+    if (g_a6ZClear) {   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: своя очистка глубины на переходе дальний->ближний слой
+        static bool wasFar = false;
+        const float* Pz = g_projectionStack.back().data();
+        bool isFar = (Pz[11] > 0.5f) && (fabsf(Pz[14]) > 1000.0f);
+        bool isNear = (Pz[11] > 0.5f) && (fabsf(Pz[14]) < 1000.0f);
+        if (wasFar && isNear) {
+            GLint dm = 1; glGetIntegerv(GL_DEPTH_WRITEMASK, &dm);
+            GLboolean sc = glIsEnabled(GL_SCISSOR_TEST);
+            if (sc) glDisable(GL_SCISSOR_TEST);
+            if (!dm) glDepthMask(GL_TRUE);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            if (!dm) glDepthMask(GL_FALSE);
+            if (sc) glEnable(GL_SCISSOR_TEST);
+        }
+        if (isFar) wasFar = true;
+        else if (isNear) wasFar = false;
+    }
+    if (A6Dbg() && (g_a6FrameNo % 200) == 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: смена проекции внутри кадра
+        static float lastP14 = 1e30f;
+        const float* Pp = g_projectionStack.back().data();
+        if (Pp[14] != lastP14) {
+            lastP14 = Pp[14];
+            char bb[160];
+            snprintf(bb, sizeof(bb), "[A6-SEQ] кадр=%d ПРОЕКЦИЯ P10=%.8g P14=%.8g P11=%.3g", g_a6FrameNo, Pp[10], Pp[14], Pp[11]);
+            _LogToJava(bb);
+        }
+    }
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: ближняя и дальняя плоскости игры
+        const float* P = g_projectionStack.back().data();
+        static std::set<uint64_t> seenProj;
+        union { float f; uint32_t u; } a, b2;
+        a.f = P[10]; b2.f = P[14];
+        uint64_t k = ((uint64_t)a.u << 32) | (uint64_t)b2.u;
+        if (seenProj.size() < 16 && seenProj.insert(k).second) {
+            float nr = 0.0f, fr = 0.0f;
+            if (P[11] > 0.5f) { nr = -P[14] / (1.0f + P[10]); fr = P[14] / (1.0f - P[10]); }
+            else if (P[11] < -0.5f) { nr = P[14] / (P[10] - 1.0f); fr = P[14] / (P[10] + 1.0f); }
+            GLfloat dr[2] = {0, 0}; glGetFloatv(GL_DEPTH_RANGE, dr);
+            GLboolean dt = glIsEnabled(GL_DEPTH_TEST);
+            GLint df = 0; glGetIntegerv(GL_DEPTH_FUNC, &df);
+            GLint dm = 0; glGetIntegerv(GL_DEPTH_WRITEMASK, &dm);
+            char bb[224];
+            snprintf(bb, sizeof(bb), "[A6-PROJ] P10=%.9g P14=%.9g near=%.6g far=%.6g P11=%.6g | range %.4g..%.4g test=%d func=0x%x mask=%d",
+                     P[10], P[14], nr, fr, P[11], (double)dr[0], (double)dr[1], (int)dt, (unsigned)df, (int)dm);
+            _LogToJava(bb);
+        }
+    }
     float mvp[16];
-    MatMul4(g_projectionStack.back().data(), g_modelViewStack.back().data(), mvp);
+    float projFar[16];
+    const float* projForMvp = A6AdjustProjection(g_projectionStack.back().data(), projFar);
+    MatMul4(projForMvp, g_modelViewStack.back().data(), mvp);
     glUniformMatrix4fv(g_ffLocMvp, 1, GL_FALSE, mvp);
+    if (g_ffLocLogZ >= 0) {   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: логарифмическая глубина
+        const float* P = g_projectionStack.back().data();
+        float nr = 0.0f, fr = 0.0f;
+        if (g_a6LogZ && P[11] > 0.5f && P[10] > 1.0f) {        // соглашение Asphalt 6: w = +z
+            nr = -P[14] / (1.0f + P[10]);
+            fr =  P[14] / (1.0f - P[10]);
+        } else if (g_a6LogZ && P[11] < -0.5f && P[10] < -1.0f) { // обычное соглашение GL
+            nr = P[14] / (P[10] - 1.0f);
+            fr = P[14] / (P[10] + 1.0f);
+        }
+        bool ok = (nr > 1e-4f && fr > nr * 2.0f);
+        glUniform1f(g_ffLocLogZ, ok ? 1.0f : 0.0f);
+        if (ok) { glUniform1f(g_ffLocZNear, nr); glUniform1f(g_ffLocZFar, fr); }
+    }
+    if (g_ffLocSplitMvp >= 0) {   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
+        glUniform1f(g_ffLocSplitMvp, g_a6SplitMvp ? 1.0f : 0.0f);
+        if (g_a6SplitMvp) {
+            glUniformMatrix4fv(g_ffLocProj, 1, GL_FALSE, g_projectionStack.back().data());
+            glUniformMatrix4fv(g_ffLocMv, 1, GL_FALSE, g_modelViewStack.back().data());
+        }
+    }
 
     glUniformMatrix4fv(g_ffLocTexMat0, 1, GL_FALSE, g_textureStacks[0].back().data());
     glUniformMatrix4fv(g_ffLocTexMat1, 1, GL_FALSE, g_textureStacks[1].back().data());
@@ -5862,6 +6414,21 @@ static bool ApplyFixedFunctionState(int rotQuarters) {
     auto bf1 = g_texBaseFormat.find(g_cpuUnitTexture[1]);
     if (bf1 != g_texBaseFormat.end()) texFmt[1] = bf1->second;
     glUniform1iv(g_ffLocTexFmt, 2, texFmt);
+
+    g_a6TintClass = 0;
+    if (g_ffLocA6Tint >= 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: красим слой по его проекции
+        float tint[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (g_a6FarTint) {
+            const float* P = g_projectionStack.back().data();
+            if (P[11] > 0.5f) {
+                float pn = -P[14] / (1.0f + P[10]);
+                if (pn > 1000.0f) { tint[0] = 1.0f; tint[3] = 0.6f; g_a6TintClass = 1; }              // дальний слой — красный
+                else if (!g_depthTestEnabled) { tint[2] = 1.0f; tint[3] = 0.6f; g_a6TintClass = 2; }  // фон без теста глубины — синий
+                else { tint[1] = 1.0f; tint[3] = 0.6f; g_a6TintClass = 3; }                           // обычная геометрия — зелёный
+            }
+        }
+        glUniform4fv(g_ffLocA6Tint, 1, tint);
+    }
 
     if (g_ffEnvUploaded != g_ffEnvSerial) {
         UploadFFTexEnv();
@@ -5907,8 +6474,19 @@ static bool ApplyFixedFunctionState(int rotQuarters) {
 
     int af = g_alphaTestEnabled ? (int)g_alphaFunc - 0x0200 : 7; // 7 = GL_ALWAYS
     if (af < 0 || af > 7) af = 7;
+    if (g_a6NoAlphaTest) af = 7;   // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6
     glUniform1i(g_ffLocAlphaFunc, af);
-    glUniform1f(g_ffLocAlphaRef, g_alphaRef);
+    glUniform1f(g_ffLocAlphaRef, g_a6AlphaRef0 ? 0.0f : g_alphaRef);
+    if (A6Dbg() && af != 7) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: с каким порогом реально режется альфа
+        static std::set<int> seenAT;
+        int key = af * 1000 + (int)(g_alphaRef * 255.0f);
+        if (seenAT.size() < 20 && seenAT.insert(key).second) {
+            char b[128];
+            snprintf(b, sizeof(b), "[A6-MIP] альфа-тест func=0x%x ref=%.3f tex0=%u",
+                     (unsigned)g_alphaFunc, (double)g_alphaRef, (unsigned)g_cpuUnitTexture[0]);
+            _LogToJava(b);
+        }
+    }
 
     glUniform1f(g_ffLocRot, (float)rotQuarters);
     glUniform1f(g_ffLocPointSize, g_pointSize);
@@ -5952,6 +6530,113 @@ static void A6ProbePixel(const char* what, int count) {
              what, (unsigned)g_cpuUnitTexture[0], count, px[0], px[1], px[2], px[3]);
     LogToJava(b);
 }
+// ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: запретить запись глубины отрисовке без теста глубины (небесный купол).
+static bool A6SkyMaskBegin() {
+    if (!g_a6SkyMask || g_depthTestEnabled || !g_depthMask) return false;
+    glDepthMask(GL_FALSE);
+    return true;
+}
+// ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: очистить глубину перед первым кадровым слоем с дальней проекцией.
+static void A6FarClear() {
+    if (!g_a6FarClear) return;
+    const float* P = g_projectionStack.back().data();
+    if (P[11] <= 0.5f || -P[14] / (1.0f + P[10]) <= 1000.0f) return;
+    static int doneFrame = -1;
+    if (doneFrame == g_a6FrameNo) return;
+    doneFrame = g_a6FrameNo;
+    GLboolean dm = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
+    if (!dm) glDepthMask(GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    if (!dm) glDepthMask(GL_FALSE);
+}
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: экранный прямоугольник и диапазон глубины одной отрисовки.
+static void A6DumpDraw(GLint first, GLsizei count, const GLvoid* indices, GLenum type) {
+    if (!g_a6DrawDump || !A6Dbg() || (g_a6FrameNo % 200) != 0) return;
+    int& lastFrame = g_a6DumpFrame;
+    int& seq = g_a6DumpSeq;
+    if (lastFrame != g_a6FrameNo) {
+        lastFrame = g_a6FrameNo; seq = 0;
+        GLint fbo = 0, db = 0, sb = 0, vp[4] = {0,0,0,0};
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+        glGetIntegerv(GL_DEPTH_BITS, &db); glGetIntegerv(GL_STENCIL_BITS, &sb);
+        glGetIntegerv(GL_VIEWPORT, vp);
+        char hb[192];
+        snprintf(hb, sizeof(hb), "[A6-FB] к=%d fbo=%d глубина=%d трафарет=%d вьюпорт=%d,%d,%dx%d",
+                 g_a6FrameNo, (int)fbo, (int)db, (int)sb, (int)vp[0], (int)vp[1], (int)vp[2], (int)vp[3]);
+        _LogToJava(hb);
+    }
+    if (seq >= 400) return;
+
+    float mvp[16], projFar[16];
+    MatMul4(A6AdjustProjection(g_projectionStack.back().data(), projFar),
+            g_modelViewStack.back().data(), mvp);
+
+    const VertexAttribState& pa = g_vertexAttribs[0];
+    const uint8_t* pb = nullptr;
+    if (pa.enabled && pa.pointer) {
+        if (pa.vbo) { auto it = g_vboShadow.find(pa.vbo); if (it != g_vboShadow.end()) pb = it->second.data() + (uintptr_t)pa.pointer; }
+        else pb = (const uint8_t*)pa.pointer;
+    }
+    const uint8_t* ib = nullptr;
+    if (indices) {
+        GLuint ebo = g_boundBuffers[0x8893];   // GL_ELEMENT_ARRAY_BUFFER
+        if (ebo) { auto it = g_vboShadow.find(ebo); if (it != g_vboShadow.end()) ib = it->second.data() + (uintptr_t)indices; }
+        else ib = (const uint8_t*)indices;
+    }
+
+    float zmin = 1e30f, zmax = -1e30f, xmin = 1e30f, xmax = -1e30f, ymin = 1e30f, ymax = -1e30f;
+    int taken = 0;
+    if (pb && (pa.type == GL_FLOAT || pa.type == GL_SHORT)) {
+        int st = pa.stride ? pa.stride : (int)(pa.size * (pa.type == GL_FLOAT ? 4 : 2));
+        int step = (count > 64) ? (count / 64) : 1;
+        for (int k = 0; k < (int)count; k += step) {
+            int vi = first + k;
+            if (ib) {
+                if (type == GL_UNSIGNED_SHORT) vi = ((const uint16_t*)ib)[k];
+                else if (type == GL_UNSIGNED_BYTE) vi = ib[k];
+                else vi = (int)((const uint32_t*)ib)[k];
+            }
+            const uint8_t* v = pb + (size_t)vi * st;
+            float x, y, z;
+            if (pa.type == GL_FLOAT) { const float* f = (const float*)v; x = f[0]; y = f[1]; z = (pa.size >= 3) ? f[2] : 0.0f; }
+            else { const int16_t* s = (const int16_t*)v; x = s[0]; y = s[1]; z = (pa.size >= 3) ? s[2] : 0.0f; }
+            float cz = mvp[2]*x + mvp[6]*y + mvp[10]*z + mvp[14];
+            float cw = mvp[3]*x + mvp[7]*y + mvp[11]*z + mvp[15];
+            float cx = mvp[0]*x + mvp[4]*y + mvp[8]*z + mvp[12];
+            float cy = mvp[1]*x + mvp[5]*y + mvp[9]*z + mvp[13];
+            if (cw <= 1e-6f) continue;
+            float zw = 0.5f * cz / cw + 0.5f;
+            float sx = (cx / cw * 0.5f + 0.5f), sy = (cy / cw * 0.5f + 0.5f);
+            if (zw < zmin) zmin = zw;
+            if (zw > zmax) zmax = zw;
+            if (sx < xmin) xmin = sx;
+            if (sx > xmax) xmax = sx;
+            if (sy < ymin) ymin = sy;
+            if (sy > ymax) ymax = sy;
+            taken++;
+        }
+    }
+    GLboolean dt = glIsEnabled(GL_DEPTH_TEST), bl = glIsEnabled(GL_BLEND);
+    GLint df = 0, dm = 0;
+    glGetIntegerv(GL_DEPTH_FUNC, &df); glGetIntegerv(GL_DEPTH_WRITEMASK, &dm);
+    const float* P = g_projectionStack.back().data();
+    float pn = 0.0f, pf = 0.0f;
+    if (P[11] > 0.5f) { pn = -P[14] / (1.0f + P[10]); pf = P[14] / (1.0f - P[10]); }
+    else if (P[11] < -0.5f) { pn = P[14] / (P[10] - 1.0f); pf = P[14] / (P[10] + 1.0f); }
+    char bb[320];
+    snprintf(bb, sizeof(bb), "[A6-DRAW] к=%d n=%03d в=%d тек=%u тест=%d/%d маска=%d/%d func=0x%x/0x%x цвет=%d бленд=%d "
+                             "бл=%.4g/%.4g z=%.7f..%.7f экр=%.3f,%.3f..%.3f,%.3f взято=%d",
+             g_a6FrameNo, seq, (int)count, (unsigned)g_cpuActiveTexture,
+             (int)dt, (int)g_depthTestEnabled, (int)dm, (int)g_depthMask,
+             (unsigned)df, (unsigned)g_depthFunc, g_a6TintClass, (int)bl,
+             (double)pn, (double)pf,
+             (double)(taken ? zmin : -1.0f), (double)(taken ? zmax : -1.0f),
+             (double)xmin, (double)ymin, (double)xmax, (double)ymax, taken);
+    _LogToJava(bb);
+    seq++;
+}
+
 extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     SyncLog("[GL-TRACE] glDrawArrays(mode=" + std::to_string(mode) + ", first=" + std::to_string(first) + ", count=" + std::to_string(count) + ")");
     g_frameHasDraw = true;
@@ -5966,6 +6651,7 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
             }
         }
         int rotQuarters = FrameRotQuarters(targetW, targetH);
+        g_a6DrawCount = (int)count;
         if (!ApplyFixedFunctionState(rotQuarters)) {
             GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
             if (prog > 0) {
@@ -5973,7 +6659,12 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
                 if (rotLoc != -1) glUniform1f(rotLoc, (float)rotQuarters);
             }
         }
+        A6DumpDraw(first, count, nullptr, 0);
+        ResetWindowDepthStencil();
+        A6FarClear();
+        bool skyMasked = A6SkyMaskBegin();
         glDrawArrays(mode, first, count);
+        if (skyMasked) glDepthMask(GL_TRUE);
         A6ProbePixel("DA", (int)count);
     } else {
         CPUExtractAndDraw(mode, first, count, nullptr, 0);
@@ -6199,6 +6890,7 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
             }
         }
         int rotQuarters = FrameRotQuarters(targetW, targetH);
+        g_a6DrawCount = (int)count;
         if (!ApplyFixedFunctionState(rotQuarters)) {
             GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
             if (prog > 0) {
@@ -6206,7 +6898,12 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
                 if (rotLoc != -1) glUniform1f(rotLoc, (float)rotQuarters);
             }
         }
+        A6DumpDraw(0, count, indices, type);
+        ResetWindowDepthStencil();
+        A6FarClear();
+        bool skyMasked = A6SkyMaskBegin();
         glDrawElements(mode, count, type, indices);
+        if (skyMasked) glDepthMask(GL_TRUE);
         A6ProbePixel("DE", (int)count);
     } else {
         CPUExtractAndDraw(mode, 0, count, indices, type);
@@ -6297,8 +6994,38 @@ extern "C" void MegaDebug_glColorMask(GLboolean r, GLboolean g, GLboolean b, GLb
     g_colorMask[2] = (b != GL_FALSE); g_colorMask[3] = (a != GL_FALSE);
     if (g_gpuOffloadMask & 32) glColorMask(r, g, b, a);
 }
+extern "C" void A6_glDepthRangef(GLclampf n, GLclampf f) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+    if (A6Dbg()) {
+        static std::set<uint64_t> seenDr;
+        union { float v; uint32_t u; } a, b;
+        a.v = n; b.v = f;
+        uint64_t k = ((uint64_t)a.u << 32) | (uint64_t)b.u;
+        if (seenDr.size() < 12 && seenDr.insert(k).second) {
+            char bb[96];
+            snprintf(bb, sizeof(bb), "[A6-DRANGE] glDepthRangef %.6g .. %.6g", (double)n, (double)f);
+            _LogToJava(bb);
+        }
+    }
+    glDepthRangef(n, f);
+}
+extern "C" void A6_glPolygonOffset(GLfloat factor, GLfloat units) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+    if (A6Dbg()) {
+        static std::set<uint64_t> seenPo;
+        union { float v; uint32_t u; } a, b;
+        a.v = factor; b.v = units;
+        uint64_t k = ((uint64_t)a.u << 32) | (uint64_t)b.u;
+        if (seenPo.size() < 12 && seenPo.insert(k).second) {
+            char bb[96];
+            snprintf(bb, sizeof(bb), "[A6-POFF] glPolygonOffset %.6g %.6g", (double)factor, (double)units);
+            _LogToJava(bb);
+        }
+    }
+    glPolygonOffset(factor, units);
+}
 extern "C" void MegaDebug_glDepthFunc(GLenum func) {
     g_depthFunc = func;
+    // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: LEQUAL -> LESS, чтобы отличить драку с самим собой.
+    if (g_a6ZLess && func == GL_LEQUAL) func = GL_LESS;
     if (g_gpuOffloadMask & 32) glDepthFunc(func);
 }
 extern "C" const GLubyte* MegaDebug_glGetString(GLenum name) {
@@ -7482,6 +8209,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
             }
             g_a6FrameNo++; A6Log("[A6-RTT] ===== PRESENT =====");
+            if (A6Dbg() && g_a6FrameNo > 0 && (g_a6FrameNo % 1200) == 0) A6MipDump();
             if (A6_FPS_CAP > 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: проверка гипотезы «гонка от высокого fps»
                 static uint64_t nextNs = 0;
                 const uint64_t step = 1000000000ull / A6_FPS_CAP;
@@ -15898,7 +16626,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(OSAtomicOr32Barrier), STB_W(OSAtomicTestAndClearBarrier), STB_W(OSSpinLockLock), STB_W(OSSpinLockTry), STB_W(OSSpinLockUnlock), STB_W(OSMemoryBarrier),
     {"___udivmodsi4", (void*)wrap___udivmodsi4}, {"_strerror", (void*)(char*(*)(int))strerror},
 
-    STB_S(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_S(glCopyTexImage2D), STB_S(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, STB_D(glDepthRangef), {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), STB_D(glPolygonOffset), STB_S(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_S(glTexParameterf), STB_S(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
+    STB_S(glActiveTexture), STB_S(glBindBuffer), STB_S(glBindTexture),    STB_D(glBlendColor), STB_D(glBlendEquation), {"_glBlendEquationOES", (void*)glBlendEquation}, {"_glBlendFunc", (void*)MegaDebug_glBlendFunc}, {"_glBlendFuncSeparate", (void*)MegaDebug_glBlendFuncSeparate}, {"_glBlendFuncSeparateOES", (void*)MegaDebug_glBlendFuncSeparate}, STB_S(glBufferData), STB_S(glBufferSubData), STB_D(glClearDepthf), STB_S(glCompressedTexImage2D), STB_S(glCompressedTexSubImage2D), STB_S(glCopyTexImage2D), STB_S(glCopyTexSubImage2D), STB_D(glClearStencil), {"_glColorMask", (void*)MegaDebug_glColorMask}, {"_glCullFace", (void*)MegaDebug_glCullFace}, STB_S(glDeleteBuffers), STB_D(glDeleteFramebuffers), {"_glDeleteFramebuffersOES", (void*)glDeleteFramebuffers}, STB_D(glDeleteProgram), STB_D(glDeleteRenderbuffers), {"_glDeleteRenderbuffersOES", (void*)glDeleteRenderbuffers}, STB_D(glDeleteShader), STB_D(glDeleteTextures), {"_glDepthFunc", (void*)MegaDebug_glDepthFunc}, {"_glDepthMask", (void*)MegaDebug_glDepthMask}, {"_glDepthRangef", (void*)A6_glDepthRangef}, {"_glDisable", (void*)MegaDebug_glDisable}, STB_S(glDisableVertexAttribArray), {"_glDrawArrays", (void*)MegaDebug_glDrawArrays}, STB_D(glFlush), {"_glFramebufferTexture2D", (void*)Stub_glFramebufferTexture2D}, {"_glFramebufferTexture2DOES", (void*)Stub_glFramebufferTexture2D}, {"_glFrontFace", (void*)MegaDebug_glFrontFace}, {"_glGenBuffers", (void*)Stub_glGenBuffers}, STB_D(glGenTextures), STB_D(glGenerateMipmap), {"_glGenerateMipmapOES", (void*)glGenerateMipmap}, STB_D(glGetActiveAttrib), STB_D(glGetActiveUniform), {"_glGetError", (void*)MegaDebug_glGetError}, STB_W(glGetFloatv), {"_glGetIntegerv", (void*)MegaDebug_glGetIntegerv}, {"_glGetProgramInfoLog", (void*)MegaDebug_glGetProgramInfoLog}, STB_D(glGetProgramiv), {"_glGetString", (void*)MegaDebug_glGetString}, STB_D(glHint), STB_D(glLineWidth), STB_W(glMapBufferOES), STB_D(glPixelStorei), {"_glPolygonOffset", (void*)A6_glPolygonOffset}, STB_S(glReadPixels), STB_S(glRenderbufferStorageMultisampleAPPLE), STB_D(glSampleCoverage), STB_W(glScissor), STB_D(glStencilFunc), STB_D(glStencilMask), STB_D(glStencilOp), STB_S(glTexImage2D), STB_S(glTexParameterf), STB_S(glTexParameteri), STB_S(glTexSubImage2D), STB_D(glUniform1f), STB_D(glUniform1fv), STB_W(glUniform1i), STB_D(glUniform1iv),     STB_D(glUniform2fv), STB_D(glUniform2iv), STB_D(glUniform3fv), STB_D(glUniform3iv), STB_W(glUniformMatrix3fv), STB_W(glUniform4fv), STB_D(glUniform4iv), STB_W(glUnmapBufferOES), STB_W(glValidateProgram), {"_glVertexAttrib4f", (void*)Stub_glVertexAttrib4f}, {"_glVertexAttrib4fv", (void*)Stub_glVertexAttrib4fv}, {"_glGetVertexAttribiv", (void*)Stub_glGetVertexAttribiv}, {"_glGetVertexAttribPointerv", (void*)Stub_glGetVertexAttribPointerv},
 
 
     STB_W(CFRetain), STB_W(CFRelease), STB_W(CFStringCreateWithCString), STB_W(CFStringGetLength),
@@ -17728,6 +18456,14 @@ void* NativeExecutionThread(void* arg) {
     LogToJava("NativeExecutionThread: Поток запущен, настраиваем EGL...");
     if (!eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext)) { LogToJava("КРИТИЧЕСКАЯ ОШИБКА: eglMakeCurrent не сработал!"); return nullptr; }
     
+    if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: реальная разрядность буфера кадра
+        GLint db = -1, sb = -1, rb = -1, ab = -1;
+        glGetIntegerv(GL_DEPTH_BITS, &db); glGetIntegerv(GL_STENCIL_BITS, &sb);
+        glGetIntegerv(GL_RED_BITS, &rb); glGetIntegerv(GL_ALPHA_BITS, &ab);
+        char bb[160];
+        snprintf(bb, sizeof(bb), "[A6-FBBITS] depth=%d stencil=%d red=%d alpha=%d", (int)db, (int)sb, (int)rb, (int)ab);
+        _LogToJava(bb);
+    }
     // --- MEGA DEBUG: ПРОВЕРКА СОСТОЯНИЯ EGL СРАЗУ ПОСЛЕ ИНИЦИАЛИЗАЦИИ ---
     EGLContext ctx = eglGetCurrentContext();
     EGLDisplay dpy = eglGetCurrentDisplay();
@@ -19959,8 +20695,47 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%sdamn32_log.txt", wd);
     env->ReleaseStringUTFChars(workDir, wd);
     g_a6DebugEnabled = (access((g_workDir + "a6debug").c_str(), F_OK) == 0);
+    g_a6NoMip = (access((g_workDir + "a6nomip").c_str(), F_OK) == 0);
+    g_a6SkipGameMips = (access((g_workDir + "a6nogamemip").c_str(), F_OK) == 0);
+    g_a6ColorMips = (access((g_workDir + "a6colormip").c_str(), F_OK) == 0);
+    g_a6CpuMips = (access((g_workDir + "a6cpumip").c_str(), F_OK) == 0);
+    g_a6AlphaRef0 = (access((g_workDir + "a6aref0").c_str(), F_OK) == 0);
+    g_a6NoAlphaTest = (access((g_workDir + "a6noat").c_str(), F_OK) == 0);
+    g_a6ForceOpaque = (access((g_workDir + "a6opaque").c_str(), F_OK) == 0);
+    g_a6AtShow = (access((g_workDir + "a6atshow").c_str(), F_OK) == 0);
+    g_a6Clean = (access((g_workDir + "a6clean").c_str(), F_OK) == 0);
+    g_a6NoCull = (access((g_workDir + "a6nocull").c_str(), F_OK) == 0);
+    g_a6NoStencil = (access((g_workDir + "a6nostencil").c_str(), F_OK) == 0);
+    g_a6NoBlend = (access((g_workDir + "a6noblend").c_str(), F_OK) == 0);
+    g_a6NoScissor = (access((g_workDir + "a6noscissor").c_str(), F_OK) == 0);
+    if (access((g_workDir + "a6notex").c_str(), F_OK) == 0) g_a6TexDbg = 1;
+    else if (access((g_workDir + "a6stage0").c_str(), F_OK) == 0) g_a6TexDbg = 2;
+    else if (access((g_workDir + "a6ashow").c_str(), F_OK) == 0) g_a6TexDbg = 3;
+    else if (access((g_workDir + "a6blendid").c_str(), F_OK) == 0) g_a6TexDbg = 4;
+    else if (access((g_workDir + "a6zshow").c_str(),   F_OK) == 0) g_a6TexDbg = 5;
+    g_a6SplitMvp = (access((g_workDir + "a6splitmvp").c_str(), F_OK) == 0);
+    g_a6NoDepth = (access((g_workDir + "a6nodepth").c_str(), F_OK) == 0);
+    g_a6Depth24 = (access((g_workDir + "a6depth24").c_str(), F_OK) == 0);
+    g_a6ZClear  = (access((g_workDir + "a6zclr").c_str(), F_OK) == 0);
+    g_a6LogZ    = (access((g_workDir + "a6logz").c_str(), F_OK) == 0);
+    g_a6FarX    = (access((g_workDir + "a6farx").c_str(), F_OK) == 0) ? 4.0f : 1.0f;
+    g_a6ZLess   = (access((g_workDir + "a6zless").c_str(), F_OK) == 0);
+    g_a6DrawDump = (access((g_workDir + "a6draws").c_str(), F_OK) == 0);
+    g_a6FarTint = (access((g_workDir + "a6fartint").c_str(), F_OK) == 0);
+    g_a6SkyMask = (access((g_workDir + "a6skymask").c_str(), F_OK) == 0);
+    g_a6FarClear = (access((g_workDir + "a6farclear").c_str(), F_OK) == 0);
+    g_a6SubMips = (access((g_workDir + "a6submip").c_str(), F_OK) == 0);
+    if (access((g_workDir + "a6lodbias1").c_str(), F_OK) == 0) g_a6LodBias = -1.0f;
+    else if (access((g_workDir + "a6lodbias").c_str(), F_OK) == 0) g_a6LodBias = -2.0f;
     // Java удаляет damn32_log.txt перед запуском — старый fd указывал бы на удалённый инод.
     ResetLogFile();
+    {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: какие экспериментальные метки реально подхвачены
+        char bb[160];
+        snprintf(bb, sizeof(bb), "[A6-MARK] logz=%d farx=%.3g zless=%d fartint=%d skymask=%d farclear=%d",
+                 (int)g_a6LogZ, (double)g_a6FarX, (int)g_a6ZLess,
+                 (int)g_a6FarTint, (int)g_a6SkyMask, (int)g_a6FarClear);
+        _LogToJava(bb);
+    }
 
     const char* bId = env->GetStringUTFChars(bundleId, 0);
     std::string bundleIdStr = bId;
@@ -20041,10 +20816,20 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, 
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT, 
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 0,
-        EGL_DEPTH_SIZE, 16, EGL_STENCIL_SIZE, 8, 
+        // 16 бит глубины не хватало дальнему плану: здания на горизонте боролись
+        // за глубину с фоном и рассыпались в крошку.
+        EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
         EGL_NONE 
     };
     EGLConfig config; EGLint numConfigs; eglChooseConfig(g_eglDisplay, attribs, &config, 1, &numConfigs);
+    {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: что реально дал драйвер
+        EGLint d = -1, st = -1;
+        eglGetConfigAttrib(g_eglDisplay, config, EGL_DEPTH_SIZE, &d);
+        eglGetConfigAttrib(g_eglDisplay, config, EGL_STENCIL_SIZE, &st);
+        char b[128];
+        snprintf(b, sizeof(b), "[A6-EGL] конфигов=%d глубина=%d трафарет=%d", (int)numConfigs, (int)d, (int)st);
+        _LogToJava(b);
+    }
     const EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE }; g_eglContext = eglCreateContext(g_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
     if (g_gpuOffloadMask & 1) {
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, config, g_nativeWindow, nullptr);
