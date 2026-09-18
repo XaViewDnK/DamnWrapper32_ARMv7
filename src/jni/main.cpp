@@ -22,6 +22,7 @@
 #include <ucontext.h>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -239,6 +240,11 @@ std::vector<uint32_t> g_initFuncs;
 struct MachOSectionInfo { std::string name; uint32_t start; uint32_t end; };
 std::vector<MachOSectionInfo> g_machoSections;
 
+// Точки входа всех функций из LC_FUNCTION_STARTS (адреса до слайда).
+// Эвристический ребейз без этого списка путает мелкие константы вроде 0x10000
+// с указателями на код: 0x10000 попадает внутрь __text и выглядит как ARM-опкод.
+std::unordered_set<uint32_t> g_funcStarts;
+
 struct HLEClass { uint32_t magic; const char* className; };
 std::map<std::string, HLEClass*> g_hleClasses;
 
@@ -330,7 +336,9 @@ int g_debugHeartbeat = 0;
 int g_lastActiveFBO = 0;
 std::set<GLuint> g_texCreatedEmpty;   // ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6
 bool g_isAsphalt6 = false;            // диагностика A6 лезет по абсолютным адресам её образа
+bool g_isAsphalt6Path = false;        // то же, но известно уже в начале LoadMachO (по пути бандла)
 int g_a6FrameNo = 0;   // ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6: номер кадра для выборочных дампов
+int g_a6DrawsToScreen = 0, g_a6DrawsToTex = 0;   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: состав кадра
 int g_a6BlendFrame = -1;
 uint32_t g_a6BlendLr = 0;
 int g_a6BlendOn = -1;
@@ -354,17 +362,18 @@ uint32_t g_a6PassStack[12] = {0};
 static void A6ProbePixel(const char* what, int count);   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
 // ВРЕМЕННАЯ ДИАГНОСТИКА A6: откуда в коде игры пришёл GL-вызов. Импорты игры идут
 // через трамплины враппера, поэтому __builtin_return_address показывает трамплин;
-// настоящий адрес лежит глубже в стеке. Образ игры загружен со slide 0, так что
-// адреса совпадают с дизассемблером. Кандидат подтверждается тем, что предыдущее
+// настоящий адрес лежит глубже в стеке. Возвращается адрес БЕЗ слайда, чтобы
+// совпадать с дизассемблером. Кандидат подтверждается тем, что предыдущее
 // слово декодируется как ARM-инструкция ветвления со ссылкой (BL/BLX).
 static inline uint32_t A6GameCaller() {
     if (!g_isAsphalt6) return 0;
     const uint32_t* stack = (const uint32_t*)__builtin_frame_address(0);
+    const uint32_t lo = g_appSlide + 0x2000, hi = g_appSlide + 0x800000;
     for (int i = 0; i < 192; i++) {
         uint32_t v = stack[i];
-        if (v < 0x2000 || v >= 0x800000 || (v & 3) != 0) continue;
+        if (v < lo || v >= hi || (v & 3) != 0) continue;
         uint32_t prev = *(const uint32_t*)(uintptr_t)(v - 4);
-        if ((prev & 0x0E000000) == 0x0A000000) return v;
+        if ((prev & 0x0E000000) == 0x0A000000) return v - g_appSlide;
     }
     return 0;
 }
@@ -404,7 +413,7 @@ std::map<GLuint, std::map<std::string, GLuint>> g_attribLocations;
 // Программный растеризатор шейдеры не исполняет, поэтому цвет он собирает сам.
 // Чтобы не угадывать, участвует ли uniform-тинт в выходном цвете, исходники
 // шейдеров разбираются один раз на линковке и программе присваивается модель.
-enum SWColorModel { SWCM_DEFAULT = 0, SWCM_TINT = 1, SWCM_SKYMIX = 2 };
+enum SWColorModel { SWCM_DEFAULT = 0, SWCM_TINT = 1, SWCM_SKYMIX = 2, SWCM_ADDDIFFUSE = 3, SWCM_CARPAINT = 4, SWCM_MASKDIFFUSE = 5 };
 std::map<GLuint, std::string> g_shaderSrc;
 std::map<GLuint, int> g_progColorModel;
 std::map<GLuint, bool> g_progSamplesTex1;
@@ -1894,6 +1903,17 @@ void DumpGLState(const std::string& prefix) {
 }
 
 
+// Сырые дампы кадров и текстур идут в подпапку, чтобы не засорять рабочий каталог враппера.
+static const char* DumpDir() {
+    static std::string dir;
+    if (dir.empty()) {
+        dir = g_workDir + "dumps/";
+        mkdir(dir.c_str(), 0777);
+        chmod(dir.c_str(), 0777);
+    }
+    return dir.c_str();
+}
+
 // Вспомогательная функция отключена, чтобы не ломать персистентный стейт игры
 void ForceSafeGLState() {
     // Пусто
@@ -1970,7 +1990,7 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
         if (mask & GL_DEPTH_BUFFER_BIT) a6DepthClears++;
         if ((g_a6FrameNo % 300) == 0 && g_a6FrameNo > 0 && !g_cpuColorBuffer.empty()) {
             char p[192];
-            snprintf(p, sizeof(p), "%sa6_p%d_%dx%d.raw", g_workDir.c_str(), a6DepthClears, g_surfaceWidth, g_surfaceHeight);
+            snprintf(p, sizeof(p), "%sa6_p%d_%dx%d.raw", DumpDir(), a6DepthClears, g_surfaceWidth, g_surfaceHeight);
             FILE* fd = fopen(p, "wb");
             if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
             LogToJava(std::string("[A6-RTT] дамп прохода -> ") + p);
@@ -2301,8 +2321,9 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, overlayTex);
             
-            if (A6Dbg() && (g_a6FrameNo % 300) == 0 && g_a6FrameNo > 0) {
-                char p[160]; snprintf(p, sizeof(p), "%sdump_999_%dx%d.raw", g_workDir.c_str(), g_surfaceWidth, g_surfaceHeight);
+            if (A6Dbg() && (g_a6FrameNo % 300) < 6 && g_a6FrameNo > 0) {
+                // ВРЕМЕННАЯ ДИАГНОСТИКА A6: шесть подряд идущих кадров — ловим тряску
+                char p[160]; snprintf(p, sizeof(p), "%sdump_кадр%d_%dx%d.raw", DumpDir(), g_a6FrameNo, g_surfaceWidth, g_surfaceHeight);
                 FILE* fd = fopen(p, "wb");
                 if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
                 int aMin = 255, aMax = 0; long aSum = 0;
@@ -2368,13 +2389,12 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             int copyH = (buffer.height < (int32_t)g_surfaceHeight) ? buffer.height : g_surfaceHeight;
             if (A6Dbg()) {
                 static int once = 0;
-                if ((once++ % 300) == 0) {
-                    char path[192];
-                    snprintf(path, sizeof(path), "%sframe_%dx%d.raw", g_workDir.c_str(), g_surfaceWidth, g_surfaceHeight);
-                    FILE* f = fopen(path, "wb");
-                    if (f) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, f); fclose(f); }
-                    LogToJava(std::string("[A6-WIN] кадр сброшен в ") + path);
-                }
+                once++;
+                char inf[192];
+                snprintf(inf, sizeof(inf), "[A6-WIN] презент %d кадр#%d наэкран=%d втекстуру=%d",
+                         once, g_a6FrameNo, g_a6DrawsToScreen, g_a6DrawsToTex);
+                _LogToJava(inf);
+                g_a6DrawsToScreen = 0; g_a6DrawsToTex = 0;
             }
             // Экранный кадр всегда непрозрачен: альфа в цветовом буфере — побочный продукт
             // блендинга, и если отдать её SurfaceFlinger, он подмешает фон окна и кадр
@@ -2460,6 +2480,31 @@ std::string A6SafeStr(uint32_t addr) {
     if (good < 4 || (good < n && buf[good] != 0)) return "";
     buf[good] = 0;
     return buf;
+}
+
+// Гостевой стек: возвраты игры через стабы теряются для __builtin_return_address, поэтому
+// просто просеиваем стек на значения, попадающие в __text слайса, и печатаем их как vmaddr.
+std::string A6GuestStack(int maxN) {
+    uint32_t lo = 0, hi = 0;
+    for (const auto& sec : g_machoSections) {
+        if (sec.name.find("__text") != std::string::npos) { lo = sec.start; hi = sec.end; break; }
+    }
+    if (lo == 0) return " <нет __text>";
+    uint32_t* sp = (uint32_t*)__builtin_frame_address(0);
+    std::string out;
+    uint32_t prev = 0;
+    for (int i = 0; i < 512 && maxN > 0; i++) {
+        uint32_t v;
+        if (!A6SafeRead(sp + i, &v, 4)) break;
+        if (v > lo && v < hi && v != prev) {
+            char b[16];
+            snprintf(b, sizeof(b), " %06x", (unsigned)(v - lo + 0x3720));
+            out += b;
+            prev = v;
+            maxN--;
+        }
+    }
+    return out;
 }
 
 // Имя эффекта движка glitch::video лежит по смещению 8 внутри объекта эффекта.
@@ -2635,6 +2680,27 @@ extern "C" void Stub_glBindFramebuffer(GLenum target, GLuint framebuffer) {
         A6NoteGlThread("bindFB");
         if ((g_gpuOffloadMask & 64) && g_lastActiveFBO > 1 && framebuffer <= 1 && (g_a6FrameNo % 60) == 0)
             A6ProbeRttContents();
+        // ВРЕМЕННАЯ ДИАГНОСТИКА A6: что осталось в offscreen-текстуре на программном пути
+        if (!(g_gpuOffloadMask & 16) && g_lastActiveFBO > 1 && framebuffer <= 1 && (g_a6FrameNo % 30) == 0) {
+            GLuint tex = g_fboColorTex.count(g_lastActiveFBO) ? g_fboColorTex[g_lastActiveFBO] : 0;
+            int w = (tex && g_cpuTexW.count(tex)) ? g_cpuTexW[tex] : 0;
+            int h = (tex && g_cpuTexH.count(tex)) ? g_cpuTexH[tex] : 0;
+            int nz = 0, maxA = -1;
+            if (tex && g_cpuTextures.count(tex)) {
+                const std::vector<uint32_t>& px = g_cpuTextures[tex];
+                for (size_t i = 0; i < px.size(); i++) {
+                    if (px[i] & 0x00FFFFFF) nz++;
+                    int a = (int)(px[i] >> 24);
+                    if (a > maxA) maxA = a;
+                }
+            }
+            char b[192];
+            snprintf(b, sizeof(b), "[A6-RTT] SWFBO #%d fbo=%u tex=%u %dx%d draws=%d nz=%d maxA=%d",
+                     g_a6FrameNo, (unsigned)g_lastActiveFBO, (unsigned)tex, w, h,
+                     g_a6FboDraws[g_lastActiveFBO], nz, maxA);
+            _LogToJava(b);
+            g_a6FboDraws[g_lastActiveFBO] = 0;
+        }
     }
     if (A6Dbg() && framebuffer != g_lastActiveFBO) {
         A6Log("[A6-RTT] FBO " + std::to_string(g_lastActiveFBO) + " -> " + std::to_string(framebuffer));
@@ -2749,6 +2815,20 @@ void ApplyGpuViewport() {
     }
 }
 
+// Программный растр раньше всегда растягивал NDC на всю цель. Проход в текстуру, где игра
+// просит вьюпорт меньше самой текстуры (Asphalt 6 рисует 480x320 внутри 512x512), от этого
+// растягивался, и композит такого RTT на экран расходился с кадрами прямого прохода.
+// Кадр экрана трогать нельзя: там вьюпорт задан в системе игры и повёрнут относительно цели.
+// Отступ отсчитывается от низа цели, как в GL: композитный квад читает RTT с переворотом
+// по Y, поэтому кадр обязан лежать в нижних строках буфера, а не в верхних.
+void SWViewportForTarget(int targetW, int targetH, int& vpX, int& vpY, int& vpW, int& vpH) {
+    vpX = 0; vpY = 0; vpW = targetW; vpH = targetH;
+    if (FrameRotQuarters(targetW, targetH) != 0) return;
+    GLint w = g_reqViewport[2], h = g_reqViewport[3];
+    if (w <= 0 || h <= 0 || w > targetW || h > targetH) return;
+    vpX = g_reqViewport[0]; vpY = g_reqViewport[1]; vpW = w; vpH = h;
+}
+
 extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (width == 0 && height == 0) {
         g_isFakeViewport = true;
@@ -2780,6 +2860,7 @@ extern "C" void Stub_glVertexAttrib4f(GLuint index, GLfloat v0, GLfloat v1, GLfl
         g_vertexAttribs[index].constantValue[2] = v2;
         g_vertexAttribs[index].constantValue[3] = v3;
     }
+    if (g_gpuOffloadMask & 16) glVertexAttrib4f(index, v0, v1, v2, v3);
 }
 
 extern "C" void Stub_glVertexAttrib4fv(GLuint index, const GLfloat *v) {
@@ -2789,6 +2870,7 @@ extern "C" void Stub_glVertexAttrib4fv(GLuint index, const GLfloat *v) {
         g_vertexAttribs[index].constantValue[2] = v[2];
         g_vertexAttribs[index].constantValue[3] = v[3];
     }
+    if ((g_gpuOffloadMask & 16) && v) glVertexAttrib4fv(index, v);
 }
 
 extern "C" void Stub_glGetVertexAttribiv(GLuint index, GLenum pname, GLint *params) {
@@ -2889,7 +2971,51 @@ extern "C" void Stub_glShaderSource(GLuint shader, GLsizei count, const GLchar *
     {
         std::string hdr = "[SHADER-DUMP] RAW id=" + std::to_string(shader) + " count=" + std::to_string(count) + " lens=";
         for (int i = 0; i < count; i++) hdr += std::to_string(length ? length[i] : -1) + ",";
+        // ВРЕМЕННАЯ ДИАГНОСТИКА A6: границы кусков. В склеенном исходнике всплывает
+        // мусорный токен, и надо знать, на стыке какого куска он появляется.
+        for (int i = 0; i < count; i++) {
+            const char* cs = string[i];
+            if (!cs) { hdr += "\n  [" + std::to_string(i) + "] NULL"; continue; }
+            int cl = (length && length[i] >= 0) ? length[i] : (int)strlen(cs);
+            std::string tail;
+            for (int j = (cl > 24 ? cl - 24 : 0); j < cl; j++) {
+                char c = cs[j];
+                tail += (c >= 32 && c <= 126) ? c : '.';
+            }
+            hdr += "\n  [" + std::to_string(i) + "] len=" + std::to_string(cl) + " хвост=<" + tail + ">";
+        }
         LogToJava(hdr + "\n=== RAW ===\n" + fullSrc + "\n===========");
+    }
+
+    // Asphalt 6 отдаёт шейдеры с мусорным токеном в строке препроцессора
+    // (`#endif]`). Компилятор Adreno на таком исходнике падает по NULL вместо
+    // того, чтобы вернуть ошибку компиляции, поэтому чистим сами: в строке,
+    // начинающейся с '#', скобки не значат ничего, кроме опечатки.
+    {
+        std::string cleaned;
+        cleaned.reserve(fullSrc.size());
+        size_t lineStart = 0;
+        while (lineStart <= fullSrc.size()) {
+            size_t lineEnd = fullSrc.find('\n', lineStart);
+            if (lineEnd == std::string::npos) lineEnd = fullSrc.size();
+            std::string line = fullSrc.substr(lineStart, lineEnd - lineStart);
+            size_t firstNonWs = line.find_first_not_of(" \t\r");
+            if (firstNonWs != std::string::npos && line[firstNonWs] == '#') {
+                std::string stripped;
+                for (char c : line) {
+                    if (c == '[' || c == ']') continue;
+                    stripped += c;
+                }
+                if (stripped != line)
+                    LogToJava("[SHADER-DUMP] Убран мусор из директивы: <" + line + "> -> <" + stripped + ">");
+                line = stripped;
+            }
+            cleaned += line;
+            if (lineEnd == fullSrc.size()) break;
+            cleaned += '\n';
+            lineStart = lineEnd + 1;
+        }
+        fullSrc = cleaned;
     }
 
     // БУЛЬДОЗЕР 3.0: Интеллектуальный разделитель шейдеров
@@ -2944,22 +3070,55 @@ extern "C" void Stub_glShaderSource(GLuint shader, GLsizei count, const GLchar *
     }
 
     std::string patched = fullSrc;
-    if (patched.find("precision") == std::string::npos) {
-        std::string prec = "";
-        if (patched.find("gl_FragColor") != std::string::npos || patched.find("texture2D") != std::string::npos) {
-            prec = "precision mediump float;\n";
-        } else if (patched.find("gl_Position") != std::string::npos) {
-            prec = "precision highp float;\n";
-        }
-        if (!prec.empty()) {
-            size_t verPos = patched.find("#version");
-            if (verPos != std::string::npos) {
-                size_t nl = patched.find('\n', verPos);
-                if (nl != std::string::npos) patched.insert(nl + 1, prec);
-                else patched = prec + patched;
-            } else {
-                patched = prec + patched;
+
+    // GLSL ES требует, чтобы #extension стояли выше любого непрепроцессорного
+    // токена, а Asphalt прячет их внутрь #if. Поднимаем их в начало: иначе наша
+    // же строка precision оказывается выше и компилятор отвергает шейдер.
+    // Директивы с require не трогаем — их перенос из ложной ветки сделал бы
+    // обязательным расширение, которого у драйвера может не быть.
+    std::string extBlock;
+    {
+        std::string rest;
+        size_t ls = 0;
+        while (ls <= patched.size()) {
+            size_t le = patched.find('\n', ls);
+            if (le == std::string::npos) le = patched.size();
+            std::string line = patched.substr(ls, le - ls);
+            size_t p = line.find_first_not_of(" \t\r");
+            bool isExt = false;
+            if (p != std::string::npos && line[p] == '#') {
+                size_t q = line.find_first_not_of(" \t", p + 1);
+                if (q != std::string::npos && line.compare(q, 9, "extension") == 0) isExt = true;
             }
+            if (isExt && line.find("require") == std::string::npos) {
+                std::string norm = line.substr(p) + "\n";
+                if (extBlock.find(norm) == std::string::npos) extBlock += norm;
+            } else {
+                rest += line;
+                if (le != patched.size()) rest += "\n";
+            }
+            if (le == patched.size()) break;
+            ls = le + 1;
+        }
+        patched = rest;
+    }
+
+    std::string prefix = extBlock;
+    if (patched.find("precision") == std::string::npos) {
+        if (patched.find("gl_FragColor") != std::string::npos || patched.find("texture2D") != std::string::npos) {
+            prefix += "precision mediump float;\n";
+        } else if (patched.find("gl_Position") != std::string::npos) {
+            prefix += "precision highp float;\n";
+        }
+    }
+    if (!prefix.empty()) {
+        size_t verPos = patched.find("#version");
+        if (verPos != std::string::npos) {
+            size_t nl = patched.find('\n', verPos);
+            if (nl != std::string::npos) patched.insert(nl + 1, prefix);
+            else patched = prefix + patched;
+        } else {
+            patched = prefix + patched;
         }
     }
 
@@ -2988,10 +3147,11 @@ extern "C" void Stub_glShaderSource(GLuint shader, GLsizei count, const GLchar *
 
     const GLchar* p = patched.c_str();
     GLint l = patched.length();
-    glShaderSource(shader, 1, &p, &l); 
+    glShaderSource(shader, 1, &p, &l);
 }
 
 extern "C" void Stub_glCompileShader(GLuint shader) { glCompileShader(shader); GLint status = 0; glGetShaderiv(shader, GL_COMPILE_STATUS, &status); if (status == GL_FALSE) { GLint logLength = 0; glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength); if (logLength > 0) { std::vector<char> log(logLength); glGetShaderInfoLog(shader, logLength, nullptr, log.data()); LogToJava(std::string("[SHADER-DUMP] ОШИБКА КОМПИЛЯЦИИ: ") + log.data()); } } }
+
 // Определяет, как программа собирает выходной цвет, по исходникам её шейдеров.
 // Проверять именно присваивания обязательно: в renderchunk CURRENT_COLOR — это
 // скалярное смещение тумана (len += CURRENT_COLOR.r), а не тинт, и умножать
@@ -3003,7 +3163,23 @@ static int DetectSWColorModel(const std::string& src) {
         if (!isspace((unsigned char)src[i])) s += src[i];
     }
 
+    // Шейдер автопокраски glitch считает цвет сам из направленного света, а имена его
+    // уникформ («Light0Specularcolor») попадают под общую маску Diffuse/Color, и геометрия
+    // умножалась на нулевой вектор бликов — кузов выходил чёрным.
+    // Общий шейдер объявляет те же уникформы под #ifdef LIGHTING, поэтому опознаём
+    // автопокраску по её отражению: reflectionColor есть только у неё.
+    if (s.find("reflectionColor") != std::string::npos &&
+        s.find("Light0Ambientcolor.rgb") != std::string::npos) return SWCM_CARPAINT;
+
+    // Миникарта гонки: цвет берётся из второго сэмплера, а первый даёт только альфа-маску.
+    // Однотекстурный растеризатор красил квад маской и выдавал чёрный прямоугольник.
+    if (s.find("maskTexColor.a*diffuseTexColor.a") != std::string::npos) return SWCM_MASKDIFFUSE;
+
     if (s.find("mix(CURRENT_COLOR,FOG_COLOR,") != std::string::npos) return SWCM_SKYMIX;
+
+    // У Asphalt 6 DiffuseColor в UI-шейдере прибавляется к текселю, а не умножается.
+    // Умножение обнуляло альфу (игра шлёт нулевой вектор) и весь интерфейс пропадал.
+    if (s.find("+DiffuseColor") != std::string::npos) return SWCM_ADDDIFFUSE;
 
     static const char* kTargets[] = {"gl_FragColor=", "color=", "diffuse="};
     for (size_t t = 0; t < sizeof(kTargets) / sizeof(kTargets[0]); t++) {
@@ -3036,9 +3212,14 @@ extern "C" void Stub_glLinkProgram(GLuint program) {
         int m = DetectSWColorModel(src);
         if (m > model) model = m;
         if (src.find("TEXTURE_1") != std::string::npos) samplesTex1 = true;
+        if (m == SWCM_MASKDIFFUSE) samplesTex1 = true;
     }
     g_progColorModel[program] = model;
     g_progSamplesTex1[program] = samplesTex1;
+    for (GLsizei i = 0; i < nAttached; i++) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: полный текст шейдеров программы
+        if (!g_shaderSrc.count(attached[i])) continue;
+        A6Log("[A6-SRC] программа " + std::to_string(program) + " шейдер " + std::to_string(attached[i]) + ":\n" + g_shaderSrc[attached[i]]);
+    }
     LogToJava("[SHADER-DUMP] Программа " + std::to_string(program) + ": модель цвета CPU = " + std::to_string(model) + " tex1=" + std::to_string((int)samplesTex1));
 }
 
@@ -3086,7 +3267,7 @@ static void A6DumpTexture(GLuint tex, const std::vector<uint32_t>& buf, int w, i
     static std::set<GLuint> dumped;
     if (tex > 64 || !dumped.insert(tex).second) return;
     char p[192];
-    snprintf(p, sizeof(p), "%sa6tex_%02u_%dx%d.raw", g_workDir.c_str(), (unsigned)tex, w, h);
+    snprintf(p, sizeof(p), "%sa6tex_%02u_%dx%d.raw", DumpDir(), (unsigned)tex, w, h);
     FILE* f = fopen(p, "wb");
     if (f) { fwrite(buf.data(), 4, (size_t)w * h, f); fclose(f); }
 }
@@ -3204,13 +3385,25 @@ static inline void SWApplyTexEnv(GLenum envMode, const SWTexCombine& C,
 float g_a6RawC0[4] = {0};   // цвет первой вершины до освещения
 float g_a6UV[4] = {0};      // umin,vmin,umax,vmax за отрисовку
 bool g_a6TintByTexture = false;
-static long g_dbgPixels = 0, g_dbgSkipA0 = 0;
+static long g_dbgPixels = 0, g_dbgSkipA0 = 0, g_dbgLumSum = 0;
+static int g_a6SwDrawLines = 0;
+static int g_a6CornerLines = 0;
+static int g_a6ShakeLines = 0;
+static long g_dbgTexLumSum = 0, g_dbgTexN = 0;
+static float g_dbgUvBB[4] = {1e9f, -1e9f, 1e9f, -1e9f};
+static int g_dbgBB[4] = {1 << 30, -1, 1 << 30, -1};
+static uint8_t g_dbgHits[512 * 512];
+static bool g_dbgHitsOn = false;
+static float g_dbgRawUv[4][4];
+static int g_dbgUvN = 0;
 // куда деваются пиксели draw'а
 static long g_dbgCovered = 0, g_dbgRejDepth = 0, g_dbgRejW = 0, g_dbgRejAT = 0;
 static double g_dbgZfMin = 0, g_dbgZfMax = 0, g_dbgZbMin = 0, g_dbgZbMax = 0;
 // сырые позиции первых вершин и параметры массива
 static float g_dbgRawPos[6][4];
 static int g_dbgRawN = 0, g_dbgPosSize = 0, g_dbgPosStride = 0;
+static float g_dbgFirstCol[4] = {0,0,0,0};
+static int g_dbgColEnabled = 0, g_dbgColSize = 0; static unsigned g_dbgColType = 0;
 static unsigned g_dbgPosType = 0;
 static float g_dbgMvp[16];
 extern int g_clientActiveTexture;
@@ -3468,6 +3661,16 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
         if (noCtx++ < 20) A6Log("[A6-NOCTX] glTexImage2D без контекста, поток " +
                                     std::to_string((long)pthread_self()) + " w=" + std::to_string(width) +
                                     " h=" + std::to_string(height));
+    }
+    if (A6Dbg() && level == 0) {
+        static int texN = 0;
+        if (texN < 80) {
+            char tb[128];
+            snprintf(tb, sizeof(tb), "[A6-TEXNEW] #%d tex=%u %dx%d фмт=0x%X данные=%d стек",
+                     texN, g_cpuActiveTexture, width, height, (unsigned)format, pixels != nullptr);
+            A6Log(std::string(tb) + A6GuestStack(10));
+        }
+        texN++;
     }
     // Лог с hex-значениями для диагностики
     char logbuf[256];
@@ -4279,8 +4482,13 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
     if (targetDepthBuf->size() != targetColorBuf->size()) {
         targetDepthBuf->assign(targetColorBuf->size(), 1.0f);
     }
+    if (targetColorBuf == &g_cpuColorBuffer) g_a6DrawsToScreen++; else g_a6DrawsToTex++;
     SyncLog("[RENDER] Анализ вызова отрисовки...");
-    g_dbgPixels = 0; g_dbgSkipA0 = 0;
+    g_dbgPixels = 0; g_dbgSkipA0 = 0; g_dbgLumSum = 0; g_dbgUvN = 0;
+    g_dbgTexLumSum = 0; g_dbgTexN = 0;
+    g_dbgUvBB[0] = g_dbgUvBB[2] = 1e9f; g_dbgUvBB[1] = g_dbgUvBB[3] = -1e9f;
+    g_dbgHitsOn = false;
+    g_dbgBB[0] = g_dbgBB[2] = 1 << 30; g_dbgBB[1] = g_dbgBB[3] = -1;
     g_dbgCovered = 0; g_dbgRejDepth = 0; g_dbgRejW = 0; g_dbgRejAT = 0;
     g_dbgZfMin = 1e30; g_dbgZfMax = -1e30; g_dbgZbMin = 1e30; g_dbgZbMax = -1e30;
     g_dbgRawN = 0;
@@ -4293,7 +4501,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         if (g_vboShadow.count(ibo)) iboPtr = g_vboShadow[ibo].data();
     }
 
-    GLint posLoc = -1, colorLoc = -1, texLoc = -1, tex2Loc = -1, idxLoc = -1, weightLoc = -1;
+    GLint posLoc = -1, colorLoc = -1, texLoc = -1, tex2Loc = -1, idxLoc = -1, weightLoc = -1, normLoc = -1;
     char texName[256] = {0};
     char tex2Name[256] = {0};
     if (prog > 0) {
@@ -4309,7 +4517,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             char up[256]; { size_t k = 0; for (; name[k] && k < sizeof(up) - 1; k++) up[k] = toupper((unsigned char)name[k]); up[k] = 0; }
 
             if (strstr(up, "POS") || strstr(up, "VERT")) posLoc = loc;
-            else if (strstr(up, "NORM")) { /* ignore */ }
+            else if (strstr(up, "NORM")) { normLoc = loc; }
             else if (strstr(up, "COLOR") || strstr(up, "COL") || strstr(up, "DIFF")) colorLoc = loc;
             // Растеризатор однотекстурный: из TEXCOORD_0/TEXCOORD_1 нужен нулевой набор
             // (атлас), иначе UV берутся от карты освещения и геометрия выходит белой.
@@ -4345,9 +4553,14 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             float diffuseUniform[4] = {1.0f, 1.0f, 1.0f, 1.0f};
             float currentColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
             float fogColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            float lightAmb[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            float lightDif[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            float lightDirOS[3] = {0.0f, 0.0f, 0.0f};
             int colorModel = (prog > 0 && g_progColorModel.count(prog)) ? g_progColorModel[prog] : SWCM_DEFAULT;
             float texMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             bool hasTexMat = false;
+            float maskMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            float difMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             GLint paletteLoc = -1;
             int paletteSize = 0;
             std::vector<float> bonePalette;
@@ -4363,7 +4576,22 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                     GLint loc = glGetUniformLocation(prog, name);
                     if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 16) memcpy(mvp, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 16 * sizeof(float));
                 }
-                if (u_type == GL_FLOAT_VEC4 && (strstr(name, "Diffuse") || strstr(name, "Color"))) {
+                if (colorModel == SWCM_MASKDIFFUSE && u_type == GL_FLOAT_MAT4 &&
+                    (strstr(name, "MaskMatrix") || strstr(name, "DifMatrix"))) {
+                    GLint loc = glGetUniformLocation(prog, name);
+                    const std::vector<float>* sv = g_uniformShadowFloat.count(UniShadowKey(prog, loc)) ? &g_uniformShadowFloat[UniShadowKey(prog, loc)] : nullptr;
+                    if (sv && sv->size() >= 16)
+                        memcpy(strstr(name, "MaskMatrix") ? maskMat : difMat, sv->data(), 16 * sizeof(float));
+                }
+                if (colorModel == SWCM_CARPAINT) {
+                    GLint loc = glGetUniformLocation(prog, name);
+                    const std::vector<float>* sv = g_uniformShadowFloat.count(UniShadowKey(prog, loc)) ? &g_uniformShadowFloat[UniShadowKey(prog, loc)] : nullptr;
+                    if (sv && sv->size() >= 3) {
+                        if (strstr(name, "Light0Ambientcolor")) memcpy(lightAmb, sv->data(), 3 * sizeof(float));
+                        else if (strstr(name, "Light0Diffusecolor")) memcpy(lightDif, sv->data(), 3 * sizeof(float));
+                        else if (strstr(name, "Light0DirectionOS")) memcpy(lightDirOS, sv->data(), 3 * sizeof(float));
+                    }
+                } else if (u_type == GL_FLOAT_VEC4 && (strstr(name, "Diffuse") || strstr(name, "Color"))) {
                     GLint loc = glGetUniformLocation(prog, name);
                     if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 4) memcpy(diffuseUniform, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 4 * sizeof(float));
                 }
@@ -4380,7 +4608,11 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                     if (g_uniformShadowFloat.count(UniShadowKey(prog, loc)) && g_uniformShadowFloat[UniShadowKey(prog, loc)].size() >= 16) memcpy(texMat, g_uniformShadowFloat[UniShadowKey(prog, loc)].data(), 16 * sizeof(float));
                     hasTexMat = true;
                 }
-                if ((u_type == GL_FLOAT_MAT4 || u_type == 0x8B52 /*GL_FLOAT_VEC4*/) && 
+                // Палитра костей — это массив. Одиночная матрица под эту маску попадать не
+                // должна: у Asphalt 6 «WorldViewProjectionMatrix» содержит «atrix», и вершину
+                // умножало на WVP дважды — сначала как костью, потом проекцией.
+                bool looksLikeMvp = strstr(up, "WVP") || strstr(up, "MVP") || strstr(up, "PROJ");
+                if ((u_type == GL_FLOAT_MAT4 || u_type == 0x8B52 /*GL_FLOAT_VEC4*/) && u_size > 1 && !looksLikeMvp &&
                    (strstr(name, "alette") || strstr(name, "one") || strstr(name, "atrix") || strstr(name, "atrices"))) {
                     paletteLoc = glGetUniformLocation(prog, name);
                     
@@ -4423,6 +4655,24 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             }
         }
     memcpy(g_dbgMvp, mvp, sizeof(g_dbgMvp));   // ВРЕМЕННАЯ ДИАГНОСТИКА A6
+    if (A6Dbg() && prog > 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: по одному отчёту на программу
+        static std::set<int> seenProg;
+        if (seenProg.size() < 40 && seenProg.insert(prog).second) {
+            std::string u;
+            GLint nu = 0; glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &nu);
+            for (int i = 0; i < nu; i++) {
+                char nm[256]; GLsizei l; GLint sz; GLenum ty;
+                glGetActiveUniform(prog, i, sizeof(nm), &l, &sz, &ty, nm);
+                if (ty == GL_FLOAT_MAT4 || ty == GL_FLOAT_VEC4) u += std::string(" ") + nm + "@" + std::to_string(glGetUniformLocation(prog, nm));
+            }
+            char b[512];
+            snprintf(b, sizeof(b), "[A6-SWP] prog=%d pos=%d col=%d tex=%d cnt=%d palSize=%d mvp=[%.6f %.6f %.6f %.6f | %.6f %.6f %.6f %.6f | %.6f %.6f %.6f %.6f | %.6f %.6f %.6f %.6f] mat4:%s",
+                     (int)prog, (int)posLoc, (int)colorLoc, (int)texLoc, (int)count, paletteSize,
+                     mvp[0],mvp[1],mvp[2],mvp[3], mvp[4],mvp[5],mvp[6],mvp[7],
+                     mvp[8],mvp[9],mvp[10],mvp[11], mvp[12],mvp[13],mvp[14],mvp[15], u.c_str());
+            _LogToJava(b);
+        }
+    }
 
     auto getTypeSize = [](GLenum t) -> int {
         if (t == GL_FLOAT || t == 0x140C || t == GL_INT || t == GL_UNSIGNED_INT) return 4;
@@ -4489,14 +4739,17 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
 
     // Нормали читает только фиксированный конвейер, и только когда включено освещение.
     const bool swLighting = (prog == 0 && g_lightingEnabled);
+    // Шейдер автопокраски считает свет по нормали, поэтому ей нужен тот же массив.
+    const bool carPaint = (prog > 0 && colorModel == SWCM_CARPAINT && normLoc >= 0 && normLoc < 16);
     GLvoid* nPtr = nullptr; GLint nStride = 0, nType = 0; GLint nVBO = 0; GLint nEnabled = 0;
-    if (swLighting) {
-        nEnabled = g_vertexAttribs[5].enabled;
+    if (swLighting || carPaint) {
+        const int nIdx = swLighting ? 5 : normLoc;
+        nEnabled = g_vertexAttribs[nIdx].enabled;
         if (nEnabled) {
-            nPtr = (GLvoid*)g_vertexAttribs[5].pointer;
-            nStride = g_vertexAttribs[5].stride;
-            nType = g_vertexAttribs[5].type;
-            nVBO = g_vertexAttribs[5].vbo;
+            nPtr = (GLvoid*)g_vertexAttribs[nIdx].pointer;
+            nStride = g_vertexAttribs[nIdx].stride;
+            nType = g_vertexAttribs[nIdx].type;
+            nVBO = g_vertexAttribs[nIdx].vbo;
             if (nStride == 0) nStride = 3 * getTypeSize(nType);
         }
     }
@@ -4657,6 +4910,11 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             uint8_t* v = cBase + idx * cStride;
             cr = readC(v, cType, 0); if (cSize > 1) cg = readC(v, cType, 1); if (cSize > 2) cb = readC(v, cType, 2); if (cSize > 3) ca = readC(v, cType, 3);
         }
+        if (A6Dbg() && g_dbgRawN == 1) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: цвет первой вершины
+            g_dbgFirstCol[0] = cr; g_dbgFirstCol[1] = cg; g_dbgFirstCol[2] = cb; g_dbgFirstCol[3] = ca;
+            g_dbgColEnabled = (cBase && cEnabled) ? 1 : 0;
+            g_dbgColSize = cSize; g_dbgColType = (unsigned)cType;
+        }
 
         float tu = 0, tv = 0;
         int activeTexLoc = (texLoc != -1) ? texLoc : 2;
@@ -4674,14 +4932,23 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             uint8_t* v = t2Base + idx * t2Stride;
             tu2 = readG(v, t2Type, 0, t2Norm); if (t2Size > 1) tv2 = readG(v, t2Type, 1, t2Norm);
         }
-        if (prog == 0) {
+        if (prog > 0 && colorModel == SWCM_MASKDIFFUSE) {
+            // Шейдер миникарты крутит оба набора координат своими матрицами, причём
+            // умножает на vec4(uv, 1, 0): сдвиг лежит в третьем столбце, не в четвёртом.
+            float mu = tu * maskMat[0] + tv * maskMat[4] + maskMat[8];
+            float mv = tu * maskMat[1] + tv * maskMat[5] + maskMat[9];
+            tu = mu; tv = mv;
+            float du = tu2 * difMat[0] + tv2 * difMat[4] + difMat[8];
+            float dv = tu2 * difMat[1] + tv2 * difMat[5] + difMat[9];
+            tu2 = du; tv2 = dv;
+        } else if (prog == 0) {
             const float* tm1 = g_textureStacks[1].back().data();
             float tmpU = tu2 * tm1[0] + tv2 * tm1[4] + tm1[12];
             float tmpV = tu2 * tm1[1] + tv2 * tm1[5] + tm1[13];
             tu2 = tmpU; tv2 = tmpV;
         }
 
-        if (prog > 0 && hasTexMat) {
+        if (prog > 0 && hasTexMat && colorModel != SWCM_MASKDIFFUSE) {
             float tempU = tu * texMat[0] + tv * texMat[4] + texMat[12];
             float tempV = tu * texMat[1] + tv * texMat[5] + texMat[13];
             tu = tempU; tv = tempV;
@@ -4875,6 +5142,23 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                 outV.g = (currentColor[1] + (fogColor[1] - currentColor[1]) * cr) * 255.0f;
                 outV.b = (currentColor[2] + (fogColor[2] - currentColor[2]) * cr) * 255.0f;
                 outV.a = (currentColor[3] + (fogColor[3] - currentColor[3]) * cr) * 255.0f;
+            } else if (colorModel == SWCM_ADDDIFFUSE) {
+                // Диффуз прибавляется к текселю на фрагментной стадии, вершина несёт только Color0
+                outV.r = cr * 255.0f; outV.g = cg * 255.0f; outV.b = cb * 255.0f; outV.a = ca * 255.0f;
+            } else if (colorModel == SWCM_CARPAINT && nBase && nEnabled) {
+                // color.rgb = tex0 * (ambient + diffuse * max(0, N·L)); блик и отражение
+                // из второго сэмплера программный растеризатор не считает.
+                uint8_t* nv = nBase + idx * nStride;
+                float nx = readN(nv, nType, 0), ny = readN(nv, nType, 1), nz = readN(nv, nType, 2);
+                float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (nl > 0.0f) { nx /= nl; ny /= nl; nz /= nl; }
+                float ndotl = nx * lightDirOS[0] + ny * lightDirOS[1] + nz * lightDirOS[2];
+                if (ndotl < 0.0f) ndotl = 0.0f;
+                float lr = lightAmb[0] + lightDif[0] * ndotl;
+                float lg = lightAmb[1] + lightDif[1] * ndotl;
+                float lb = lightAmb[2] + lightDif[2] * ndotl;
+                if (lr > 1.0f) lr = 1.0f; if (lg > 1.0f) lg = 1.0f; if (lb > 1.0f) lb = 1.0f;
+                outV.r = lr * 255.0f; outV.g = lg * 255.0f; outV.b = lb * 255.0f; outV.a = 255.0f;
             } else if (colorModel == SWCM_TINT) {
                 outV.r = cr * diffuseUniform[0] * currentColor[0] * 255.0f;
                 outV.g = cg * diffuseUniform[1] * currentColor[1] * 255.0f;
@@ -5005,6 +5289,17 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
         outV.u = tu; outV.v = tv;
         outV.u2 = tu2; outV.v2 = tv2;
+        if (A6Dbg() && g_dbgUvN < 4) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: какие UV и какой цвет вершины реально вышли
+            g_dbgRawUv[g_dbgUvN][0] = tu; g_dbgRawUv[g_dbgUvN][1] = tv;
+            g_dbgRawUv[g_dbgUvN][2] = outV.r; g_dbgRawUv[g_dbgUvN][3] = outV.g;
+            g_dbgUvN++;
+        }
+        if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: габариты UV по всему draw
+            if (tu < g_dbgUvBB[0]) g_dbgUvBB[0] = tu;
+            if (tu > g_dbgUvBB[1]) g_dbgUvBB[1] = tu;
+            if (tv < g_dbgUvBB[2]) g_dbgUvBB[2] = tv;
+            if (tv > g_dbgUvBB[3]) g_dbgUvBB[3] = tv;
+        }
         extractedVerts[validVertsCount++] = outV;
     }
     extractedVerts.resize(validVertsCount);
@@ -5036,6 +5331,9 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         return (double)(c.x - a.x) * (double)(b.y - a.y) - (double)(c.y - a.y) * (double)(b.x - a.x);
     };
 
+    int vpX, vpY, vpW, vpH;
+    SWViewportForTarget(targetW, targetH, vpX, vpY, vpW, vpH);
+
     if (drawMode == GL_POINTS) {
         for (size_t i = 0; i < extractedVerts.size(); i++) {
             SWVertex v = extractedVerts[i];
@@ -5046,8 +5344,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                 case 2: { cx = -cx; cy = -cy;            break; }
                 case 3: { float t = cx; cx =  cy; cy = -t; break; }
             }
-            v.x = (cx + 1.0f) * 0.5f * targetW;
-            v.y = (1.0f - cy) * 0.5f * targetH;
+            v.x = (float)vpX + (cx + 1.0f) * 0.5f * vpW;
+            v.y = (float)(targetH - vpY) - (cy + 1.0f) * 0.5f * vpH;
             v.z = (cz + 1.0f) * 0.5f;
 
             int px = (int)v.x, py = (int)v.y;
@@ -5099,6 +5397,11 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             useTex = false;
         }
     }
+
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: карта реально прочитанных текселей крупной геометрии
+    g_dbgHitsOn = A6Dbg() && useTex && activeTexW == 512 && activeTexH == 512 &&
+                  count >= 1000 && (g_a6FrameNo % 120) == 0;
+    if (g_dbgHitsOn) memset(g_dbgHits, 0, sizeof(g_dbgHits));
 
     auto texClamped = [](std::map<GLuint, GLenum>& m, GLuint t) {
         auto i = m.find(t);
@@ -5205,7 +5508,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
-    auto toScreen = [targetW, targetH](SWVertex& v) {
+    auto toScreen = [targetW, targetH, vpX, vpY, vpW, vpH](SWVertex& v) {
         float w = v.w; if (w < 0.0001f) w = 0.0001f;
         float cx = v.x / w, cy = v.y / w, cz = v.z / w;
         switch (FrameRotQuarters(targetW, targetH)) {
@@ -5213,8 +5516,8 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             case 2: { cx = -cx; cy = -cy;            break; }
             case 3: { float t = cx; cx =  cy; cy = -t; break; }
         }
-        v.x = (cx + 1.0f) * 0.5f * targetW;
-        v.y = (1.0f - cy) * 0.5f * targetH;
+        v.x = (float)vpX + (cx + 1.0f) * 0.5f * vpW;
+        v.y = (float)(targetH - vpY) - (cy + 1.0f) * 0.5f * vpH;
         v.z = (cz + 1.0f) * 0.5f;
         v.invW = 1.0f / w;
         v.u *= v.invW; v.v *= v.invW;
@@ -5410,6 +5713,13 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         int maxX = (int)(v0.x > v1.x ? (v0.x > v2.x ? v0.x : v2.x) : (v1.x > v2.x ? v1.x : v2.x)) + 1; if (maxX >= targetW) maxX = targetW - 1;
         int maxY = (int)(v0.y > v1.y ? (v0.y > v2.y ? v0.y : v2.y) : (v1.y > v2.y ? v1.y : v2.y)) + 1; if (maxY >= targetH) maxY = targetH - 1;
 
+        if (A6Dbg()) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: экранный габарит отрисовки
+            if (minX < g_dbgBB[0]) g_dbgBB[0] = minX;
+            if (maxX > g_dbgBB[1]) g_dbgBB[1] = maxX;
+            if (minY < g_dbgBB[2]) g_dbgBB[2] = minY;
+            if (maxY > g_dbgBB[3]) g_dbgBB[3] = maxY;
+        }
+
         SWVertex p_start; p_start.x = minX + 0.5f; p_start.y = minY + 0.5f;
         double e0_row = edgeFunction(v1, v2, p_start);
         double e1_row = edgeFunction(v2, v0, p_start);
@@ -5473,6 +5783,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         // --- HOISTING (Вынос логики и флагов из цикла) ---
         bool opt_tex = useTex;
         bool opt_tex2 = useTex2;
+        bool opt_maskDif = (colorModel == SWCM_MASKDIFFUSE && useTex2);
         bool opt_env2Only = useEnv2Only;
         int tex2MaskW = activeTex2W - 1;
         int tex2MaskH = activeTex2H - 1;
@@ -5493,6 +5804,14 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         GLenum opt_depthFunc = g_depthFunc;
         bool opt_fullmask = (!g_blendEnabled && g_colorMask[0] && g_colorMask[1] && g_colorMask[2] && g_colorMask[3]);
         bool opt_prog = prog > 0;
+        bool opt_addDiffuse = opt_prog && colorModel == SWCM_ADDDIFFUSE;
+        int opt_difAdd[4] = {0, 0, 0, 0};
+        if (opt_addDiffuse) {
+            for (int k = 0; k < 4; k++) {
+                int a = (int)(diffuseUniform[k] * 255.0f + 0.5f);
+                opt_difAdd[k] = a < -255 ? -255 : (a > 255 ? 255 : a);
+            }
+        }
         // В ES 2.0 текстурное окружение не существует — там всё решает шейдер.
         GLenum opt_envMode = opt_prog ? (GLenum)GL_MODULATE : g_texEnvMode[0];
         GLenum opt_envMode1 = g_texEnvMode[1];
@@ -5584,13 +5903,25 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                         if (opt_isFboTex) ty = activeTexH - 1 - ty;
                         if (ty < 0) ty = 0; else if (ty >= activeTexH) ty = activeTexH - 1; // Защита
                         
+                        if (g_dbgHitsOn) g_dbgHits[(ty << 9) + tx] = 255;
                         uint32_t texColor = activeTexPtr[ty * activeTexW + tx];
                         int tr = texColor & 0xFF;
                         int tg = (texColor >> 8) & 0xFF;
                         int tb = (texColor >> 16) & 0xFF;
                         int ta = (texColor >> 24) & 0xFF;
+                        g_dbgTexLumSum += tr + tg + tb; g_dbgTexN++;
                         const int vr0 = ir, vg0 = ig, vb0 = ib, va0 = ia;
-                        if (opt_prog) {
+                        if (opt_addDiffuse) {
+                            tr += opt_difAdd[0]; tg += opt_difAdd[1]; tb += opt_difAdd[2]; ta += opt_difAdd[3];
+                            if (tr < 0) tr = 0; else if (tr > 255) tr = 255;
+                            if (tg < 0) tg = 0; else if (tg > 255) tg = 255;
+                            if (tb < 0) tb = 0; else if (tb > 255) tb = 255;
+                            if (ta < 0) ta = 0; else if (ta > 255) ta = 255;
+                        }
+                        if (opt_maskDif) {
+                            // Нулевой юнит здесь только маска: цвет придёт из первого юнита ниже.
+                            ir = 255; ig = 255; ib = 255; ia = ta;
+                        } else if (opt_prog) {
                             ir = (ir * tr) >> 8; ig = (ig * tg) >> 8;
                             ib = (ib * tb) >> 8; ia = (ia * ta) >> 8;
                         } else {
@@ -5657,6 +5988,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                     if (opt_fullmask) {
                         *colorPtr = (ia << 24) | (ib << 16) | (ig << 8) | ir;
                         g_dbgPixels++;
+                        g_dbgLumSum += ir + ig + ib;
                         continue;
                     }
 
@@ -5713,6 +6045,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                     
                     *colorPtr = (finalA << 24) | (finalB << 16) | (finalG << 8) | finalR;
                     g_dbgPixels++;
+                    g_dbgLumSum += finalR + finalG + finalB;
                 } else if (inside) {
                     break; // ВАЖНО: Треугольник выпуклый. Раз мы вышли за его границу, дальше по оси X пусто.
                 }
@@ -5720,6 +6053,119 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
         }
     }
 
+    if (g_dbgHitsOn && g_dbgPixels > 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: сброс карты текселей
+        char p[256];
+        snprintf(p, sizeof(p), "%sa6hits_%u_c%d.raw", g_workDir.c_str(), (unsigned)g_cpuUnitTexture[0], (int)count);
+        FILE* f = fopen(p, "wb");
+        if (f) { fwrite(g_dbgHits, 1, sizeof(g_dbgHits), f); fclose(f); }
+    }
+
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: чем крупная геометрия залита на самом деле
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: тряска — что двигается по вертикали между кадрами
+    if (A6Dbg() && prog > 0 && count >= 150 && g_dbgPixels > 0 && g_a6ShakeLines < 40000) {
+        static std::map<int, int> shakeLastFrame;
+        int shakeKey = (int)prog * 64 + (int)(g_lastActiveFBO & 63);
+        if (shakeLastFrame[shakeKey] != g_a6FrameNo) {
+            shakeLastFrame[shakeKey] = g_a6FrameNo;
+            g_a6ShakeLines++;
+            char sb[320];
+            snprintf(sb, sizeof(sb), "[A6-RTT] ТРЯСКА #%d fbo=%u цель=%dx%d%s вп=%d,%d,%dx%d пов=%d fbotex=%d prog=%d c=%d cm=%d mvp=[%.5f %.5f %.5f %.5f | %.5f %.5f] экранY=%d..%d X=%d..%d",
+                     g_a6FrameNo, (unsigned)g_lastActiveFBO, targetW, targetH,
+                     (targetColorBuf == &g_cpuColorBuffer) ? "ЭКРАН" : "тексура",
+                     vpX, vpY, vpW, vpH,
+                     FrameRotQuarters(targetW, targetH), (int)isFboTexture, (int)prog, (int)count, colorModel,
+                     mvp[5], mvp[9], mvp[13], mvp[15], mvp[7], mvp[11],
+                     g_dbgBB[2], g_dbgBB[3], g_dbgBB[0], g_dbgBB[1]);
+            _LogToJava(sb);
+        }
+    }
+
+    // ВРЕМЕННАЯ ДИАГНОСТИКА A6: мелкие, но крупно закрашенные экранные квады — композит/блюр
+    if (A6Dbg() && prog > 0 && count < 150 && g_dbgPixels > 15000 &&
+        targetColorBuf == &g_cpuColorBuffer && g_a6ShakeLines < 40000) {
+        g_a6ShakeLines++;
+        char qb[320];
+        snprintf(qb, sizeof(qb), "[A6-RTT] КВАД #%d fbo=%u prog=%d c=%d cm=%d fbotex=%d тех=%u пикс=%d экранY=%d..%d X=%d..%d",
+                 g_a6FrameNo, (unsigned)g_lastActiveFBO, (int)prog, (int)count, colorModel,
+                 (int)isFboTexture, (unsigned)g_cpuUnitTexture[0], g_dbgPixels,
+                 g_dbgBB[2], g_dbgBB[3], g_dbgBB[0], g_dbgBB[1]);
+        _LogToJava(qb);
+    }
+
+    const bool dbgCorner = false;
+    (void)g_a6CornerLines;
+    if (dbgCorner ||
+        (A6Dbg() && (g_a6FrameNo % 120) == 0 && g_a6SwDrawLines < 4000 &&
+        ((prog > 0 && count >= 300) || (g_dbgPixels > 1500 && g_dbgLumSum / (3 * (g_dbgPixels ? g_dbgPixels : 1)) < 12)))) {
+        g_a6SwDrawLines++;
+        GLuint t0 = g_cpuUnitTexture[0];
+        long texLum = -1;
+        if (g_cpuTextures.count(t0) && !g_cpuTextures[t0].empty()) {
+            const std::vector<uint32_t>& tx = g_cpuTextures[t0];
+            long s = 0; int n = 0;
+            for (size_t i = 0; i < tx.size(); i += 13) {
+                uint32_t p = tx[i];
+                s += (p & 0xFF) + ((p >> 8) & 0xFF) + ((p >> 16) & 0xFF); n++;
+            }
+            texLum = n ? s / (3 * n) : -1;
+        }
+        char b[640];
+        snprintf(b, sizeof(b), "[A6-RTT] SWDRAW%s #%d fbo=%u c=%d prog=%d cm=%d tex0=%u %dx%d фмт=%d texLum=%ld "
+                               "записано=%ld ярк=%ld покрыто=%ld A0=%ld Z=%ld W=%ld AT=%ld depth=%d zfunc=0x%x cull=%d/0x%x/0x%x "
+                               "цвет0=(%.2f,%.2f,%.2f,%.2f) diffuse=(%.2f,%.2f,%.2f,%.2f) бленд=%d "
+                               "тексель=%ld fbotex=%d tex2=%d tex1=%u uvbb=(%.3f..%.3f, %.3f..%.3f) экран=(%d..%d, %d..%d)",
+                 dbgCorner ? "-УГОЛ" : "", g_a6FrameNo, (unsigned)g_lastActiveFBO, (int)count, (int)prog, colorModel, (unsigned)t0,
+                 g_cpuTexW.count(t0) ? g_cpuTexW[t0] : -1, g_cpuTexH.count(t0) ? g_cpuTexH[t0] : -1,
+                 g_texBaseFormat.count(t0) ? g_texBaseFormat[t0] : -1, texLum,
+                 g_dbgPixels, g_dbgPixels ? g_dbgLumSum / (3 * g_dbgPixels) : -1,
+                 g_dbgCovered, g_dbgSkipA0, g_dbgRejDepth, g_dbgRejW, g_dbgRejAT,
+                 (int)g_depthTestEnabled, (unsigned)g_depthFunc, (int)g_cullFaceEnabled, (unsigned)g_cullFaceMode, (unsigned)g_frontFace,
+                 g_dbgFirstCol[0], g_dbgFirstCol[1], g_dbgFirstCol[2], g_dbgFirstCol[3],
+                 diffuseUniform[0], diffuseUniform[1], diffuseUniform[2], diffuseUniform[3],
+                 (int)g_blendEnabled,
+                 g_dbgTexN ? g_dbgTexLumSum / (3 * g_dbgTexN) : -1,
+                 (int)isFboTexture, (int)useTex2, (unsigned)drawTex1,
+                 g_dbgUvBB[0], g_dbgUvBB[1], g_dbgUvBB[2], g_dbgUvBB[3],
+                 g_dbgBB[0], g_dbgBB[1], g_dbgBB[2], g_dbgBB[3]);
+        int n = (int)strlen(b);
+        for (int i = 0; i < g_dbgUvN && n < (int)sizeof(b) - 48; i++)
+            n += snprintf(b + n, sizeof(b) - n, " uv%d=(%.3f,%.3f)в=(%.0f,%.0f)", i,
+                          g_dbgRawUv[i][0], g_dbgRawUv[i][1], g_dbgRawUv[i][2], g_dbgRawUv[i][3]);
+        _LogToJava(b);
+    }
+    if (A6Dbg() && prog > 0) {   // ВРЕМЕННАЯ ДИАГНОСТИКА A6: сырые вершины и итог по программе
+        static std::set<int> seenVtx;
+        if (seenVtx.size() < 40 && seenVtx.insert(prog).second) {
+            char b[1024]; int n = 0;
+            n += snprintf(b, sizeof(b), "[A6-VTX] prog=%d size=%d stride=%d type=0x%x пикселей=%ld покрыто=%ld отказ A0=%ld Z=%ld W=%ld AT=%ld depth=%d zfunc=0x%x afunc=0x%x aref=%.2f blend=%d сырые:",
+                          (int)prog, g_dbgPosSize, g_dbgPosStride, g_dbgPosType, g_dbgPixels, g_dbgCovered,
+                          g_dbgSkipA0, g_dbgRejDepth, g_dbgRejW, g_dbgRejAT,
+                          (int)g_depthTestEnabled, (unsigned)g_depthFunc, (unsigned)g_alphaFunc, (double)g_alphaRef,
+                          (int)g_blendEnabled);
+            n += snprintf(b + n, sizeof(b) - n, " colorModel=%d цвет0=(%.2f,%.2f,%.2f,%.2f) colEn=%d colSize=%d colType=0x%x tex0=%u вCPU=%d",
+                          colorModel, g_dbgFirstCol[0], g_dbgFirstCol[1], g_dbgFirstCol[2], g_dbgFirstCol[3],
+                          g_dbgColEnabled, g_dbgColSize, g_dbgColType, (unsigned)g_cpuUnitTexture[0],
+                          (int)(g_cpuTextures.count(g_cpuUnitTexture[0]) && !g_cpuTextures[g_cpuUnitTexture[0]].empty()));
+            {
+                GLuint t0 = g_cpuUnitTexture[0];
+                int aMin = 999, aMax = -1;
+                if (g_cpuTextures.count(t0)) {
+                    const std::vector<uint32_t>& tx = g_cpuTextures[t0];
+                    for (size_t i = 0; i < tx.size(); i += 7) { int a = (int)(tx[i] >> 24); if (a < aMin) aMin = a; if (a > aMax) aMax = a; }
+                }
+                n += snprintf(b + n, sizeof(b) - n, " diffuse=(%.2f,%.2f,%.2f,%.2f) current=(%.2f,%.2f,%.2f,%.2f)",
+                              diffuseUniform[0], diffuseUniform[1], diffuseUniform[2], diffuseUniform[3],
+                              currentColor[0], currentColor[1], currentColor[2], currentColor[3]);
+                n += snprintf(b + n, sizeof(b) - n, " texW=%d texH=%d базФмт=%d альфа=%d..%d",
+                              g_cpuTexW.count(t0) ? g_cpuTexW[t0] : -1, g_cpuTexH.count(t0) ? g_cpuTexH[t0] : -1,
+                              g_texBaseFormat.count(t0) ? g_texBaseFormat[t0] : -1, aMin, aMax);
+            }
+            for (int i = 0; i < g_dbgRawN && n < (int)sizeof(b) - 64; i++)
+                n += snprintf(b + n, sizeof(b) - n, " (%.2f,%.2f,%.2f,%.2f)",
+                              g_dbgRawPos[i][0], g_dbgRawPos[i][1], g_dbgRawPos[i][2], g_dbgRawPos[i][3]);
+            _LogToJava(b);
+        }
+    }
     if (A6Dbg() && a6info[0] && a6LumBefore >= 0) {
         a6rx0 = std::min(a6rx0, (float)targetW - 1); a6rx1 = std::min(a6rx1, (float)targetW);
         a6ry0 = std::min(a6ry0, (float)targetH - 1); a6ry1 = std::min(a6ry1, (float)targetH);
@@ -6530,6 +6976,102 @@ static void A6ProbePixel(const char* what, int count) {
              what, (unsigned)g_cpuUnitTexture[0], count, px[0], px[1], px[2], px[3]);
     LogToJava(b);
 }
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: LogToJava раскладывает по тегу только первую строку,
+// поэтому многострочный текст печатаем построчно с одним и тем же тегом.
+static void A6LogLines(const char* tag, const std::string& text) {
+    size_t ls = 0;
+    int n = 0;
+    while (ls < text.size() && n < 400) {
+        size_t le = text.find('\n', ls);
+        if (le == std::string::npos) le = text.size();
+        A6Log(std::string(tag) + " " + std::to_string(n) + "| " + text.substr(ls, le - ls));
+        ls = le + 1; n++;
+    }
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: чем именно рисуется экранная отрисовка на GPU ES 2.0 —
+// программа игры, значения её уникформ и текстуры на юнитах.
+static void A6ProbeGpuDraw(int count) {
+    if (!A6Dbg() || !(g_gpuOffloadMask & 16)) return;
+    bool isRtt = g_cpuUnitTexture[0] != 0 && g_fboTextures.count(g_cpuUnitTexture[0]) > 0;
+    if (isRtt && (g_a6FrameNo % 60) == 0) {
+        GLint p0 = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &p0);
+        GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
+        char b[200];
+        snprintf(b, sizeof(b), "[A6-RTT] PROBE-RTTQ #%d fbo=%u tex=%u реально=%d prog=%d cnt=%d",
+                 g_a6FrameNo, (unsigned)g_lastActiveFBO, (unsigned)g_cpuUnitTexture[0], (int)bt, (int)p0, count);
+        A6Log(std::string(b));
+    }
+    if (g_lastActiveFBO > 1) return;
+    if ((count < 2000 && !isRtt) || (g_a6FrameNo % 120) != 0) return;
+    GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    if (prog <= 0) return;
+    static std::set<uint64_t> seen;
+    uint64_t key = ((uint64_t)(g_a6FrameNo / 600) << 40) ^ ((uint64_t)prog << 24) ^ (uint64_t)count;
+    if (seen.size() > 4000 || !seen.insert(key).second) return;
+
+    GLint act = GL_TEXTURE0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+    std::string t;
+    for (int u = 0; u < 4; u++) {
+        glActiveTexture(GL_TEXTURE0 + u);
+        GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
+        GLint mn = 0, mg = 0;
+        if (bt) { glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mn);
+                  glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mg); }
+        char b[224];
+        const A6MipInfo* mi = g_a6Mip.count(bt) ? &g_a6Mip[bt] : nullptr;
+        snprintf(b, sizeof(b), " u%d=%d(%dx%d bf=%d min=0x%x mag=0x%x lvl=%x cmp=%x fail=%x gen=%d пусто=%d)",
+                 u, (int)bt,
+                 g_cpuTexW.count(bt) ? g_cpuTexW[bt] : -1, g_cpuTexH.count(bt) ? g_cpuTexH[bt] : -1,
+                 g_texBaseFormat.count(bt) ? g_texBaseFormat[bt] : -1,
+                 (unsigned)mn, (unsigned)mg,
+                 mi ? mi->lvlMask : 0u, mi ? mi->cmpMask : 0u, mi ? mi->failMask : 0u,
+                 mi ? mi->gen : -1, mi ? (int)mi->emptyL0 : -1);
+        t += b;
+    }
+    glActiveTexture(act);
+    A6Log("[A6-RTT] PROBE-GPUDRAW #" + std::to_string(g_a6FrameNo) + " prog=" + std::to_string(prog) + " cnt=" + std::to_string(count) +
+          " fbo=" + std::to_string(g_lastActiveFBO) + " blend=" + std::to_string((int)g_blendEnabled) +
+          " depth=" + std::to_string((int)g_depthTestEnabled) + " текстуры:" + t);
+
+    GLint nu = 0, maxLen = 0;
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &nu);
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORM_MAX_LENGTH, &maxLen);
+    if (maxLen < 8) maxLen = 64;
+    std::vector<char> nm(maxLen + 1);
+    for (GLint i = 0; i < nu; i++) {
+        GLint sz = 0; GLenum ty = 0; GLsizei len = 0;
+        glGetActiveUniform(prog, i, maxLen, &len, &sz, &ty, nm.data());
+        nm[len < maxLen ? len : maxLen] = 0;
+        GLint loc = glGetUniformLocation(prog, nm.data());
+        if (loc < 0) continue;
+        char b[256];
+        int n = snprintf(b, sizeof(b), "[A6-RTT] PROBE-UNI #%d prog=%d %s тип=0x%x раз=%d =",
+                         g_a6FrameNo, (int)prog, nm.data(), (unsigned)ty, (int)sz);
+        if (ty == GL_SAMPLER_2D || ty == GL_SAMPLER_CUBE || ty == GL_INT || ty == GL_BOOL) {
+            GLint v[4] = {0}; glGetUniformiv(prog, loc, v);
+            n += snprintf(b + n, sizeof(b) - n, " %d", (int)v[0]);
+        } else {
+            GLfloat v[16] = {0}; glGetUniformfv(prog, loc, v);
+            int cnt = (ty == GL_FLOAT_VEC4 || ty == GL_FLOAT_MAT2) ? 4 :
+                      (ty == GL_FLOAT_VEC3) ? 3 : (ty == GL_FLOAT_VEC2) ? 2 :
+                      (ty == GL_FLOAT_MAT3) ? 9 : (ty == GL_FLOAT_MAT4) ? 16 : 1;
+            for (int k = 0; k < cnt && n < 230; k++) n += snprintf(b + n, sizeof(b) - n, " %.3f", (double)v[k]);
+        }
+        A6Log(std::string(b));
+    }
+
+    static std::set<int> srcDone;
+    if (srcDone.insert(prog).second) {
+        GLuint attached[8] = {0}; GLsizei na = 0;
+        glGetAttachedShaders(prog, 8, &na, attached);
+        for (GLsizei i = 0; i < na; i++)
+            if (g_shaderSrc.count(attached[i]))
+                A6LogLines(("[A6-RTT] PROBE-SRC p" + std::to_string(prog) + " s" + std::to_string(attached[i])).c_str(),
+                           g_shaderSrc[attached[i]]);
+    }
+}
+
 // ВРЕМЕННЫЙ ЭКСПЕРИМЕНТ A6: запретить запись глубины отрисовке без теста глубины (небесный купол).
 static bool A6SkyMaskBegin() {
     if (!g_a6SkyMask || g_depthTestEnabled || !g_depthMask) return false;
@@ -6660,6 +7202,7 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
             }
         }
         A6DumpDraw(first, count, nullptr, 0);
+        A6ProbeGpuDraw((int)count);
         ResetWindowDepthStencil();
         A6FarClear();
         bool skyMasked = A6SkyMaskBegin();
@@ -6899,6 +7442,7 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
             }
         }
         A6DumpDraw(0, count, indices, type);
+        A6ProbeGpuDraw((int)count);
         ResetWindowDepthStencil();
         A6FarClear();
         bool skyMasked = A6SkyMaskBegin();
@@ -8204,7 +8748,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (strcmp(op, "presentRenderbuffer:") == 0) {
             if ((g_a6FrameNo % 300) == 0 && g_a6FrameNo > 0 && !g_cpuColorBuffer.empty()) {
                 char p[192];
-                snprintf(p, sizeof(p), "%sa6_p9_%dx%d.raw", g_workDir.c_str(), g_surfaceWidth, g_surfaceHeight);
+                snprintf(p, sizeof(p), "%sa6_p9_%dx%d.raw", DumpDir(), g_surfaceWidth, g_surfaceHeight);
                 FILE* fd = fopen(p, "wb");
                 if (fd) { fwrite(g_cpuColorBuffer.data(), 4, (size_t)g_surfaceWidth * g_surfaceHeight, fd); fclose(fd); }
             }
@@ -17232,8 +17776,10 @@ extern "C" void* A6_RegisterMatName(void* sret, void* self, const void* v) {
         uint8_t ok = 0;
         A6SafeRead((const uint8_t*)sret + 4, &ok, 1);
         char b[48];
-        snprintf(b, sizeof(b), "%08x/%08x", (unsigned)w[1], (unsigned)w[2]);
-        A6Log("[A6-REG] " + std::string(b) + (ok ? " новый " : " ЗАНЯТО ") + A6SafeStr(w[0]));
+        snprintf(b, sizeof(b), "%08x/%08x self=%08x", (unsigned)w[1], (unsigned)w[2],
+                 (unsigned)(uintptr_t)self);
+        A6Log("[A6-REG] " + std::string(b) + (ok ? " новый " : " ЗАНЯТО ") + A6SafeStr(w[0]) +
+              " от " + GetModuleInfoForAddress((uintptr_t)__builtin_return_address(0)));
     }
     return r;
 }
@@ -17255,6 +17801,482 @@ static void A6InstallRegisterHook(uint32_t slide) {
     fn[1] = (uint32_t)(uintptr_t)&A6_RegisterMatName;
     __builtin___clear_cache((char*)fn, (char*)fn + 8);
     A6Log("[A6-DIAG] хук на 0x56fa98 установлен");
+}
+
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: шрифты. На слайде не создаётся ни одной текстуры GL_ALPHA,
+// то есть кэш глифов TTF не поднимается вовсе — отсюда розовые блоки вместо текста
+// и падение в меню на нулевом объекте. Хуки показывают, на каком шаге встал FreeType.
+static bool A6HookRaw(uint32_t slide, uint32_t addr, uint32_t p0, uint32_t p1,
+                      void* hook, void** orig, const char* tag) {
+    uint32_t* fn = (uint32_t*)(addr + slide);
+    if (fn[0] != p0 || fn[1] != p1) {
+        char b[96];
+        snprintf(b, sizeof(b), "[A6-FONT] %s: пролог %08x/%08x", tag, (unsigned)fn[0], (unsigned)fn[1]);
+        A6Log(b);
+        return false;
+    }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return false;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = addr + 8 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    *orig = (void*)tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)hook;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    return true;
+}
+
+static int (*g_a6FtInitOrig)(void*) = nullptr;
+extern "C" int A6_FtInit(void* lib) {
+    int r = g_a6FtInitOrig(lib);
+    A6Log("[A6-FONT] FT_Init_FreeType -> " + std::to_string(r));
+    return r;
+}
+
+static int (*g_a6FtFaceOrig)(void*, const void*, int32_t, int32_t, void*) = nullptr;
+extern "C" int A6_FtFace(void* lib, const void* base, int32_t size, int32_t idx, void* out) {
+    int r = g_a6FtFaceOrig(lib, base, size, idx, out);
+    uint32_t face = 0;
+    A6SafeRead(out, &face, 4);
+    char b[128];
+    uint32_t first = 0;
+    A6SafeRead(base, &first, 4);
+    snprintf(b, sizeof(b), "[A6-FONT] FT_New_Memory_Face байт=%d индекс=%d база=%08x нач=%08x -> %d лицо=%08x",
+             (int)size, (int)idx, (unsigned)(uintptr_t)base, (unsigned)first, r, (unsigned)face);
+    A6Log(b);
+    return r;
+}
+
+static int (*g_a6FontFileOrig)(const char*, int, int, char*, int) = nullptr;
+extern "C" int A6_GetFontFile(const char* name, int a, int b_, char* out, int n) {
+    int r = g_a6FontFileOrig(name, a, b_, out, n);
+    A6Log("[A6-FONT] get_fontfile(" + A6SafeStr((uint32_t)(uintptr_t)name) + ") -> " +
+          std::to_string(r) + " путь=" + A6SafeStr((uint32_t)(uintptr_t)out));
+    return r;
+}
+
+// Логгер движка: os::Printer::logf сам сообщает про битые заголовки и провалы загрузки данных.
+static void (*g_a6LogfOrig)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+extern "C" void A6_Logf(uint32_t lvl, uint32_t fmt, uint32_t a2, uint32_t a3, uint32_t a4,
+                        uint32_t a5) {
+    static int n = 0;
+    std::string f = A6SafeStr(fmt);
+    // Отсев двух самых болтливых сообщений шейдерного профиля: они забивают лимит строк.
+    bool noisy = f.find("invalid bind symbol") != std::string::npos ||
+                 f.find("unused parameter") != std::string::npos ||
+                 f.find("not a supported") != std::string::npos;
+    if (n < 600 && !noisy) {
+        n++;
+        char b[64];
+        snprintf(b, sizeof(b), " [ур=%u %08x %08x]", (unsigned)lvl, (unsigned)a2, (unsigned)a3);
+        A6Log("[A6-ENG] " + f + b + " " + A6SafeStr(a2) + " " + A6SafeStr(a3));
+    }
+    g_a6LogfOrig(lvl, fmt, a2, a3, a4, a5);
+}
+
+// pixel_format::convert принимает часть аргументов через стек, поэтому обычный C-хук их сдвигает
+// и игра падает. Наблюдаем только вход: naked-обёртка восстанавливает SP перед переходом,
+// так что стековые аргументы остаются ровно там, где их ждёт оригинал.
+extern "C" void* g_a6ConvTramp = nullptr;
+static uint32_t g_a6ConvLr[32];
+static int g_a6ConvDepth = 0;
+extern "C" void* A6_ConvEnter(uint32_t lr, uint32_t a1, uint32_t a2, uint32_t a3) {
+    if (g_a6ConvDepth >= 0 && g_a6ConvDepth < 32) g_a6ConvLr[g_a6ConvDepth] = lr;
+    g_a6ConvDepth++;
+    static int n = 0;
+    if (n < 80) {
+        n++;
+        char b[160];
+        snprintf(b, sizeof(b), "[A6-CONV] вход #%d гл=%d %08x %08x %08x", n, g_a6ConvDepth,
+                 (unsigned)a1, (unsigned)a2, (unsigned)a3);
+        A6Log(b);
+    }
+    return g_a6ConvTramp;
+}
+extern "C" void* A6_ConvExit(uint32_t ret) {
+    g_a6ConvDepth--;
+    static int n = 0;
+    if (n < 80) {
+        n++;
+        char b[96];
+        snprintf(b, sizeof(b), "[A6-CONV] выход #%d гл=%d рез=%d", n, g_a6ConvDepth, (int)ret);
+        A6Log(b);
+    }
+    uint32_t lr = 0;
+    if (g_a6ConvDepth >= 0 && g_a6ConvDepth < 32) lr = g_a6ConvLr[g_a6ConvDepth];
+    return (void*)(uintptr_t)lr;
+}
+// ITexture::bind — единственный путь данных в GL. Смотрим, для каких текстур он вообще зовётся
+// и не отсекает ли их ранний выход по флагам 0x2b/0x2c.
+static void (*g_a6BindOrig)(uint32_t, uint32_t) = nullptr;
+extern "C" void A6_TexBind(uint32_t tex, uint32_t upload) {
+    static int n = 0;
+    if (n < 80) {
+        n++;
+        uint32_t w = 0, h = 0, fl = 0, desc = 0;
+        A6SafeRead((const void*)(uintptr_t)(tex + 0x0c), &w, 4);
+        A6SafeRead((const void*)(uintptr_t)(tex + 0x10), &h, 4);
+        uint32_t f2c = 0;
+        A6SafeRead((const void*)(uintptr_t)(tex + 0x28), &fl, 4);
+        A6SafeRead((const void*)(uintptr_t)(tex + 0x2c), &f2c, 4);
+        A6SafeRead((const void*)(uintptr_t)(tex + 0x24), &desc, 4);
+        char b[240];
+        snprintf(b, sizeof(b), "[A6-BIND] #%d %ux%u фмт=%u 2c=%04x загр=%u", n, w, h,
+                 (desc >> 4) & 0x3f, (unsigned)(f2c & 0xffff), upload);
+        A6Log(b);
+    }
+    g_a6BindOrig(tex, upload);
+}
+
+// Возврат перехватываем через отдельную площадку. Адрес берём через функцию, а не adr:
+// иначе теряется Thumb-бит и игра возвращается в ARM-режиме прямо в thumb-код.
+__attribute__((naked)) extern "C" void A6_ConvLand() {
+    asm volatile("push {r0, r1, r2, r3}\n"
+                 "bl A6_ConvExit\n"
+                 "mov r12, r0\n"
+                 "pop {r0, r1, r2, r3}\n"
+                 "bx r12\n");
+}
+extern "C" void* A6_ConvGetLand() { return (void*)&A6_ConvLand; }
+__attribute__((naked)) extern "C" void A6_ConvNaked() {
+    asm volatile("push {r0, r1, r2, r3, r12, lr}\n"
+                 "mov r0, lr\n"
+                 "bl A6_ConvEnter\n"
+                 "str r0, [sp, #16]\n"
+                 "bl A6_ConvGetLand\n"
+                 "str r0, [sp, #20]\n"
+                 "pop {r0, r1, r2, r3, r12, lr}\n"
+                 "bx r12\n");
+}
+
+// os::Printer::log(текст, уровень). Второе слово пролога — PC-relative загрузка литерала,
+// поэтому трамплин собираем вручную: подставляем уже прочитанное значение литерала.
+static void (*g_a6Log2Orig)(uint32_t, uint32_t) = nullptr;
+extern "C" void A6_Log2(uint32_t text, uint32_t lvl) {
+    A6Log("[A6-ENG2] " + A6SafeStr(text) + " [ур=" + std::to_string(lvl) + "]");
+    g_a6Log2Orig(text, lvl);
+}
+
+static void (*g_a6Log3Orig)(uint32_t, uint32_t, uint32_t) = nullptr;
+extern "C" void A6_Log3(uint32_t text, uint32_t hint, uint32_t lvl) {
+    A6Log("[A6-ENG3] " + A6SafeStr(text) + " / " + A6SafeStr(hint) + " [ур=" +
+          std::to_string(lvl) + "]");
+    g_a6Log3Orig(text, hint, lvl);
+}
+
+static void A6InstallLogSmallHook(uint32_t slide) {
+    uint32_t addr = 0x4fab58;
+    uint32_t* fn = (uint32_t*)(addr + slide);
+    if (fn[0] != 0xe1a0c000 || fn[1] != 0xe59f001c) {
+        A6Log("[A6-ENG2] пролог не тот");
+        return;
+    }
+    uint32_t literal = *(uint32_t*)(0x4fab80 + slide);
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = 0xe1a0c000;
+    tr[1] = 0xe59f0004;
+    tr[2] = 0xe51ff004;
+    tr[3] = addr + 8 + slide;
+    tr[4] = literal;
+    __builtin___clear_cache((char*)tr, (char*)tr + 20);
+    g_a6Log2Orig = (void (*)(uint32_t, uint32_t))tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_Log2;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-ENG2] хук Printer::log установлен");
+}
+
+// IVideoDriver::createTexture — единственное место, где заказ текстуры может провалиться молча
+// (виртуальный вызов драйвера вернул 0), поэтому смотрим и запрос, и результат.
+static void (*g_a6MkTexOrig)(uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+extern "C" void A6_MakeTex(uint32_t out, uint32_t drv, uint32_t name, uint32_t desc) {
+    uint32_t type = 0, fmt = 0, w = 0, h = 0, dp = 0;
+    A6SafeRead((const void*)(uintptr_t)desc, &type, 4);
+    A6SafeRead((const void*)(uintptr_t)(desc + 4), &fmt, 4);
+    A6SafeRead((const void*)(uintptr_t)(desc + 16), &w, 4);
+    A6SafeRead((const void*)(uintptr_t)(desc + 20), &h, 4);
+    A6SafeRead((const void*)(uintptr_t)(desc + 24), &dp, 4);
+    g_a6MkTexOrig(out, drv, name, desc);
+    uint32_t res = 0;
+    A6SafeRead((const void*)(uintptr_t)out, &res, 4);
+    static int n = 0;
+    if (n < 120) {
+        n++;
+        char b[256];
+        snprintf(b, sizeof(b), "[A6-MKTEX] #%d тип=%u фмт=%u %ux%ux%u рез=%08x имя=%s", n,
+                 (unsigned)type, (unsigned)fmt, w, h, dp, (unsigned)res, A6SafeStr(name).c_str());
+        A6Log(w <= 4 && h <= 4 ? std::string(b) + A6GuestStack(14) : std::string(b));
+    }
+}
+
+// gameswf bitmap_info::upload — ленивое создание текстуры для флеш-битмапа.
+// Именно отсюда берутся имена bitmap_info_ogl_0x…, которых нет на слайде.
+static void (*g_a6SwfBmpOrig)(uint32_t) = nullptr;
+extern "C" void A6_SwfBmp(uint32_t self) {
+    uint32_t tex = 0, img = 0, lay = 0, dev = 0;
+    uint8_t flag = 0;
+    A6SafeRead((const void*)(uintptr_t)(self + 0x10), &tex, 4);
+    A6SafeRead((const void*)(uintptr_t)(self + 0x18), &img, 4);
+    A6SafeRead((const void*)(uintptr_t)(self + 0x1c), &lay, 4);
+    A6SafeRead((const void*)(uintptr_t)(self + 0x28), &dev, 4);
+    A6SafeRead((const void*)(uintptr_t)(self + 0xc), &flag, 1);
+    static int n = 0;
+    if (n < 60) {
+        n++;
+        char b[192];
+        snprintf(b, sizeof(b), "[A6-SWFBMP] #%d self=%08x тек=%08x обр=%08x лэй=%08x дев=%08x ф=%u",
+                 n, (unsigned)self, (unsigned)tex, (unsigned)img, (unsigned)lay, (unsigned)dev,
+                 (unsigned)flag);
+        A6Log(std::string(b) + A6GuestStack(10));
+    }
+    g_a6SwfBmpOrig(self);
+}
+
+// Слоты render_handler, создающие bitmap_info для флеш-битмапов. На слайде их
+// объектов рождается 1 вместо 6, и надо понять, какой из создателей не зовётся.
+#define A6_BMPMAKER(idx, addr)                                                              \
+    static uint32_t (*g_a6Mk##idx##Orig)(uint32_t, uint32_t, uint32_t, uint32_t) = nullptr; \
+    extern "C" uint32_t A6_Mk##idx(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {        \
+        uint32_t r = g_a6Mk##idx##Orig(a, b, c, d);                                         \
+        static int n = 0;                                                                   \
+        if (n < 12) {                                                                       \
+            n++;                                                                            \
+            char buf[160];                                                                  \
+            snprintf(buf, sizeof(buf), "[A6-SWFBMP] создатель %s #%d а=%08x б=%08x в=%08x -> %08x", \
+                     #addr, n, (unsigned)a, (unsigned)b, (unsigned)c, (unsigned)r);         \
+            A6Log(std::string(buf) + A6GuestStack(8));                                      \
+        }                                                                                   \
+        return r;                                                                           \
+    }
+
+A6_BMPMAKER(0, 3c3c94)
+A6_BMPMAKER(1, 3c3ce8)
+A6_BMPMAKER(2, 3c3f58)
+A6_BMPMAKER(3, 3c3f8c)
+A6_BMPMAKER(4, 3c3fe0)
+
+// Атлас глифов FreeType: get_glyph -> render_glyph -> lock_atlas. Первым создаёт текстуру
+// GL_ALPHA, которой на слайде нет вовсе, поэтому смотрим, докуда доходит цепочка.
+static void* (*g_a6AtlasOrig)(uint32_t) = nullptr;
+extern "C" void* A6_Atlas(uint32_t self) {
+    void* r = g_a6AtlasOrig(self);
+    static int n = 0;
+    if (n < 20) {
+        n++;
+        char b[96];
+        snprintf(b, sizeof(b), "[A6-GLYPH] атлас #%d self=%08x буф=%p", n, (unsigned)self, r);
+        A6Log(b);
+    }
+    return r;
+}
+
+extern "C" void* g_a6GetGlyphTramp = nullptr;
+extern "C" void A6_GetGlyphLog(uint32_t self, uint32_t ch) {
+    static int n = 0;
+    if (n < 20) {
+        n++;
+        char b[96];
+        snprintf(b, sizeof(b), "[A6-GLYPH] get_glyph #%d self=%08x сим=%u", n, (unsigned)self,
+                 (unsigned)(ch & 0xffff));
+        A6Log(b);
+    }
+}
+extern "C" void* A6_GetGlyphTrampGet() { return g_a6GetGlyphTramp; }
+// Аргументов больше четырёх: обычный C-хук сдвинул бы стековые, поэтому только push/pop и переход.
+__attribute__((naked)) extern "C" void A6_GetGlyphNaked() {
+    asm volatile("push {r0, r1, r2, r3, r12, lr}\n"
+                 "bl A6_GetGlyphLog\n"
+                 "bl A6_GetGlyphTrampGet\n"
+                 "str r0, [sp, #16]\n"
+                 "pop {r0, r1, r2, r3, r12, lr}\n"
+                 "bx r12\n");
+}
+
+extern "C" void* g_a6DrawTextTramp = nullptr;
+extern "C" void* A6_DrawTextTrampGet() { return g_a6DrawTextTramp; }
+extern "C" void A6_DrawTextLog(uint32_t self, uint32_t chars, uint32_t cnt) {
+    static int n = 0;
+    if (n < 20) {
+        n++;
+        uint16_t c0 = 0;
+        A6SafeRead((const void*)(uintptr_t)chars, &c0, 2);
+        char b[128];
+        snprintf(b, sizeof(b), "[A6-GLYPH] рисую текст #%d self=%08x n=%u первый=%u", n,
+                 (unsigned)self, (unsigned)cnt, (unsigned)c0);
+        A6Log(b);
+    }
+}
+__attribute__((naked)) extern "C" void A6_DrawTextNaked() {
+    asm volatile("push {r0, r1, r2, r3, r12, lr}\n"
+                 "bl A6_DrawTextLog\n"
+                 "bl A6_DrawTextTrampGet\n"
+                 "str r0, [sp, #16]\n"
+                 "pop {r0, r1, r2, r3, r12, lr}\n"
+                 "bx r12\n");
+}
+
+static uint32_t (*g_a6GlyphInfoOrig)(uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+extern "C" uint32_t A6_GlyphInfo(uint32_t a1, uint32_t a2, uint32_t ch, uint32_t a4) {
+    uint32_t mgr = 0, prov = 0, ft = 0, bm = 0;
+    A6SafeRead((const void*)(uintptr_t)(a1 + 0x1c), &mgr, 4);
+    if (mgr) A6SafeRead((const void*)(uintptr_t)(mgr + 0xa8), &prov, 4);
+    if (prov) {
+        A6SafeRead((const void*)(uintptr_t)(prov + 0x10), &ft, 4);
+        A6SafeRead((const void*)(uintptr_t)(prov + 0xc), &bm, 4);
+    }
+    uint32_t r = g_a6GlyphInfoOrig(a1, a2, ch, a4);
+    uint32_t o4 = 0, o18 = 0;
+    A6SafeRead((const void*)(uintptr_t)(a2 + 4), &o4, 4);
+    A6SafeRead((const void*)(uintptr_t)(a2 + 0x18), &o18, 4);
+    static int n = 0;
+    if (n < 20) {
+        n++;
+        char b[192];
+        snprintf(b, sizeof(b), "[A6-GLYPH] инфо #%d сим=%u -> %u мгр=%08x пров=%08x ft=%08x бмп=%08x вых4=%08x вых18=%08x",
+                 n, (unsigned)(ch & 0xffff), (unsigned)r, (unsigned)mgr, (unsigned)prov,
+                 (unsigned)ft, (unsigned)bm, (unsigned)o4, (unsigned)o18);
+        A6Log(b);
+    }
+    return r;
+}
+
+static uint32_t (*g_a6FontFaceOrig)(uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+extern "C" uint32_t A6_FontFace(uint32_t a1, uint32_t name, uint32_t b, uint32_t i) {
+    uint32_t r = g_a6FontFaceOrig(a1, name, b, i);
+    static int n = 0;
+    if (n < 10) {
+        n++;
+        uint8_t k = 0;
+        A6SafeRead((const void*)(uintptr_t)name, &k, 1);
+        uint32_t ptr = name + 1;
+        if (k == 0xff) A6SafeRead((const void*)(uintptr_t)(name + 0xc), &ptr, 4);
+        uint8_t mode = 0;
+        A6SafeRead((const void*)(uintptr_t)(a1 + 8), &mode, 1);
+        char b2[192];
+        snprintf(b2, sizeof(b2), "[A6-GLYPH] лицо #%d имя=%s жир=%u курс=%u реж=%u -> %08x", n,
+                 A6SafeStr(ptr).c_str(), (unsigned)(b & 0xff), (unsigned)(i & 0xff),
+                 (unsigned)mode, (unsigned)r);
+        A6Log(b2);
+    }
+    return r;
+}
+
+static uint32_t (*g_a6FindFileOrig)(uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+extern "C" uint32_t A6_FindFile(uint32_t name, uint32_t out, uint32_t b, uint32_t i) {
+    uint32_t r = g_a6FindFileOrig(name, out, b, i);
+    static int n = 0;
+    if (n < 10) {
+        n++;
+        uint8_t k = 0;
+        A6SafeRead((const void*)(uintptr_t)out, &k, 1);
+        uint32_t ptr = out + 1;
+        if (k == 0xff) A6SafeRead((const void*)(uintptr_t)(out + 0xc), &ptr, 4);
+        char b2[192];
+        snprintf(b2, sizeof(b2), "[A6-GLYPH] файл #%d запрос=%s -> %u путь=%s", n,
+                 A6SafeStr(name).c_str(), (unsigned)r, A6SafeStr(ptr).c_str());
+        A6Log(b2);
+    }
+    return r;
+}
+
+static void (*g_a6FontCtorOrig)(uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+extern "C" void A6_FontCtor(uint32_t self, uint32_t face, uint32_t mem, uint32_t style) {
+    g_a6FontCtorOrig(self, face, mem, style);
+    static int n = 0;
+    if (n < 6) {
+        n++;
+        char b[128];
+        snprintf(b, sizeof(b), "[A6-GLYPH] ctor #%d self=%08x лицо=%08x пам=%08x", n,
+                 (unsigned)self, (unsigned)face, (unsigned)mem);
+        A6Log(b);
+    }
+}
+
+static void A6InstallFontHooks(uint32_t slide) {
+    A6HookRaw(slide, 0x388d74, 0xe92d40f0, 0xe28d700c, (void*)&A6_FontCtor,
+              (void**)&g_a6FontCtorOrig, "font ctor");
+    A6HookRaw(slide, 0x3876dc, 0xe92d40f0, 0xe28d700c, (void*)&A6_FontFace,
+              (void**)&g_a6FontFaceOrig, "font get_face");
+    A6HookRaw(slide, 0x3875ec, 0xe92d40f0, 0xe28d700c, (void*)&A6_FindFile,
+              (void**)&g_a6FindFileOrig, "font find_file");
+    A6HookRaw(slide, 0x3aee20, 0xe92d40f0, 0xe28d700c, (void*)&A6_DrawTextNaked, &g_a6DrawTextTramp,
+              "font draw text");
+    A6HookRaw(slide, 0x385060, 0xe92d40f0, 0xe28d700c, (void*)&A6_GlyphInfo,
+              (void**)&g_a6GlyphInfoOrig, "font glyph info");
+    A6HookRaw(slide, 0x388194, 0xe92d40f0, 0xe28d700c, (void*)&A6_Atlas, (void**)&g_a6AtlasOrig,
+              "glyph atlas lock");
+    A6HookRaw(slide, 0x3873e0, 0xe92d40f0, 0xe28d700c, (void*)&A6_GetGlyphNaked, &g_a6GetGlyphTramp,
+              "font get_glyph");
+    A6HookRaw(slide, 0x3c3c94, 0xe92d40f0, 0xe28d700c, (void*)&A6_Mk0, (void**)&g_a6Mk0Orig, "bmp mk 3c3c94");
+    A6HookRaw(slide, 0x3c3ce8, 0xe92d40f0, 0xe28d700c, (void*)&A6_Mk1, (void**)&g_a6Mk1Orig, "bmp mk 3c3ce8");
+    A6HookRaw(slide, 0x3c3f58, 0xe92d40f0, 0xe28d700c, (void*)&A6_Mk2, (void**)&g_a6Mk2Orig, "bmp mk 3c3f58");
+    A6HookRaw(slide, 0x3c3f8c, 0xe92d40f0, 0xe28d700c, (void*)&A6_Mk3, (void**)&g_a6Mk3Orig, "bmp mk 3c3f8c");
+    A6HookRaw(slide, 0x3c3fe0, 0xe92d40f0, 0xe28d700c, (void*)&A6_Mk4, (void**)&g_a6Mk4Orig, "bmp mk 3c3fe0");
+    A6HookRaw(slide, 0x3c0e78, 0xe92d40f0, 0xe28d700c, (void*)&A6_SwfBmp, (void**)&g_a6SwfBmpOrig,
+              "gameswf bitmap_info::upload");
+    A6HookRaw(slide, 0x5a1210, 0xe92d40f0, 0xe28d700c, (void*)&A6_MakeTex, (void**)&g_a6MkTexOrig,
+              "IVideoDriver::createTexture");
+    A6InstallLogSmallHook(slide);
+    A6HookRaw(slide, 0x4fab84, 0xe92d4080, 0xe28d7000, (void*)&A6_Log3, (void**)&g_a6Log3Orig,
+              "Printer::log3");
+    A6HookRaw(slide, 0x4fad10, 0xe92d000e, 0xe92d4080, (void*)&A6_Logf, (void**)&g_a6LogfOrig,
+              "Printer::logf");
+    A6HookRaw(slide, 0x5e97b0, 0xe92d40f0, 0xe28d700c, (void*)&A6_ConvNaked, &g_a6ConvTramp,
+              "pixel_format::convert");
+    A6HookRaw(slide, 0x5f714c, 0xe92d40f0, 0xe28d700c, (void*)&A6_TexBind, (void**)&g_a6BindOrig,
+              "ITexture::bind");
+
+    // Литеральные пулы внутри __text у non-PIE слайса содержат абсолютные адреса данных.
+    // Если слайд к ним не применён, код читает таблицы по пустым адресам. Проверяем два
+    // литерала pixel_format::convert и заодно ищем в __text слова, похожие на неребейзенные
+    // указатели (значение лежит внутри vmaddr слайса, а не сдвинуто на слайд).
+    {
+        uint32_t probe[2] = {0x5ea43c, 0x5ea420};
+        for (uint32_t p : probe) {
+            uint32_t v = *(uint32_t*)(p + slide);
+            char b[96];
+            snprintf(b, sizeof(b), "[A6-LIT] %06x = %08x %s", (unsigned)p, (unsigned)v,
+                     (v > slide) ? "(сдвинут)" : "(БЕЗ СДВИГА)");
+            A6Log(b);
+        }
+        uint32_t lo = 0, hi = 0;
+        for (const auto& sec : g_machoSections) {
+            if (sec.name.find("__text") != std::string::npos) { lo = sec.start; hi = sec.end; break; }
+        }
+        int shown = 0, total = 0;
+        for (uint32_t a = lo; lo && a < hi; a += 4) {
+            uint32_t v = *(uint32_t*)a;
+            if (v >= 0x6f0000 && v < 0x835000) {
+                total++;
+                if (shown < 40) {
+                    char b[96];
+                    snprintf(b, sizeof(b), "[A6-LIT] без сдвига %06x -> %08x",
+                             (unsigned)(a - lo + 0x3720), (unsigned)v);
+                    A6Log(b);
+                    shown++;
+                }
+            }
+        }
+        A6Log("[A6-LIT] всего неребейзенных кандидатов: " + std::to_string(total));
+    }
+    A6HookRaw(slide, 0x625810, 0xe92d40f0, 0xe28d700c, (void*)&A6_FtInit,
+              (void**)&g_a6FtInitOrig, "FT_Init_FreeType");
+    A6HookRaw(slide, 0x62c120, 0xe92d4080, 0xe28d7000, (void*)&A6_FtFace,
+              (void**)&g_a6FtFaceOrig, "FT_New_Memory_Face");
+    A6HookRaw(slide, 0x39e24, 0xe92d40f0, 0xe28d700c, (void*)&A6_GetFontFile,
+              (void**)&g_a6FontFileOrig, "get_fontfile");
+    A6Log("[A6-FONT] хуки шрифта установлены");
 }
 
 // ВРЕМЕННАЯ ДИАГНОСТИКА A6: 0x43d04c — collada::createMaterialRendererForProfile<SProfileGLESTraits>.
@@ -17658,6 +18680,167 @@ static void A6InstallSetBufferHook(uint32_t slide) {
     snprintf(g_a6CommitDiag + dl, sizeof(g_a6CommitDiag) - dl, " setbuf:ок");
 }
 
+// ВРЕМЕННАЯ ДИАГНОСТИКА A6: аргументы glitch::video::pixel_format::unpackPalettized.
+// На слайде игра уходит туда с огромной шириной и падает, читая за концом буфера.
+typedef uint32_t (*A6UnpackFn)(const void*, uint32_t, uint32_t, uint32_t, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t);
+static A6UnpackFn g_a6UnpackOrig = nullptr;
+static int g_a6UnpackCnt = 0;
+static uint32_t A6_UnpackPalettized(const void* src, uint32_t pitch, uint32_t bpp, uint32_t fmt,
+                                    const void* pal, void* dst, uint32_t dpitch,
+                                    uint32_t w, uint32_t h, uint32_t flip) {
+    if (g_a6UnpackCnt < 24) {
+        char b[224];
+        snprintf(b, sizeof(b), "[A6-BMP] unpack#%d src=%p шаг=%u бит=%u фмт=%u пал=%p dst=%p dшаг=%u %ux%u flip=%u",
+                 g_a6UnpackCnt++, src, (unsigned)pitch, (unsigned)bpp, (unsigned)fmt, pal, dst,
+                 (unsigned)dpitch, (unsigned)w, (unsigned)h, (unsigned)flip);
+        A6Log(b);
+    }
+    uint32_t r = g_a6UnpackOrig(src, pitch, bpp, fmt, pal, dst, dpitch, w, h, flip);
+    if (g_a6UnpackCnt <= 2) {
+        char b[320];
+        std::string s = "[A6-BMP] исх:";
+        for (int i = 0; i < 16; i++) {
+            snprintf(b, sizeof(b), " %02x", (unsigned)((const uint8_t*)src)[i]);
+            s += b;
+        }
+        s += " пал:";
+        for (int i = 0; i < 16; i++) {
+            snprintf(b, sizeof(b), " %02x", (unsigned)((const uint8_t*)pal)[i]);
+            s += b;
+        }
+        s += " рез:";
+        for (int i = 0; i < 16; i++) {
+            snprintf(b, sizeof(b), " %02x", (unsigned)((const uint8_t*)dst)[i]);
+            s += b;
+        }
+        snprintf(b, sizeof(b), " рет=%u", (unsigned)r);
+        A6Log(s + b);
+    }
+    return r;
+}
+
+static void A6InstallUnpackHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x5d4278 + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) { A6Log("[A6-BMP] пролог не тот"); return; }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x5d4280 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6UnpackOrig = (A6UnpackFn)tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_UnpackPalettized;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-BMP] хук на unpackPalettized установлен");
+}
+
+typedef void (*A6DeconFn)(void*, void*, void*);
+static A6DeconFn g_a6DeconOrig = nullptr;
+static int g_a6DeconCnt = 0;
+static void A6_SceneDeconstruct(void* self, void* node, void* other) {
+    if (g_a6DeconCnt < 40) {
+        uint32_t vptr = node ? *(const uint32_t*)node : 0;
+        uint32_t vbase = vptr ? *(const uint32_t*)(uintptr_t)(vptr - 12) : 0;
+        char b[200];
+        snprintf(b, sizeof(b), "[A6-SCN] decon#%d узел=%p vptr=0x%08x vbase=0x%08x счётчик=%p",
+                 g_a6DeconCnt++, node, (unsigned)vptr, (unsigned)vbase,
+                 (void*)(vptr ? (uintptr_t)node + (int32_t)vbase : 0));
+        A6Log(b);
+    }
+    g_a6DeconOrig(self, node, other);
+}
+
+static void A6InstallDeconHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0xdc3d8 + slide);
+    if (fn[0] != 0xe92d4090 || fn[1] != 0xe3520000) { A6Log("[A6-SCN] пролог не тот"); return; }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0xdc3e0 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6DeconOrig = (A6DeconFn)tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_SceneDeconstruct;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-SCN] хук на SceneMng_Deconstruct установлен");
+}
+
+typedef void (*A6SwfReadFn)(void*, void*);
+static A6SwfReadFn g_a6SwfReadOrig = nullptr;
+static int g_a6SwfReadCnt = 0;
+static void A6_SwfMovieRead(void* self, void* in) {
+    g_a6SwfReadOrig(self, in);
+    if (g_a6SwfReadCnt < 16) {
+        const uint32_t* p = (const uint32_t*)self;
+        char b[180];
+        snprintf(b, sizeof(b), "[A6-SWF] read#%d this=%p версия=%u кадров=%u сжатие=%u длина=%u",
+                 g_a6SwfReadCnt++, self, (unsigned)p[0x32], (unsigned)p[0xe], (unsigned)p[0x37], (unsigned)p[0x36]);
+        A6Log(b);
+    }
+}
+
+static void A6InstallSwfReadHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x391c60 + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) { A6Log("[A6-SWF] пролог read не тот"); return; }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x391c68 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6SwfReadOrig = (A6SwfReadFn)tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_SwfMovieRead;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-SWF] хук на movie_def_impl::read установлен");
+}
+
+typedef void (*A6SwfFrameFn)(void*, int, char);
+static A6SwfFrameFn g_a6SwfFrameOrig = nullptr;
+static int g_a6SwfFrameCnt = 0;
+static void A6_SwfExecuteFrameTags(void* self, int frame, char state) {
+    if (g_a6SwfFrameCnt < 32) {
+        uint32_t def = self ? *(const uint32_t*)((uintptr_t)self + 0xa0) : 0;
+        uint32_t vptr = def ? *(const uint32_t*)(uintptr_t)def : 0;
+        uint32_t slot = vptr ? *(const uint32_t*)(uintptr_t)(vptr + 0x38) : 0;
+        char b[200];
+        snprintf(b, sizeof(b), "[A6-SWF] frame_tags#%d this=%p кадр=%d сост=%d def=0x%08x vptr=0x%08x get_frame_count=0x%08x",
+                 g_a6SwfFrameCnt++, self, frame, (int)state, (unsigned)def, (unsigned)vptr, (unsigned)slot);
+        A6Log(b);
+    }
+    g_a6SwfFrameOrig(self, frame, state);
+}
+
+static void A6InstallSwfFrameHook(uint32_t slide) {
+    uint32_t* fn = (uint32_t*)(0x3a72ac + slide);
+    if (fn[0] != 0xe92d40f0 || fn[1] != 0xe28d700c) { A6Log("[A6-SWF] пролог не тот"); return; }
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint32_t* tr = (uint32_t*)mmap(nullptr, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tr == MAP_FAILED) return;
+    tr[0] = fn[0]; tr[1] = fn[1];
+    tr[2] = 0xe51ff004;
+    tr[3] = 0x3a72b4 + slide;
+    __builtin___clear_cache((char*)tr, (char*)tr + 16);
+    g_a6SwfFrameOrig = (A6SwfFrameFn)tr;
+    void* base = (void*)(((uintptr_t)fn) & ~(page - 1));
+    if (mprotect(base, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    fn[0] = 0xe51ff004;
+    fn[1] = (uint32_t)(uintptr_t)&A6_SwfExecuteFrameTags;
+    __builtin___clear_cache((char*)fn, (char*)fn + 8);
+    A6Log("[A6-SWF] хук на execute_frame_tags установлен");
+}
+
 static void A6InstallStageHook(uint32_t slide) {
     uint32_t* fn = (uint32_t*)(0x567a14 + slide);
     if (fn[0] != 0xe92d40b0 || fn[1] != 0xe28d7008 || fn[2] != 0xe6ef1071) return;
@@ -17674,6 +18857,50 @@ static void A6InstallStageHook(uint32_t slide) {
 struct fat_header { uint32_t magic; uint32_t nfat_arch; }; struct fat_arch { uint32_t cputype; uint32_t cpusubtype; uint32_t offset; uint32_t size; uint32_t align; }; struct mach_header { uint32_t magic; uint32_t cputype; uint32_t cpusubtype; uint32_t filetype; uint32_t ncmds; uint32_t sizeofcmds; uint32_t flags; }; struct load_command { uint32_t cmd; uint32_t cmdsize; }; struct segment_command { uint32_t cmd; uint32_t cmdsize; char segname[16]; uint32_t vmaddr; uint32_t vmsize; uint32_t fileoff; uint32_t filesize; uint32_t maxprot; uint32_t initprot; uint32_t nsects; uint32_t flags; }; struct section { char sectname[16]; char segname[16]; uint32_t addr; uint32_t size; uint32_t offset; uint32_t align; uint32_t reloff; uint32_t nreloc; uint32_t flags; uint32_t reserved1; uint32_t reserved2; }; struct symtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t symoff; uint32_t nsyms; uint32_t stroff; uint32_t strsize; }; struct dysymtab_command { uint32_t cmd; uint32_t cmdsize; uint32_t ilocalsym; uint32_t nlocalsym; uint32_t iextdefsym; uint32_t nextdefsym; uint32_t iundefsym; uint32_t nundefsym; uint32_t tocoff; uint32_t ntoc; uint32_t modtaboff; uint32_t nmodtab; uint32_t extrefsymoff; uint32_t nextrefsyms; uint32_t indirectsymoff; uint32_t nindirectsyms; uint32_t extreloff; uint32_t nextrel; uint32_t locreloff; uint32_t nlocrel; }; struct thread_command { uint32_t cmd; uint32_t cmdsize; uint32_t flavor; uint32_t count; }; struct nlist { union { uint32_t n_strx; } n_un; uint8_t n_type; uint8_t n_sect; int16_t n_desc; uint32_t n_value; }; struct dyld_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t rebase_off; uint32_t rebase_size; uint32_t bind_off; uint32_t bind_size; uint32_t weak_bind_off; uint32_t weak_bind_size; uint32_t lazy_bind_off; uint32_t lazy_bind_size; uint32_t export_off; uint32_t export_size; };
 struct encryption_info_command { uint32_t cmd; uint32_t cmdsize; uint32_t cryptoff; uint32_t cryptsize; uint32_t cryptid; };
 uint64_t read_uleb128(const uint8_t** p) { uint64_t result = 0; int bit = 0; do { result |= ((**p & 0x7f) << bit); bit += 7; } while (*(*p)++ & 0x80); return result; } int64_t read_sleb128(const uint8_t** p) { int64_t result = 0; int bit = 0; uint8_t byte; do { byte = *(*p)++; result |= ((byte & 0x7f) << bit); bit += 7; } while (byte & 0x80); if (byte & 0x40) result |= (-1ULL) << bit; return result; }
+
+// segname/sectname в Mach-O — поля ровно по 16 байт, нуль-терминатора у имени в
+// 16 символов нет: без ограничения длины имя склеивается со следующим полем.
+static std::string MachOName(const char* f16) { return std::string(f16, strnlen(f16, 16)); }
+
+// Зонд состояния ребейза: проходит __objc_classlist и считает, сколько указателей
+// осталось в исходной (несдвинутой) области. Читает только внутри образа.
+static void A6RebaseProbe(const char* tag, const std::vector<section>& classlist, uint32_t slide, uint32_t minv, uint32_t maxv) {
+    if (!g_isAsphalt6Path) return;
+    uint32_t lo = slide + minv, hi = slide + maxv;
+    auto slid = [&](uint32_t v) { return v >= lo && v < hi; };
+    for (const auto& sect : classlist) {
+        uint32_t* tbl = (uint32_t*)sect.addr;
+        uint32_t n = sect.size / 4;
+        int ok = 0, badCls = 0, badRo = 0, badName = 0; uint32_t firstBad = 0; int firstIdx = -1;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t cls = tbl[i];
+            if (!slid(cls)) { badCls++; if (firstIdx < 0) { firstIdx = i; firstBad = cls; } continue; }
+            uint32_t ro = ((uint32_t*)cls)[4] & ~3u;
+            if (!slid(ro)) { badRo++; if (firstIdx < 0) { firstIdx = i; firstBad = ro; } continue; }
+            uint32_t nm = ((uint32_t*)ro)[4];
+            if (!slid(nm)) {
+                badName++;
+                if (firstIdx < 0) { firstIdx = i; firstBad = nm; }
+                if (badName <= 10) {
+                    std::string tgt = "Unknown";
+                    for (const auto& s : g_machoSections)
+                        if (nm + slide >= s.start && nm + slide < s.end) { tgt = s.name; break; }
+                    char b2[256];
+                    snprintf(b2, sizeof(b2), "[A6-REB] имя#%u слово@0x%08X знач=0x%08X цель=%s строка=%d '%.20s'",
+                             i, (unsigned)(ro + 16 - slide), nm, tgt.c_str(),
+                             (int)isValidString((const char*)(nm + slide)), (const char*)(nm + slide));
+                    LogToJava(b2);
+                }
+                continue;
+            }
+            ok++;
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "[A6-REB] %s classlist=%u ok=%d badCls=%d badRo=%d badName=%d перв=#%d 0x%08X",
+                 tag, n, ok, badCls, badRo, badName, firstIdx, firstBad);
+        LogToJava(buf);
+    }
+}
 
 void ProcessRebaseOpcodes(int fd, uint32_t arch_offset, uint32_t rebase_off, uint32_t rebase_size, const std::vector<segment_command>& segments, uint32_t slide) {
     std::vector<uint8_t> rebase_data(rebase_size); VfsLseekAny(fd, arch_offset + rebase_off, SEEK_SET); VfsReadAny(fd, rebase_data.data(), rebase_size);
@@ -17899,6 +19126,7 @@ void LoadMachO(const std::string& bundlePath) {
 
     std::string execName = bundlePath.substr(bundlePath.find_last_of('/') + 1); execName = execName.substr(0, execName.find(".app")); std::string execPath = bundlePath + "/" + execName;
     g_execPath = execPath;
+    g_isAsphalt6Path = bundlePath.find("Asphalt6") != std::string::npos;
     int fd = VfsOpenAny(execPath.c_str(), O_RDONLY); if (fd < 0) return;
     
     uint32_t magic; VfsReadAny(fd, &magic, sizeof(magic));
@@ -17949,6 +19177,7 @@ void LoadMachO(const std::string& bundlePath) {
 
     // --- ПЕРВЫЙ ПРОХОД: Вычисляем min/max vmaddr и slide ---
     uint32_t min_vmaddr = 0xFFFFFFFF; uint32_t max_vmaddr = 0;
+    uint32_t funcStartsOff = 0, funcStartsSize = 0, text_vmaddr = 0xFFFFFFFF;
     uint32_t scan_offset = arch_offset + sizeof(mach_header);
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         load_command lc; VfsLseekAny(fd, scan_offset, SEEK_SET); VfsReadAny(fd, &lc, sizeof(lc));
@@ -17961,8 +19190,14 @@ void LoadMachO(const std::string& bundlePath) {
                 return;
             }
         }
+        if (lc.cmd == 0x26) { // LC_FUNCTION_STARTS
+            struct { uint32_t cmd, cmdsize, dataoff, datasize; } fs;
+            VfsLseekAny(fd, scan_offset, SEEK_SET); VfsReadAny(fd, &fs, sizeof(fs));
+            funcStartsOff = fs.dataoff; funcStartsSize = fs.datasize;
+        }
         if (lc.cmd == 1) {
             segment_command seg; VfsLseekAny(fd, scan_offset, SEEK_SET); VfsReadAny(fd, &seg, sizeof(seg));
+            if (MachOName(seg.segname) == "__TEXT") text_vmaddr = seg.vmaddr;
             if (seg.vmsize > 0) {
                 if (seg.vmaddr < min_vmaddr) min_vmaddr = seg.vmaddr;
                 if (seg.vmaddr + seg.vmsize > max_vmaddr) max_vmaddr = seg.vmaddr + seg.vmsize;
@@ -17970,6 +19205,25 @@ void LoadMachO(const std::string& bundlePath) {
         }
         scan_offset += lc.cmdsize;
     }
+    g_funcStarts.clear();
+    // Дельты отсчитываются от начала __TEXT (адрес mach-заголовка), а не от min_vmaddr:
+    // __PAGEZERO опускает минимум до нуля и сдвинул бы весь список.
+    if (funcStartsSize > 0 && funcStartsSize < 0x400000 && text_vmaddr != 0xFFFFFFFF) {
+        std::vector<uint8_t> buf(funcStartsSize);
+        VfsLseekAny(fd, arch_offset + funcStartsOff, SEEK_SET);
+        VfsReadAny(fd, buf.data(), funcStartsSize);
+        uint32_t addr = text_vmaddr, i = 0;
+        while (i < funcStartsSize) {
+            uint32_t val = 0, sh = 0; uint8_t b;
+            do { b = buf[i++]; val |= (uint32_t)(b & 0x7f) << sh; sh += 7; }
+            while ((b & 0x80) && i < funcStartsSize);
+            if (val == 0) break;
+            addr += val;
+            g_funcStarts.insert(addr);
+        }
+        LogToJava("REBASE-TRACE: LC_FUNCTION_STARTS: точек входа " + std::to_string(g_funcStarts.size()));
+    }
+
     g_appSlide = 0;
     if (max_vmaddr > min_vmaddr) {
         if (g_nativeRootMmap) {
@@ -17998,7 +19252,7 @@ void LoadMachO(const std::string& bundlePath) {
     }
     // --------------------------------------------------------
 
-    uint32_t cmd_offset = arch_offset + sizeof(mach_header); symtab_command symtab = {0}; dysymtab_command dysymtab = {0}; uint32_t dyld_bind_off = 0, dyld_bind_size = 0; uint32_t dyld_lazy_bind_off = 0, dyld_lazy_bind_size = 0; uint32_t dyld_rebase_off = 0, dyld_rebase_size = 0; std::vector<segment_command> loaded_segments; std::vector<section> dysym_sections; std::vector<section> classlist_sections; std::vector<section> init_func_sections;
+    uint32_t cmd_offset = arch_offset + sizeof(mach_header); symtab_command symtab = {0}; dysymtab_command dysymtab = {0}; uint32_t dyld_bind_off = 0, dyld_bind_size = 0; uint32_t dyld_lazy_bind_off = 0, dyld_lazy_bind_size = 0; uint32_t dyld_rebase_off = 0, dyld_rebase_size = 0; std::vector<segment_command> loaded_segments; std::vector<section> dysym_sections; std::vector<section> classlist_sections; std::vector<section> init_func_sections; std::vector<std::pair<uint32_t, uint32_t>> code_ranges;
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         VfsLseekAny(fd, cmd_offset, SEEK_SET); load_command lc; VfsReadAny(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { 
@@ -18010,14 +19264,15 @@ void LoadMachO(const std::string& bundlePath) {
                 uint32_t sect_offset = cmd_offset + sizeof(segment_command);
                 for(uint32_t s = 0; s < seg.nsects; s++) { 
                     section sect; VfsLseekAny(fd, sect_offset, SEEK_SET); VfsReadAny(fd, &sect, sizeof(sect)); 
+                    if (sect.flags & 0x80000000) code_ranges.push_back({sect.addr, sect.addr + sect.size}); // S_ATTR_PURE_INSTRUCTIONS, адреса без слайда
                     sect.addr += g_appSlide; // Сдвигаем адрес секции
-                    uint8_t type = sect.flags & 0xff; 
+                    uint8_t type = sect.flags & 0xff;
                     if (type == 6 || type == 7) dysym_sections.push_back(sect); 
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     
                     MachOSectionInfo sinfo;
-                    sinfo.name = std::string(sect.segname) + "," + std::string(sect.sectname);
+                    sinfo.name = MachOName(sect.segname) + "," + MachOName(sect.sectname);
                     sinfo.start = sect.addr;
                     sinfo.end = sect.addr + sect.size;
                     g_machoSections.push_back(sinfo);
@@ -18037,17 +19292,30 @@ void LoadMachO(const std::string& bundlePath) {
         std::vector<char> strTable(symtab.strsize); VfsLseekAny(fd, arch_offset + symtab.stroff, SEEK_SET); VfsReadAny(fd, strTable.data(), symtab.strsize);
         std::vector<nlist> symTable(symtab.nsyms); VfsLseekAny(fd, arch_offset + symtab.symoff, SEEK_SET); VfsReadAny(fd, symTable.data(), symtab.nsyms * sizeof(nlist));
         bool isES1 = false; bool isES2 = false;
+        uint32_t thumbCodeSyms = 0, armCodeSyms = 0;
         for (uint32_t i = 0; i < symtab.nsyms; i++) {
             if (symTable[i].n_un.n_strx > 0) {
                 std::string symName = &strTable[symTable[i].n_un.n_strx];
                 if (symTable[i].n_sect > 0) {
                     g_appSymbols[symName] = symTable[i].n_value + g_appSlide;
                     if (symTable[i].n_desc & 0x0008) g_appThumbSymbols.insert(symName);
+                    for (const auto& cr : code_ranges) {
+                        if (symTable[i].n_value >= cr.first && symTable[i].n_value < cr.second) {
+                            if (symTable[i].n_desc & 0x0008) thumbCodeSyms++; else armCodeSyms++;
+                            break;
+                        }
+                    }
                 }
                 if (symName == "_glCompileShader") isES2 = true;
                 if (symName == "_glEnableClientState" || symName == "_glVertexPointer") isES1 = true;
             } 
         }
+        // Кодовые секции целиком в одном режиме: смешанные образы встречаются, но ребейз
+        // литеральных пулов зависит от того, как декодировать поток инструкций.
+        bool imageIsThumb = (thumbCodeSyms >= armCodeSyms);
+        if (g_isAsphalt6Path) LogToJava("[A6-REB] Режим кода: " + std::string(imageIsThumb ? "Thumb" : "ARM") +
+                  " (thumb=" + std::to_string(thumbCodeSyms) + " arm=" + std::to_string(armCodeSyms) + ")");
+
         std::string renderStr = "Unknown";
         if (isES1 && isES2) renderStr = "OpenGL ES 1.1/2.0 (Dual)";
         else if (isES2) renderStr = "OpenGL ES 2.0 Only";
@@ -18118,6 +19386,34 @@ void LoadMachO(const std::string& bundlePath) {
                 uint8_t sig_dext[] = {0x10, 0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0x00, 0x11, 0x00, 0x11, 0x00, 0x12, 0x00, 0x12, 0x00, 0x13, 0x00, 0x13, 0x00};
                 add_to_blacklist(sig_dext, sizeof(sig_dext), 64, "dext");
 
+                // Встроенные картинки BMP: их пиксели и заголовок — обычные байты, и слово
+                // 0x00800000 (ширина/высота 128) попадает в диапазон образа, после чего
+                // эвристика прибавляет к нему слайд и ломает размеры изображения.
+                for (const auto& s : g_machoSections) {
+                    if (s.name.find("__const") == std::string::npos &&
+                        s.name.find("__data") == std::string::npos &&
+                        s.name.find("__common") == std::string::npos) continue;
+                    if (s.end <= s.start || s.end - s.start < 54) continue;
+                    for (const uint8_t* p = (const uint8_t*)s.start; p <= (const uint8_t*)(s.end - 54); p++) {
+                        if (p[0] != 'B' || p[1] != 'M') continue;
+                        uint32_t fsize, reserved, dataOff, hdrSize;
+                        memcpy(&fsize, p + 2, 4); memcpy(&reserved, p + 6, 4);
+                        memcpy(&dataOff, p + 10, 4); memcpy(&hdrSize, p + 14, 4);
+                        uint16_t planes, bits;
+                        memcpy(&planes, p + 26, 2); memcpy(&bits, p + 28, 2);
+                        if (reserved != 0 || hdrSize != 40 || planes != 1) continue;
+                        if (dataOff < 54 || dataOff > fsize || fsize < 54) continue;
+                        if ((uint32_t)p + fsize > s.end) continue;
+                        if (bits != 1 && bits != 4 && bits != 8 && bits != 16 && bits != 24 && bits != 32) continue;
+                        uint32_t found_addr = (uint32_t)p - g_appSlide;
+                        zlib_blacklist.push_back({found_addr, found_addr + fsize});
+                        char bbuf[160];
+                        snprintf(bbuf, sizeof(bbuf), "BMP PROTECTOR: встроенная картинка по 0x%X, %u байт", found_addr, (unsigned)fsize);
+                        LogToJava(bbuf);
+                        p += fsize - 1;
+                    }
+                }
+
                 LogToJava("CUSTOM-PARSER: Движок успешно инициализирован (ARM_THUMB).");
 
                 uint32_t scan_cmd_offset = arch_offset + sizeof(mach_header);
@@ -18128,12 +19424,115 @@ void LoadMachO(const std::string& bundlePath) {
                         uint32_t sect_offset = scan_cmd_offset + sizeof(segment_command);
                         for(uint32_t s = 0; s < seg.nsects; s++) {
                             section sect; VfsLseekAny(fd, sect_offset, SEEK_SET); VfsReadAny(fd, &sect, sizeof(sect));
-                            std::string sectname = sect.sectname;
+                            std::string sectname = MachOName(sect.sectname);
                             
-                            bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
-                            bool isString = (sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype");
-                            
-                                if (isCode && sect.size > 0) {
+                            bool isCode = (sect.flags & 0x80000000) != 0 || sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub";
+                            bool isString = (sect.flags & 0xff) == 2 || sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype";
+
+                            // Секции-заглушки линкер всегда собирает в ARM, даже в Thumb-образе:
+                            // ldr ip,[pc,#0] / ldr pc,[ip] с абсолютным адресом la_symbol_ptr в литерале.
+                            // Thumb-парсер такой код не разбирает, и на слайде переход уходит в никуда.
+                            bool isStub = sectname.compare(0, 13, "__symbol_stub") == 0 ||
+                                          sectname.compare(0, 15, "__picsymbolstub") == 0 ||
+                                          sectname == "__stub_helper";
+
+                            if (isCode && sect.size >= 4 && (!imageIsThumb || isStub)) {
+                                // ARM: абсолютные адреса живут в литеральных пулах, читаемых
+                                // LDR Rt,[PC,#±imm12]. Один и тот же пул адресуют несколько
+                                // инструкций, поэтому слово сдвигаем не больше одного раза.
+                                LogToJava("REBASE-TRACE: ARM-скан секции: " + sectname + " (размер: " + std::to_string(sect.size) + ")");
+                                const uint32_t* insns = (const uint32_t*)(sect.addr + g_appSlide);
+                                uint32_t n = sect.size / 4;
+                                std::vector<uint8_t> done(n, 0);
+                                int modified_literals = 0, pic_skipped = 0;
+
+                                int jumptab_entries = 0;
+                                for (uint32_t k = 0; k < n; k++) {
+                                    uint32_t insn = insns[k];
+
+                                    // Инлайновая таблица переходов: ldr pc,[pc,Rm,lsl #2]. Абсолютные
+                                    // адреса меток лежат сразу за ней в коде, и их не адресует ни один
+                                    // LDR-литерал, так что обычный скан пулов их не видит.
+                                    if ((insn & 0x0FFFFFF0) == 0x079FF100) {
+                                        uint32_t rm = insn & 0xF;
+                                        uint32_t limit = 0;
+                                        for (uint32_t j = k; j > 0 && j + 8 > k; j--) {
+                                            uint32_t c = insns[j - 1];
+                                            if ((c & 0x0FF0F000) == 0x03500000 && ((c >> 16) & 0xF) == rm) {
+                                                uint32_t rot = ((c >> 8) & 0xF) * 2, imm8 = c & 0xFF;
+                                                limit = rot ? ((imm8 >> rot) | (imm8 << (32 - rot))) : imm8;
+                                                limit++;
+                                                break;
+                                            }
+                                        }
+                                        if (limit == 0 || limit > 256) limit = 256;
+                                        for (uint32_t e = 0; e < limit && k + 2 + e < n; e++) {
+                                            uint32_t idx2 = k + 2 + e;
+                                            uint32_t t = insns[idx2];
+                                            if ((t & 3) != 0 || t < sect.addr || t >= sect.addr + sect.size) break;
+                                            if (!done[idx2]) {
+                                                *(uint32_t*)(sect.addr + g_appSlide + idx2 * 4) = t + g_appSlide;
+                                                done[idx2] = 1;
+                                                jumptab_entries++;
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    if ((insn & 0x0F7F0000) != 0x051F0000) continue; // LDR Rt,[PC,#imm12]
+                                    uint32_t rt = (insn >> 12) & 0xF;
+                                    uint32_t imm = insn & 0xFFF;
+                                    uint32_t pc = sect.addr + k * 4 + 8;
+                                    uint32_t lit = (insn & 0x00800000) ? (pc + imm) : (pc - imm);
+                                    if (lit < sect.addr || lit + 4 > sect.addr + sect.size) continue;
+                                    uint32_t idx = (lit - sect.addr) / 4;
+                                    if (done[idx]) continue;
+
+                                    // PIC: следом ADD Rd,PC,Rt или LDR Rd,[PC,Rt] — в пуле лежит
+                                    // смещение от PC, а не адрес; сдвигать его нельзя.
+                                    bool is_pic = false;
+                                    for (uint32_t j = k + 1; j < n && j < k + 17; j++) {
+                                        uint32_t s2 = insns[j];
+                                        if ((s2 & 0x0FEF0FF0) == 0x008F0000 && (s2 & 0xF) == rt) { is_pic = true; break; }
+                                        if ((s2 & 0x0F7F0FF0) == 0x071F0000 && (s2 & 0xF) == rt) { is_pic = true; break; }
+                                    }
+                                    if (is_pic) { done[idx] = 1; pic_skipped++; continue; }
+
+                                    uint32_t val = *(const uint32_t*)(lit + g_appSlide);
+                                    if (val <= 0x1000 || val >= max_vmaddr) continue;
+                                    uint32_t shifted = val + g_appSlide;
+                                    bool in_section = false;
+                                    bool code_target = false;
+                                    bool text_target = false;
+                                    for (const auto& sInfo : g_machoSections) {
+                                        if (shifted >= sInfo.start && shifted < sInfo.end) {
+                                            in_section = true;
+                                            text_target = sInfo.name.find("__text") != std::string::npos;
+                                            code_target = text_target ||
+                                                          sInfo.name.find("__stub") != std::string::npos ||
+                                                          sInfo.name.find("__picsymbolstub") != std::string::npos;
+                                            break;
+                                        }
+                                    }
+                                    if (!in_section) continue;
+                                    // Указатель на код всегда либо ARM (кратен 4), либо Thumb (остаток 1).
+                                    // Остаток 2 или 3 — это константа, случайно похожая на адрес: так под
+                                    // ребейз попадали магические слова 'FWS'/'CWS' (0x535746/0x535743).
+                                    if (code_target && (val & 2) != 0) continue;
+                                    // В __text литерал может указывать только на начало функции. Иначе под
+                                    // ребейз попадают константы: у Asphalt 6 так уезжали идентификаторы
+                                    // колбэков GLU (0x1870c/0x1870d), и тесселятор терял колбэк end.
+                                    if (text_target && !g_funcStarts.empty() &&
+                                        !g_funcStarts.count(val & ~1u) && !g_funcStarts.count(val | 1u)) continue;
+
+                                    *(uint32_t*)(lit + g_appSlide) = shifted;
+                                    done[idx] = 1;
+                                    modified_literals++;
+                                }
+                                if (g_isAsphalt6Path) LogToJava("[A6-REB] ARM-пулы " + sectname + ": сдвинуто " + std::to_string(modified_literals) +
+                                          ", PIC пропущено " + std::to_string(pic_skipped) +
+                                          ", таблиц переходов " + std::to_string(jumptab_entries));
+                            } else if (isCode && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Кастомный парсер сканирует секцию: " + sectname + " (размер: " + std::to_string(sect.size) + ")");
                                 uint32_t current_addr = sect.addr;
                                 const uint8_t* code = (const uint8_t*)(sect.addr + g_appSlide);
@@ -18224,6 +19623,12 @@ void LoadMachO(const std::string& bundlePath) {
                                 }
                                 LogToJava("CUSTOM-PARSER: Успешно разобрано " + std::to_string(parsed_count) + " инструкций.");
                                 LogToJava("CUSTOM-PARSER: Изменено абсолютных указателей в пулах: " + std::to_string(modified_literals));
+                            } else if (!isString && sect.size > 0 && MachOName(seg.segname) == "__TEXT") {
+                                // Сегмент __TEXT грузится только для чтения и по устройству Mach-O
+                                // не может требовать релокаций: указателей тут нет по определению.
+                                // Эвристика же принимала за них битовые маски (__const: 0000f800 ->
+                                // 1000f800) и рвала таблицу форматов пикселей PFDTable.
+                                LogToJava("REBASE-TRACE: Пропускаю __TEXT," + sectname + " — релокаций там не бывает");
                             } else if (!isString && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Эвристический ребейз секции данных: " + sectname);
                                 uint32_t* ptr = (uint32_t*)(sect.addr + g_appSlide);
@@ -18295,7 +19700,17 @@ void LoadMachO(const std::string& bundlePath) {
                                                                      target_section.find("__lazy_symbol") != std::string::npos || 
                                                                      target_section.find("__mod_init_func") != std::string::npos);
 
-                                            if (is_code_target) {
+                                            if (is_code_target && !g_funcStarts.empty() &&
+                                                target_section.find("__text") != std::string::npos) {
+                                                // В __text указатель может вести только в начало функции, а их точный
+                                                // список даёт LC_FUNCTION_STARTS. Без этого константы вроде 0x10000
+                                                // (module_version у FreeType) проходят как адреса кода.
+                                                // Thumb-бит в LC_FUNCTION_STARTS ставят не все линкеры,
+                                                // поэтому сверяем адрес в обоих видах.
+                                                if (!g_funcStarts.count(val & ~1u) && !g_funcStarts.count(val | 1u)) {
+                                                    safe_to_rebase = false; reason = "Code: Not a func start";
+                                                }
+                                            } else if (is_code_target) {
                                                 // Чётный адрес — это ARM-режим, а не Thumb; такие указатели реальны
                                                 // (vtable ARM-собранных статических библиотек). Отличаем их от констант
                                                 // по признакам точки входа ARM: выравнивание на 4 и безусловный (cond=AL) первый опкод.
@@ -18352,6 +19767,7 @@ void LoadMachO(const std::string& bundlePath) {
                     scan_cmd_offset += lc.cmdsize;
                 }
                 LogToJava("CUSTOM-PARSER: Обработка Mach-O завершена.");
+                A6RebaseProbe("после-ребейза", classlist_sections, g_appSlide, min_vmaddr, max_vmaddr);
             }
             // ------------------------------------
         }
@@ -18362,7 +19778,33 @@ void LoadMachO(const std::string& bundlePath) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); VfsLseekAny(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); VfsReadAny(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
                 uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
+                // Локальные записи таблицы (INDIRECT_SYMBOL_LOCAL/ABS, а также заглушка
+                // ld «radr://5614542» с индексом 0) символом не связываются: в них лежит
+                // адрес внутри самого образа, и его надо просто сдвинуть. Исходное слово
+                // берётся из файла, потому что эвристика уже могла его тронуть.
+                std::vector<uint32_t> orig;
+                if (g_appSlide > 0 && sect.offset > 0) {
+                    orig.resize(num_pointers);
+                    VfsLseekAny(fd, arch_offset + sect.offset, SEEK_SET);
+                    VfsReadAny(fd, orig.data(), num_pointers * sizeof(uint32_t));
+                }
+                for (uint32_t i = 0; i < num_pointers; i++) {
+                    uint32_t sym_idx = indirectSyms[sect.reserved1 + i];
+                    bool isLocal = (sym_idx == 0x80000000 || sym_idx == 0x40000000);
+                    std::string symName;
+                    if (!isLocal) {
+                        symName = &strTable[symTable[sym_idx].n_un.n_strx];
+                        if (symName.compare(0, 7, "radr://") == 0) isLocal = true;
+                    }
+                    if (isLocal) {
+                        if (!orig.empty()) {
+                            uint32_t v = orig[i];
+                            if (v >= min_vmaddr && v < max_vmaddr && v > 0x1000) ptr_table[i] = v + g_appSlide;
+                        }
+                        continue;
+                    }
+                    ptr_table[i] = (uint32_t)ResolveSymbol(symName);
+                }
             }
         }
     }
@@ -18393,20 +19835,29 @@ void LoadMachO(const std::string& bundlePath) {
         A6InstallRegNodeHook(g_appSlide);
         A6InstallSetBufferHook(g_appSlide);
         A6InstallRandStrHook(g_appSlide);
+        A6InstallUnpackHook(g_appSlide);
+        A6InstallSwfFrameHook(g_appSlide);
+        A6InstallSwfReadHook(g_appSlide);
+        A6InstallDeconHook(g_appSlide);
+        A6InstallFontHooks(g_appSlide);
     }
 
+    A6RebaseProbe("перед-classlist", classlist_sections, g_appSlide, min_vmaddr, max_vmaddr);
+
     // --- ПАРСИНГ __objc_classlist (Восстановление скрытых/stripped классов) ---
+    const uint32_t img_lo = g_appSlide + min_vmaddr, img_hi = g_appSlide + max_vmaddr;
+    auto inImage = [&](uint32_t v) { return v >= img_lo + 0x1000 && v < img_hi; };
     for (const auto& sect : classlist_sections) {
-        uint32_t* ptr_table = (uint32_t*)sect.addr; 
+        uint32_t* ptr_table = (uint32_t*)sect.addr;
         uint32_t num_classes = sect.size / 4;
         for (uint32_t i = 0; i < num_classes; i++) {
             uint32_t cls_addr = ptr_table[i];
-            if (cls_addr > 0x1000) {
+            if (inImage(cls_addr)) {
                 uint32_t* cls = (uint32_t*)cls_addr;
                 uint32_t data_ptr = cls[4] & ~3;
-                if (data_ptr > 0x1000) {
+                if (inImage(data_ptr)) {
                     uint32_t name_ptr = ((uint32_t*)data_ptr)[4];
-                    if (isValidString((const char*)name_ptr)) {
+                    if (inImage(name_ptr) && isValidString((const char*)name_ptr)) {
                         std::string cName = (const char*)name_ptr;
                         g_appSymbols["_OBJC_CLASS_$_" + cName] = cls_addr;
                         if (LogCatOn(LOG_DIAG)) {
