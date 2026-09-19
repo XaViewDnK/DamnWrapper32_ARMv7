@@ -149,11 +149,3 @@ jobs:
       with:
         name: DamnWrapper32-APK
         path: DamnWrapper32_ARMv7.apk
-
-    - name: Upload Unstripped Library
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: DamnWrapper32-so-unstripped
-        path: build/ndk-obj/local/armeabi-v7a/libDamnWrapper32.so
-        if-no-files-found: warn
