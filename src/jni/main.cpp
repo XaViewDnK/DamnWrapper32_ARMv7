@@ -253,7 +253,10 @@ bool g_frameHasDraw = false;
 bool g_framePresented = false;
 bool g_onScreenDebugOverlay = false;
 bool g_showPerfOverlay = false;
-int g_esModeOption = 2;
+// Режим ES, выбранный в настройках. Это лишь пожелание: действующий режим лежит
+// в g_esMode и может быть продиктован образом игры. Читать его вправе только
+// код, выбирающий режим, — все остальные проверки обязаны смотреть на g_esMode.
+int g_esModeRequested = 2;
 
 // Variables for FPS calculation
 uint64_t g_fpsLastTimeMs = 0;
@@ -331,7 +334,10 @@ static inline void RotTouchPoint(int quarters, float x, float y, float& rx, floa
 static inline void MapTouchToGameView(float x, float y, float& rx, float& ry) {
     RotTouchPoint(g_screenRotQuarters, x, y, rx, ry);
 }
-int g_activeESVersion = 2;
+// Действующий режим ES: 1 или 2. Единственный источник истины для всего,
+// что зависит от режима, — отказа initWithAPI:, модели устройства, GL_VERSION,
+// фиксированного конвейера.
+int g_esMode = 2;
 int g_debugHeartbeat = 0;
 int g_lastActiveFBO = 0;
 std::set<GLuint> g_texCreatedEmpty;   // ВРЕМЕННАЯ ДИАГНОСТИКА Asphalt 6
@@ -751,6 +757,7 @@ std::map<void*, void*> g_layerDrawableProperties;
 std::map<int, void*> g_pointerToUI;
 
 void* g_mainView = nullptr;
+bool g_touchTrace = false;
 void* g_presentedView = nullptr;
 std::vector<void*> g_modalStack;   // модалки складываются стопкой, как в UIKit
 std::vector<void*> g_modalPresenters;          // кто показал каждую модалку
@@ -792,8 +799,9 @@ void LoadUserDefaults();
 void SaveUserDefaults();
 
 struct NSFastEnumerationState { unsigned long state; void** itemsPtr; unsigned long* mutationsPtr; unsigned long extra[5]; };
-struct FakeUITouch { uint32_t isa; const char* className; float x; float y; void* view; uint32_t touchId; };
+struct FakeUITouch { uint32_t isa; const char* className; float x; float y; void* view; uint32_t touchId; int phase; };
 struct FakeNSSet { uint32_t isa; const char* className; std::vector<void*> touches; };
+struct FakeUIEvent { uint32_t isa; const char* className; void* touchSet; };
 struct FakeUIAcceleration { uint32_t isa; const char* className; double timestamp; double x; double y; double z; };
 std::map<int, FakeUITouch*> g_activeTouches;
 double g_latestAccelX = 0.0;
@@ -2760,14 +2768,14 @@ extern "C" GLenum Stub_glCheckFramebufferStatus(GLenum target) {
 }
 extern "C" void Stub_glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint *params) { 
     uint32_t lr = (uint32_t)__builtin_return_address(0);
-    if (pname == 0x8D42) { 
-        *params = g_surfaceWidth; 
+    if (pname == 0x8D42) {
+        *params = g_surfaceWidth;
         LogToJava(">>>>>>>> [SIZE-CRITICAL] glGetRenderbufferParameteriv(WIDTH) <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr) + " | Отдаем: " + std::to_string(*params));
         return; 
     } 
-    if (pname == 0x8D43) { 
-        *params = g_surfaceHeight; 
+    if (pname == 0x8D43) {
+        *params = g_surfaceHeight;
         LogToJava(">>>>>>>> [SIZE-CRITICAL] glGetRenderbufferParameteriv(HEIGHT) <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr) + " | Отдаем: " + std::to_string(*params));
         return; 
@@ -4891,7 +4899,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
             uint8_t* v = pBase + idx * pStride;
             px = readG(v, pType, 0, pNorm); if (pSize > 1) py = readG(v, pType, 1, pNorm); if (pSize > 2) pz = readG(v, pType, 2, pNorm); if (pSize > 3) pw = readG(v, pType, 3, pNorm);
         }
-        if (A6Dbg() && g_dbgRawN < 6) {
+        if ((A6Dbg() || LogCatOn(LOG_RENDER_DUMP)) && g_dbgRawN < 6) {
             g_dbgRawPos[g_dbgRawN][0] = px; g_dbgRawPos[g_dbgRawN][1] = py;
             g_dbgRawPos[g_dbgRawN][2] = pz; g_dbgRawPos[g_dbgRawN][3] = pw;
             g_dbgRawN++;
@@ -5565,7 +5573,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
 
             double area = edgeFunction(tv0, tv1, tv2);
             if (std::abs(area) < 0.001) continue;
-            
+
             bool isCCW = area > 0;
             if (flipWinding) isCCW = !isCCW;
             bool isFront = (g_frontFace == 0x0901) ? isCCW : !isCCW;
@@ -6091,6 +6099,7 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
                  g_dbgBB[2], g_dbgBB[3], g_dbgBB[0], g_dbgBB[1]);
         _LogToJava(qb);
     }
+
 
     const bool dbgCorner = false;
     (void)g_a6CornerLines;
@@ -6708,7 +6717,7 @@ static const float* A6AdjustProjection(const float* P, float* out16) {
 
 // Возвращает true, если кадр рисуется нашей fixed-function программой.
 static bool ApplyFixedFunctionState(int rotQuarters) {
-    if (g_activeESVersion != 1) return false;
+    if (g_esMode != 1) return false;
 
     GLint curProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &curProg);
     // Игра сама привязала шейдер — не вмешиваемся.
@@ -7582,7 +7591,7 @@ extern "C" const GLubyte* MegaDebug_glGetString(GLenum name) {
     static char s_glStrExt[1024] = "GL_APPLE_framebuffer_multisample GL_APPLE_texture_2D_limited_npot GL_APPLE_texture_format_BGRA8888 GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_OES_blend_equation_separate GL_OES_blend_func_separate GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_fbo_render_mipmap GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_stencil8 GL_OES_stencil_wrap GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object GL_OES_element_index_uint";
     if (name == GL_VERSION) {
         snprintf(s_glStrVersion, sizeof(s_glStrVersion), "%s",
-                 (g_activeESVersion == 1) ? "OpenGL ES-CM 1.1 Apple" : "OpenGL ES 2.0 Apple");
+                 (g_esMode == 1) ? "OpenGL ES-CM 1.1 Apple" : "OpenGL ES 2.0 Apple");
         char dbg[160];
         snprintf(dbg, sizeof(dbg), "[GL-DIAG] glGetString(GL_VERSION) -> %p '%s'", (void*)s_glStrVersion, s_glStrVersion);
         LogToJava(dbg);
@@ -8507,6 +8516,23 @@ static void NibApplyViewProps(NibArchive& a, int idx, void* obj) {
     }
 }
 
+// Настоящий UIKit разворачивает объекты архива через -initWithCoder:. Без этого
+// вызова ивары класса игры остаются нулями: у MCPE так обнулялся viewScale EAGLView,
+// и контроллер считал размер экрана как bounds*0.
+static void* NibInitWithCoder(void* inst) {
+    if (!inst) return inst;
+    uint32_t isa = ((uint32_t*)inst)[0];
+    if (isa == 0xDEADBEEF || !FindMethodIMP(isa, "initWithCoder:")) return inst;
+    static uint32_t* dummyCoder = nullptr;
+    if (!dummyCoder) {
+        dummyCoder = (uint32_t*)calloc(1, 32);
+        dummyCoder[0] = g_hleClasses.count("NSCoder") ? (uint32_t)(uintptr_t)g_hleClasses["NSCoder"] : 0xDEADBEEF;
+    }
+    void* r = (void*)(uintptr_t)Stub_objc_msgSend(inst, "initWithCoder:", dummyCoder,
+                                                  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    return r ? r : inst;
+}
+
 static void* NibMaterialize(NibArchive& a, int idx) {
     if (idx < 0 || idx >= (int)a.objects.size()) return nullptr;
     if (a.state[idx] == 2) return a.instances[idx];
@@ -8563,6 +8589,7 @@ static void* NibMaterialize(NibArchive& a, int idx) {
         void* real = want.empty() ? nullptr : ResolveSymbol("OBJC_CLASS_$_" + want);
         if (real) {
             inst = (void*)(uintptr_t)Stub_objc_msgSend(real, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            inst = NibInitWithCoder(inst);
         } else {
             inst = HLE_NewInstanceOf(base);
             g_views[inst].type = (base.find("UI") == 0) ? base : "UIView";
@@ -8573,6 +8600,7 @@ static void* NibMaterialize(NibArchive& a, int idx) {
         bool realFromGame = real && ((uint32_t*)real)[0] != 0xDEADBEEF;
         if (realFromGame) {
             inst = (void*)(uintptr_t)Stub_objc_msgSend(real, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            inst = NibInitWithCoder(inst);
         } else {
             inst = HLE_NewInstanceOf(cls);
         }
@@ -8683,10 +8711,14 @@ std::string ResolveNibPath(const std::string& name) {
     std::string base = name;
     if (base.size() > 4 && base.compare(base.size() - 4, 4, ".nib") == 0) base.resize(base.size() - 4);
     const char* suffixes[] = {"", "_iphone", "~iphone", "_ipad", "~ipad"};
-    for (const char* sfx : suffixes) {
-        std::string p = g_appBundlePath + "/" + base + sfx + ".nib";
-        struct stat st;
-        if (VfsStatAny(p, &st) == 0) return p;
+    // Локализованные nib-и лежат в <язык>.lproj, а не в корне бандла.
+    const char* dirs[] = {"/", "/en.lproj/", "/Base.lproj/", "/English.lproj/"};
+    for (const char* dir : dirs) {
+        for (const char* sfx : suffixes) {
+            std::string p = g_appBundlePath + dir + base + sfx + ".nib";
+            struct stat st;
+            if (VfsStatAny(p, &st) == 0) return p;
+        }
     }
     LogToJava("HLE-NIB: не нашёл .nib с именем " + base);
     return "";
@@ -8741,6 +8773,9 @@ int g_fpu_ret_flag = 0;
 
 uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8) {
     float saved_s[4] = {g_fpu_args[0], g_fpu_args[1], g_fpu_args[2], g_fpu_args[3]};
+    extern bool g_touchTrace;
+    if (g_touchTrace && op && isValidString(op))
+        LogToJava("[VIEW-DBG] msg " + GetObjCClassName(self) + "@" + std::to_string((uintptr_t)self) + " <- " + std::string(op));
     // трассировка кадрового пути EAGLView Asphalt 6 1.0.2 (адреса её образа)
     if (A6Dbg() && op && (strcmp(op, "drawView") == 0 || strcmp(op, "drawViewEventPump") == 0 ||
                strcmp(op, "updateKeyboard") == 0 || strcmp(op, "presentRenderbuffer:") == 0)) {
@@ -9236,9 +9271,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (cName.find("UIScreen") != std::string::npos) {
             w = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
             h = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-        } else if (g_views.count(self)) { 
-            x = g_views[self].frame[0]; y = g_views[self].frame[1];
-            w = g_views[self].frame[2]; h = g_views[self].frame[3]; 
+        } else if (g_views.count(self)) {
+            float vw = g_views[self].frame[2]; float vh = g_views[self].frame[3];
+            if (vw > 0.5f && vh > 0.5f) {
+                x = g_views[self].frame[0]; y = g_views[self].frame[1];
+                w = vw; h = vh;
+            }
         }
         
         float rect[4] = {x, y, w, h};
@@ -9613,7 +9651,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             LogToJava("HLE_DEBUG: [EAGLContext initWithAPI:] - Создание контекста API: " + std::to_string((int)(uintptr_t)a1));
             // В режиме ES 1.1 запрос ES 2.0 обязан провалиться, как на устройстве без шейдеров:
             // иначе игра выбирает шейдерный драйвер и требует GLSL-эффекты, которых нет.
-            if ((int)(uintptr_t)a1 >= 2 && g_esModeOption == 1) {
+            if ((int)(uintptr_t)a1 >= 2 && g_esMode == 1) {
                 LogToJava("HLE_DEBUG: [EAGLContext initWithAPI:] - отказ, враппер в режиме ES 1.1");
                 return 0;
             }
@@ -9814,11 +9852,29 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         Stub_objc_msgSend(a1, "viewDidAppear:", (void*)1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                     }
                 } else {
+                    // UIKit показывает корневой контроллер в порядке
+                    // viewWillAppear: -> layoutSubviews -> viewDidAppear:.
+                    typedef void (*AppearFunc)(void*, const char*, uint32_t);
+                    // UIKit спрашивает контроллер об ориентации до показа; игры
+                    // нередко именно в этом ответе подгоняют размер сцены.
+                    void* impRot = FindMethodIMP(vcIsa, "shouldAutorotateToInterfaceOrientation:");
+                    if (impRot) {
+                        LogToJava("HLE: Опрос [RootVC shouldAutorotateToInterfaceOrientation:" + std::to_string(g_ifaceOrientation) + "]");
+                        ((AppearFunc)impRot)(a1, "shouldAutorotateToInterfaceOrientation:", (uint32_t)g_ifaceOrientation);
+                    }
+                    void* impVWA = FindMethodIMP(vcIsa, "viewWillAppear:");
+                    if (impVWA) {
+                        LogToJava("HLE: Автоматический вызов [RootVC viewWillAppear:]");
+                        ((AppearFunc)impVWA)(a1, "viewWillAppear:", 1);
+                    }
+                    if (g_mainView && FindMethodIMP(((uint32_t*)g_mainView)[0], "layoutSubviews")) {
+                        LogToJava("HLE: Автоматический вызов [RootView layoutSubviews]");
+                        Stub_objc_msgSend(g_mainView, "layoutSubviews", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                    }
                     void* impVDA = FindMethodIMP(vcIsa, "viewDidAppear:");
                     if (impVDA) {
                         LogToJava("HLE: Автоматический вызов [RootVC viewDidAppear:]");
-                        typedef void (*VDAFunc)(void*, const char*, uint32_t);
-                        ((VDAFunc)impVDA)(a1, "viewDidAppear:", 1);
+                        ((AppearFunc)impVDA)(a1, "viewDidAppear:", 1);
                     }
                 }
                 return 0;
@@ -10073,7 +10129,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "UIScreen") {
             if (strcmp(op, "displayLinkWithTarget:selector:") == 0) {
                 g_displayLinkTarget = a1; g_displayLinkSelector = (const char*)a2;
-                uint32_t* inst = (uint32_t*)calloc(1, 32); 
+                uint32_t* inst = (uint32_t*)calloc(1, 32);
                 inst[0] = g_hleClasses.count("CADisplayLink") ? (uint32_t)g_hleClasses["CADisplayLink"] : 0xDEADBEEF;
                 return (uint64_t)(uintptr_t)inst;
             }
@@ -11236,6 +11292,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             dv_cnt++;
         }
 
+        if (clsName.compare(0, 4, "Fake") == 0)
+            LogToJava("[VIEW-DBG] " + clsName + " <- " + std::string(op));
+
         // --- Original HLE Handlers ---
         if (clsName == "CADisplayLink" && strcmp(op, "addToRunLoop:forMode:") == 0) {
             LogToJava("HLE_DEBUG: [CADisplayLink addToRunLoop:forMode:] - ИГРА ЗАПУСТИЛА РЕНДЕР ЛУП!");
@@ -11262,8 +11321,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "EAGLContext" && strcmp(op, "initWithAPI:") == 0) {
             int api = (int)(uintptr_t)a1;
             LogToJava("HLE_DEBUG: [EAGLContext initWithAPI:" + std::to_string(api) + "]" +
-                      ((api >= 2 && g_esModeOption == 1) ? " -> nil, враппер в режиме ES 1.1" : ""));
-            if (api >= 2 && g_esModeOption == 1) return 0;
+                      ((api >= 2 && g_esMode == 1) ? " -> nil, враппер в режиме ES 1.1" : ""));
+            if (api >= 2 && g_esMode == 1) return 0;
             return (uint64_t)(uintptr_t)self;
         }
 
@@ -11275,7 +11334,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 SyncLog("[MEGA-DEBUG] EAGLContext presentRenderbuffer: called");
                 DumpGLState("BEFORE RenderHLEUI inside presentRenderbuffer");
             }
-            RenderHLEUI(); 
+            RenderHLEUI();
             if (!isSpamOn || pr_cnt <= 30 || pr_cnt % 120 == 0) {
                 DumpGLState("AFTER RenderHLEUI inside presentRenderbuffer");
             }
@@ -11301,15 +11360,30 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if ((strcmp(op, "locationInView:") == 0 || strcmp(op, "previousLocationInView:") == 0) && clsName == "FakeUITouch") {
             FakeUITouch* t = (FakeUITouch*)self;
             float rx, ry; MapTouchToGameView(t->x, t->y, rx, ry);
+            LogToJava("[VIEW-DBG] " + std::string(op) + " -> (" + std::to_string(rx) + "," + std::to_string(ry) + ") phase=" + std::to_string(t->phase));
             uint32_t bx, by; memcpy(&bx, &rx, 4); memcpy(&by, &ry, 4);
             return ((uint64_t)by << 32) | bx; // r0 = x, r1 = y
         }
         if (strcmp(op, "countByEnumeratingWithState:objects:count:") == 0 && clsName == "FakeNSSet") {
             NSFastEnumerationState* state = (NSFastEnumerationState*)a1; void** stackbuf = (void**)a2;
+            LogToJava("[VIEW-DBG] enum state=" + std::to_string(state->state) + " buf=" + std::to_string((uintptr_t)stackbuf) +
+                      " cap=" + std::to_string((uintptr_t)a3) + " touches=" + std::to_string(((FakeNSSet*)self)->touches.size()));
             if (state->state == 0) {
                 static unsigned long mut = 0; state->mutationsPtr = &mut; state->itemsPtr = stackbuf; FakeNSSet* set = (FakeNSSet*)self;
                 int c = 0; for (void* t : set->touches) stackbuf[c++] = t; state->state = 1; return c;
             } return 0;
+        }
+        if (clsName == "FakeUIEvent") {
+            FakeUIEvent* ev = (FakeUIEvent*)self;
+            if (strcmp(op, "allTouches") == 0 || strcmp(op, "touchesForView:") == 0 ||
+                strcmp(op, "touchesForWindow:") == 0) return (uint64_t)(uintptr_t)ev->touchSet;
+            if (strcmp(op, "type") == 0) return 0;          // UIEventTypeTouches
+            if (strcmp(op, "subtype") == 0) return 0;
+            if (strcmp(op, "timestamp") == 0) {
+                double ts = (double)Stub_mach_absolute_time() / 1000000000.0;
+                memcpy(g_fpu_ret, &ts, 8); g_fpu_ret_flag = 1;
+                uint64_t ret; memcpy(&ret, &ts, 8); return ret;
+            }
         }
         if (clsName == "FakeNSSet" && strcmp(op, "count") == 0) {
             FakeNSSet* set = (FakeNSSet*)self;
@@ -11336,7 +11410,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             FakeUITouch* t = (FakeUITouch*)self; return (uint64_t)(uintptr_t)t->view;
         }
         if (clsName == "FakeUITouch" && strcmp(op, "phase") == 0) {
-            return 0; // UITouchPhaseBegan
+            return (uint64_t)((FakeUITouch*)self)->phase;
         }
         if (clsName == "FakeUITouch" && strcmp(op, "tapCount") == 0) {
             return 1;
@@ -11481,7 +11555,16 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                             std::vector<void*> top = LoadNibArchive(nibPath, self);
                             if (g_viewControllersViews.count(self)) view = g_viewControllersViews[self];
                             if (!view) for (void* o : top) if (o && g_views.count(o)) { view = o; break; }
-                            if (view) LogToJava("HLE: view для " + cName + " взят из " + nibPath);
+                            if (view) {
+                                LogToJava("HLE: view для " + cName + " взят из " + nibPath);
+                                // В nib лежит размер под экран того iPhone, на котором его рисовали
+                                // (например 320x460). Настоящий UIKit растягивает вью контроллера
+                                // по окну, иначе игра считает кадр и тачи по чужим размерам.
+                                g_views[view].frame = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
+                                HLE_MsgSendRectBits(view, "setFrame:", px, py, pw, ph);
+                                if (FindMethodIMP(((uint32_t*)view)[0], "layoutSubviews"))
+                                    Stub_objc_msgSend(view, "layoutSubviews", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                            }
                         }
                     }
 
@@ -11489,7 +11572,9 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                     // для модалок это плодит второй GL-вью и вешает игру.
                     if (!view) {
                         uint32_t viewClassAddr = 0;
-                        if (!g_mainView) {
+                        // g_mainView мог быть занят самим контроллером (восстановление
+                        // по [nil startAnimation]) — тогда GL-вью ещё не создан.
+                        if (!g_mainView || self == g_mainView) {
                             for (auto const& pair : g_appSymbols) {
                                 if (pair.first.find("_OBJC_CLASS_$_EAGLView") == 0) {
                                     viewClassAddr = pair.second; break;
@@ -11519,8 +11604,10 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                             view = (void*)HLE_MsgSendRectBits(view, "initWithFrame:", px, py, pw, ph);
                         }
                         g_views[view].type = "UIView";
-                        g_uiColors[view] = {0.0f, 0.0f, 0.0f, 1.0f};
-                        g_views[view].bgColor = g_uiColors[view]; g_views[view].hasBg = true;
+                        // backgroundColor у автосозданного вью контроллера в UIKit равен nil:
+                        // непрозрачная заливка затирала бы кадр игры поверх GL-слоя.
+                        g_uiColors[view] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        g_views[view].bgColor = g_uiColors[view]; g_views[view].hasBg = false;
                     }
                     g_viewControllersViews[self] = view;
                 }
@@ -11764,10 +11851,11 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         if (cName.find("UIScreen") != std::string::npos) {
             w = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
             h = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-        } else if (g_views.count(self)) { 
-            w = g_views[self].frame[2]; h = g_views[self].frame[3]; 
+        } else if (g_views.count(self)) {
+            float vw = g_views[self].frame[2]; float vh = g_views[self].frame[3];
+            if (vw > 0.5f && vh > 0.5f) { w = vw; h = vh; }
         }
-        
+
         // ВНИМАНИЕ: Возвращаем нормальный CGRect: x=0, y=0, w=width, h=height
         float rectData[4] = {0.0f, 0.0f, w, h};
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET MSG_SEND " + std::string(op) + " <<<<<<<<");
@@ -11796,6 +11884,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
             float* pt = (float*)ret_addr;
             pt[0] = rx;
             pt[1] = ry;
+            LogToJava("[VIEW-DBG] stret " + std::string(op) + " -> (" + std::to_string(rx) + "," + std::to_string(ry) + ")");
         }
         return ret_addr;
     }
@@ -13008,12 +13097,9 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         // игра получит два контроллера, и первый отработает до того, как делегат выставит
         // размеры экрана (Wolf3D так уходил в glViewport(0,0,0,0)).
         bool hasMainNib = false;
-        for (const char* nibName : {"/MainWindow.nib", "/MainWindow-iPhone.nib", "/MainWindow~iphone.nib"}) {
-            std::string nibPath = g_appBundlePath + nibName;
-            if (IpaIsVirtualPath(nibPath.c_str()) ? IpaExists(nibPath)
-                                                 : (access(nibPath.c_str(), F_OK) == 0)) {
-                hasMainNib = true; break;
-            }
+        void* pendingRootVC = nullptr;
+        for (const char* nibName : {"MainWindow", "MainWindow-iPhone"}) {
+            if (!ResolveNibPath(nibName).empty()) { hasMainNib = true; break; }
         }
         if (!hasMainNib && FindMethodIMP(appDelIsa, "application:didFinishLaunchingWithOptions:")) {
             LogToJava("HLE: Главного nib нет — корневой контроллер создаст сам делегат.");
@@ -13052,7 +13138,10 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             if (FindMethodIMP(appDelIsa, "setViewController:")) {
                 Stub_objc_msgSend(appDel, "setViewController:", vc, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
             }
-            Stub_objc_msgSend(window, "setRootViewController:", vc, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            // Показ контроллера тянет loadView/viewDidLoad, где игра создаёт движок.
+            // На iOS это происходит после делегата, который успевает выставить размер
+            // экрана, поэтому откладываем показ и отдаём приоритет самой игре.
+            pendingRootVC = vc;
         }
         }
 
@@ -13068,12 +13157,25 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             LogToJava("HLE: ВНИМАНИЕ! Метод запуска делегата не найден!");
         }
 
+        if (pendingRootVC && !g_mainView) {
+            LogToJava("HLE: Делегат не показал свой вид — ставим корневой контроллер сами.");
+            Stub_objc_msgSend(window, "setRootViewController:", pendingRootVC, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        }
+
         LogToJava("HLE: Имитация перехода приложения в активный режим...");
         if (FindMethodIMP(appDelIsa, "applicationDidBecomeActive:")) {
             LogToJava("HLE: Вызов applicationDidBecomeActive:...");
             Stub_objc_msgSend(appDel, "applicationDidBecomeActive:", uiApp, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         }
         
+        // UIKit прогоняет layout ещё раз на первом проходе runloop, уже после того,
+        // как приложение стало активным. Игры, чей вид пришёл из nib, именно в этом
+        // втором проходе узнают итоговый размер сцены.
+        if (g_mainView && FindMethodIMP(((uint32_t*)g_mainView)[0], "layoutSubviews")) {
+            LogToJava("HLE: Повторный layoutSubviews после активации приложения.");
+            Stub_objc_msgSend(g_mainView, "layoutSubviews", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        }
+
         // Отправляем нотификации (некоторые движки подписываются на них вместо делегата)
         uint32_t* actNotifInst = (uint32_t*)calloc(1, 32);
         actNotifInst[0] = g_hleClasses.count("NSNotification") ? (uint32_t)g_hleClasses["NSNotification"] : 0xDEADBEEF;
@@ -13126,12 +13228,20 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         g_mainQueue.clear();
         pthread_mutex_unlock(&g_mainQueueMutex);
         for (auto& item : queueCopy) {
+            bool isTouch = item.sel && strncmp(item.sel, "touches", 7) == 0 && strncmp(item.sel, "touchesMoved", 12) != 0;
+            if (isTouch) {
+                LogToJava("[VIEW-DBG] dispatch " + std::string(item.sel) + " -> " + GetObjCClassName(item.target));
+                g_touchTrace = true;
+            }
             Stub_objc_msgSend(item.target, item.sel, item.arg, item.arg2, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            g_touchTrace = false;
         }
 
         if (g_renderingStarted && g_displayLinkTarget && g_displayLinkSelector) {
             static int dl_ticks = 0;
-            if (dl_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Вызов DisplayLink: target=" + GetObjCClassName(g_displayLinkTarget) + " sel=" + std::string(g_displayLinkSelector));
+            if (dl_ticks++ % 60 == 0) {
+                LogToJava("[MAIN-LOOP] Вызов DisplayLink: target=" + GetObjCClassName(g_displayLinkTarget) + " sel=" + std::string(g_displayLinkSelector));
+            }
             g_framePresented = false;
             Stub_objc_msgSend(g_displayLinkTarget, g_displayLinkSelector, realFakeLink, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
             // Игра с UIKit-меню (Wolf3D) крутит display link, но пока меню на экране ничего не
@@ -13152,7 +13262,9 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             }
         } else {
             static int idle_ticks = 0;
-            if (idle_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Крутимся в IDLE_LOOP. g_renderingStarted=" + std::to_string(g_renderingStarted) + " target_set=" + std::to_string(g_displayLinkTarget != nullptr));
+            if (idle_ticks++ % 60 == 0) {
+                LogToJava("[MAIN-LOOP] Крутимся в IDLE_LOOP. g_renderingStarted=" + std::to_string(g_renderingStarted) + " target_set=" + std::to_string(g_displayLinkTarget != nullptr));
+            }
             SyncLog("\n[ABSOLUTE-IDLE-LOOP] --- FRAME START ---");
             g_frameHasDraw = false;
             SyncLog("[ABSOLUTE-IDLE-LOOP] 1. Checking Context...");
@@ -13957,7 +14069,7 @@ extern "C" int wrap_pthread_cond_destroy(void* cond) {
 // грузит шейдеры «ES2-класса» и рассогласуется с фиксированным конвейером.
 static const char* HleDeviceModel() {
     // Asphalt 6 исключена: на iPhone1,2 она уходит в урезанный набор ресурсов.
-    return (g_esModeOption == 1 && !g_isAsphalt6) ? "iPhone1,2" : "iPhone2,1";
+    return (g_esMode == 1 && !g_isAsphalt6) ? "iPhone1,2" : "iPhone2,1";
 }
 
 extern "C" int wrap_sysctlbyname(const char* name, void* oldp, size_t* oldlenp, void* newp, size_t newlen) {
@@ -15169,12 +15281,22 @@ extern "C" int wrap_thread_set_state(uint32_t target_thread, int flavor, void* n
     return 0; // KERN_SUCCESS
 }
 
+struct DwGuestThreadStart { void* (*fn)(void*); void* arg; };
+static void* DwGuestThreadTrampoline(void* p) {
+    DwGuestThreadStart s = *(DwGuestThreadStart*)p;
+    delete (DwGuestThreadStart*)p;
+    LogToJava("[VIEW-DBG] гостевой поток стартовал fn=" + std::to_string((uintptr_t)s.fn));
+    void* r = s.fn(s.arg);
+    LogToJava("[VIEW-DBG] гостевой поток завершился fn=" + std::to_string((uintptr_t)s.fn));
+    return r;
+}
+
 extern "C" int wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg) {
     uint32_t lr = (uint32_t)__builtin_return_address(0);
     LogToJava("C-API-TRACE: [pthread_create] Создается новый поток! Caller: " + GetModuleInfoForAddress(lr));
-    // КРИТИЧНО: Игнорируем attr, передавая nullptr. 
+    // КРИТИЧНО: Игнорируем attr, передавая nullptr.
     // Структуры iOS и Android не совпадают, Android вернет EINVAL и поток не запустится!
-    int res = pthread_create(thread, nullptr, start_routine, arg);
+    int res = pthread_create(thread, nullptr, DwGuestThreadTrampoline, new DwGuestThreadStart{start_routine, arg});
     if (res != 0) {
         LogToJava("C-API-ERROR: pthread_create FAILED with code " + std::to_string(res));
     }
@@ -17088,6 +17210,8 @@ extern "C" int wrap_objc_sync_exit(void* obj) {
     return 0;
 }
 
+extern "C" int wrap_usleep(useconds_t us);
+
 #define STB_S(n) {"_" #n, (void*)Stub_##n}
 #define STB_W(n) {"_" #n, (void*)wrap_##n}
 #define STB_D(n) {"_" #n, (void*)n}
@@ -17159,7 +17283,7 @@ std::map<std::string, void*> g_hleStubs = {
     
     STB_D(acosf), STB_D(asinf), STB_D(strlcpy), STB_D(strtok), STB_D(strerror_r), STB_D(wcscmp), STB_D(wcscpy), STB_D(wcslen), {"_wcschr", (void*)(wchar_t*(*)(wchar_t*, wchar_t))wcschr}, STB_D(wcsncpy), STB_D(wcstombs), STB_D(wcstol), STB_W(memset_pattern16),
     {"_wmemchr", (void*)(wchar_t*(*)(wchar_t*, wchar_t, size_t))wmemchr}, STB_D(wmemcmp), STB_D(wmemcpy), STB_D(wmemmove), STB_D(swprintf), STB_W(vswprintf), STB_W(swscanf), STB_W(wcsncmp), STB_W(wcstof),
-    STB_W(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_W(open), STB_W(read), STB_D(write), STB_W(pread), STB_W(fsync), STB_W(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
+    STB_W(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_W(open), STB_W(read), STB_D(write), STB_W(pread), STB_W(fsync), STB_W(lseek), STB_W(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
     {"_div", (void*)(div_t(*)(int, int))div}, STB_D(gethostbyaddr), STB_W(gethostbyname), STB_W(gethostname), STB_D(getnameinfo), STB_W(getpeername), STB_W(getsockname), STB_W(getsockopt), STB_D(if_nametoindex), STB_D(inet_addr),
     STB_W(SecItemAdd), STB_W(SecItemCopyMatching), STB_W(SecItemUpdate), STB_W(SecItemDelete), STB_D(getpid), STB_D(inet_aton), STB_D(inet_ntoa), STB_W(longjmp), STB_D(perror), STB_D(sigaction), STB_W(sigprocmask), STB_D(utimes), STB_D(vprintf), STB_W(fcntl), STB_D(system), STB_D(uname), STB_D(dladdr), STB_D(dlsym), STB_D(arc4random), STB_D(localtime), STB_D(localtime_r),
     STB_W(sysctl), STB_W(sysctlbyname), STB_W(sysconf), STB_W(asprintf), STB_W(dlopen), STB_W(dlclose), STB_W(hash_create), STB_W(hash_search),
@@ -19321,16 +19445,23 @@ void LoadMachO(const std::string& bundlePath) {
         else if (isES2) renderStr = "OpenGL ES 2.0 Only";
         else if (isES1) renderStr = "OpenGL ES 1.1 Only";
         
-        if (isES1 && !isES2) g_activeESVersion = 1;
-        else if (!isES1 && isES2) g_activeESVersion = 2;
-        else if (isES1 && isES2) g_activeESVersion = g_esModeOption;
-        else g_activeESVersion = 2;
+        // Образ решает, что игра вообще умеет. Собранная под один ES игра не станет
+        // работать в другом режиме, поэтому здесь фолбэк переключает именно действующий
+        // режим, а не отдельный флаг: иначе отказ initWithAPI:, модель устройства и
+        // GL_VERSION продолжали бы отвечать по настройке и расходились бы с драйвером.
+        if (isES1 && !isES2) g_esMode = 1;
+        else if (!isES1 && isES2) g_esMode = 2;
+        else if (isES1 && isES2) g_esMode = g_esModeRequested;
+        else g_esMode = 2;
+        if (g_esMode != g_esModeRequested)
+            LogToJava("Режим ES сменён с " + std::to_string(g_esModeRequested) + " на " +
+                      std::to_string(g_esMode) + ": образ игры поддерживает только его.");
         
         LogToJava("- Arch: " + archStr);
         LogToJava("- Render: " + renderStr);
         LogToJava("");
         LogToJava("Picked Arch: " + (hasArmv7 ? std::string("ARMv7") : (hasArmv8 ? std::string("ARMv8") : (hasArmv6 ? std::string("ARMv6") : std::string("Unknown")))));
-        LogToJava("Picked render: " + (g_activeESVersion == 2 ? std::string("OpenGL ES 2.0") : std::string("OpenGL ES 1.1")));
+        LogToJava("Picked render: " + (g_esMode == 2 ? std::string("OpenGL ES 2.0") : std::string("OpenGL ES 1.1")));
         
         if (!hasArmv7) {
             VfsCloseAny(fd);
@@ -21338,6 +21469,9 @@ extern "C" unsigned wrap_lcxx_thread_hw_concurrency() {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (unsigned)n : 1u;
 }
+extern "C" int wrap_usleep(useconds_t us) {
+    return usleep(us);
+}
 extern "C" void wrap_lcxx_sleep_for(const long long* ns) {
     if (!ns) return;
     long long v = *ns;
@@ -22132,7 +22266,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     g_logMask = (uint32_t)logMask;
     g_spamMask = (uint32_t)spamMask;
     g_disableLogging = (g_logMask == 0);
-    g_esModeOption = esMode;
+    g_esModeRequested = esMode;
+    g_esMode = esMode;   // до разбора образа действующим считается выбранный
     g_onScreenDebugOverlay = onScreenDebugOverlay;
     g_showPerfOverlay = showPerfOverlay;
     g_nativeRootMmap = nativeRootMmap;
@@ -22300,6 +22435,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_onTouchEventNative(JNIEnv *env, jobject thiz, jint actionMasked, jint pointerId, jfloat x, jfloat y) {
+    if (actionMasked != 2)
+        LogToJava("[VIEW-DBG] enter act=" + std::to_string(actionMasked) + " ptr=" + std::to_string(pointerId) +
+                  " ignoring=" + std::to_string(g_ignoringInteractionEvents));
     if (g_ignoringInteractionEvents > 0) return;
     void* activeView = g_presentedView ? g_presentedView : g_mainView; if (!activeView) return;
 
@@ -22327,6 +22465,54 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
             if (!best || area < bestArea) { best = pair.first; bestArea = area; }
         }
         if (best) activeView = best;
+    }
+    if (actionMasked == 0) {
+        std::function<void(uint32_t, int)> dumpSels = [&](uint32_t cp, int depth) {
+            if (!cp || cp < 0x1000 || depth > 6) return;
+            uint32_t* cls = (uint32_t*)cp;
+            if (cls[0] == 0xDEADBEEF) { LogToJava("[VIEW-DBG]   HLE-класс " + std::string(((HLEClass*)cp)->className)); return; }
+            uint32_t data_ptr = cls[4] & ~3;
+            if (data_ptr > 0x1000) {
+                uint32_t* ro = (uint32_t*)data_ptr; uint32_t ml = ro[5];
+                if (ml > 0x1000) {
+                    uint32_t* mlist = (uint32_t*)ml; uint32_t count = mlist[1]; uint32_t* methods = mlist + 2;
+                    std::string sels;
+                    if (count < 10000) for (uint32_t i = 0; i < count; i++) {
+                        const char* nm = (const char*)methods[i*3];
+                        if (isValidString(nm)) sels += std::string(nm) + " ";
+                    }
+                    LogToJava("[VIEW-DBG]   lvl" + std::to_string(depth) + " sels: " + (sels.empty() ? "<нет touch/event>" : sels));
+                }
+            }
+            uint32_t sup = cls[1]; if (sup && sup != cp) dumpSels(sup, depth + 1);
+        };
+        LogToJava("[VIEW-DBG] методы activeView " + GetObjCClassName(activeView) + ":");
+        dumpSels(((uint32_t*)activeView)[0], 0);
+        for (auto const& pair : g_viewControllersViews) if (pair.second == activeView) {
+            LogToJava("[VIEW-DBG] методы VC " + GetObjCClassName(pair.first) + ":");
+            dumpSels(((uint32_t*)pair.first)[0], 0);
+        }
+    }
+    if (actionMasked == 0 || actionMasked == 1) {
+        auto& fr = g_views[activeView].frame;
+        LogToJava("[VIEW-DBG] touch act=" + std::to_string(actionMasked) + " xy=(" + std::to_string(x) + "," + std::to_string(y) +
+                  ") activeView=" + GetObjCClassName(activeView) + " ptr=" + std::to_string((uintptr_t)activeView) +
+                  " frame=(" + std::to_string(fr[0]) + "," + std::to_string(fr[1]) + "," + std::to_string(fr[2]) + "," + std::to_string(fr[3]) +
+                  ") mainView=" + std::to_string((uintptr_t)g_mainView) + " presented=" + std::to_string((uintptr_t)g_presentedView) +
+                  " impBegan=" + std::to_string(FindMethodIMP(((uint32_t*)activeView)[0], "touchesBegan:withEvent:") ? 1 : 0));
+        for (auto const& pair : g_views)
+            LogToJava("[VIEW-DBG] view " + GetObjCClassName(pair.first) + " " + std::to_string((uintptr_t)pair.first) +
+                      " frame=(" + std::to_string(pair.second.frame[0]) + "," + std::to_string(pair.second.frame[1]) + "," +
+                      std::to_string(pair.second.frame[2]) + "," + std::to_string(pair.second.frame[3]) + ")" +
+                      " hidden=" + std::to_string((int)pair.second.hidden) + " parent=" + std::to_string((uintptr_t)pair.second.parent));
+        LogToJava("[VIEW-DBG] viewport=" + std::to_string(g_gameViewportW) + "x" + std::to_string(g_gameViewportH) +
+                  " surf=" + std::to_string(g_surfaceWidth) + "x" + std::to_string(g_surfaceHeight));
+        LogToJava("[VIEW-DBG] dlTarget=" + std::to_string((uintptr_t)g_displayLinkTarget) + " cls=" +
+                  (g_displayLinkTarget ? GetObjCClassName(g_displayLinkTarget) : std::string("null")) +
+                  " sel=" + (g_displayLinkSelector ? std::string(g_displayLinkSelector) : std::string("null")));
+        for (auto const& pair : g_viewControllersViews)
+            LogToJava("[VIEW-DBG] vcMap " + GetObjCClassName(pair.first) + " " + std::to_string((uintptr_t)pair.first) +
+                      " -> " + GetObjCClassName(pair.second) + " " + std::to_string((uintptr_t)pair.second));
     }
     bool isDown = (actionMasked == 0 || actionMasked == 5);
     bool isUp = (actionMasked == 1 || actionMasked == 6);
@@ -22406,6 +22592,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     // =====================================
     if (!g_hleClasses.count("FakeUITouch")) g_hleClasses["FakeUITouch"] = new HLEClass{0xDEADBEEF, "FakeUITouch"};
     if (!g_hleClasses.count("FakeNSSet")) g_hleClasses["FakeNSSet"] = new HLEClass{0xDEADBEEF, "FakeNSSet"};
+    if (!g_hleClasses.count("FakeUIEvent")) g_hleClasses["FakeUIEvent"] = new HLEClass{0xDEADBEEF, "FakeUIEvent"};
 
     // Координаты уже отмасштабированы в Java, используем их напрямую
     float scaledX = x;
@@ -22417,11 +22604,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
 
     FakeUITouch* t = nullptr;
     if (g_activeTouches.count(pointerId)) t = g_activeTouches[pointerId];
-    else { t = new FakeUITouch{(uint32_t)g_hleClasses["FakeUITouch"], "FakeUITouch", scaledX, scaledY, activeView, (uint32_t)pointerId}; g_activeTouches[pointerId] = t; }
+    else { t = new FakeUITouch{(uint32_t)g_hleClasses["FakeUITouch"], "FakeUITouch", scaledX, scaledY, activeView, (uint32_t)pointerId, 0}; g_activeTouches[pointerId] = t; }
     t->x = scaledX; t->y = scaledY;
+    t->phase = isDown ? 0 : isMove ? 1 : isUp ? 3 : 4;
     
     FakeNSSet* set = new FakeNSSet{(uint32_t)g_hleClasses["FakeNSSet"], "FakeNSSet", {(void*)t}};
-    const char* method = nullptr; 
+    // Часть игр (MCPE 0.7) берёт тачи не из первого аргумента, а из [event allTouches],
+    // и с nil-событием тихо остаётся без ввода.
+    FakeUIEvent* ev = new FakeUIEvent{(uint32_t)g_hleClasses["FakeUIEvent"], "FakeUIEvent", (void*)set};
+    const char* method = nullptr;
     if (isDown) method = "touchesBegan:withEvent:";
     else if (isUp) method = "touchesEnded:withEvent:";
     else if (isMove) method = "touchesMoved:withEvent:";
@@ -22436,15 +22627,19 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         }
         pthread_mutex_lock(&g_mainQueueMutex);
         // Отправляем тач во View
-        g_mainQueue.push_back({activeView, method, (void*)set, nullptr, true});
+        g_mainQueue.push_back({activeView, method, (void*)set, (void*)ev, true});
         
         // ВАЖНО: Дублируем тач в ViewController (Responder Chain), так как логика часто там
+        bool vcFound = false;
         for (auto const& pair : g_viewControllersViews) {
             if (pair.second == activeView) {
-                g_mainQueue.push_back({pair.first, method, (void*)set, nullptr, true});
+                g_mainQueue.push_back({pair.first, method, (void*)set, (void*)ev, true});
+                vcFound = true;
                 break;
             }
         }
+        LogToJava("[VIEW-DBG] push " + std::string(method) + " vcFound=" + std::to_string((int)vcFound) +
+                  " queue=" + std::to_string(g_mainQueue.size()));
         pthread_mutex_unlock(&g_mainQueueMutex);
     }
     if (isUp || isCancel) { g_activeTouches.erase(pointerId); }
