@@ -11,7 +11,7 @@ works, DM me :)
 |---|---|---|---|
 | Action Buggy | 1.11 – 1111 | Playable | Saves not tested |
 | Traps N Gems | 1.00 – 1.01 | Playable | Saves not tested |
-| Minecraft PE | 0.1.2.0 – 0.10.4 | Playable | Runs on both the software and the GPU renderer |
+| Minecraft PE | 0.1.2.0 – 0.10.4 | Playable | 0.1.2-0.6.1 have bad system UI, 0.7.0+ have no problems with UI |
 | Wolfenstein 3D | 2.1 | Playable | Menu graphics are drawn with visible stair-stepping |
 | Super Monkey Ball 2 | 2.0.0 – 3.1.0 + 1.2.0 Lite | Rough | Saves do not work, touch input is inaccurate, crashes on death. Other versions untested |
 | Asphalt 6 | 1.0.2 Free | Rough | Long freezes during drifting |
@@ -33,4 +33,4 @@ works, DM me :)
 
 ## Compiling
 
-NDK r17 (build 4754217), released mid-2018 (android-ndk-aide).
+NDK r17 (build 4754217), released mid-2018 (an
