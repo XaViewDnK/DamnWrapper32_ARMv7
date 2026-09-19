@@ -635,18 +635,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         rootLayout.addView(gpuOffloadLayout);
         rootLayout.addView(bottomButtonsLayout, bottomParams);
 
-        TextView versionTextView = new TextView(this) {
-            @Override
-            protected void onDraw(android.graphics.Canvas canvas) {
-                getPaint().setStyle(android.graphics.Paint.Style.STROKE);
-                getPaint().setStrokeWidth(4f);
-                setTextColor(Color.BLACK);
-                super.onDraw(canvas);
-                getPaint().setStyle(android.graphics.Paint.Style.FILL);
-                setTextColor(Color.WHITE);
-                super.onDraw(canvas);
-            }
-        };
+        TextView versionTextView = new OutlineTextView(this);
         try {
             android.content.pm.PackageInfo pInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
             versionTextView.setText("DamnWrapper32 (ARMv7) v" + pInfo.versionName);
@@ -1050,8 +1039,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
                     if (targetApp != null) {
                         File target = new File(APPS_DIR, targetApp);
                         AppInfo autoInfo = null;
-                        if (target.isFile() && targetApp.toLowerCase(Locale.US).endsWith(".ipa")) autoInfo = readIpaApp(target);
-                        else if (target.isDirectory()) autoInfo = readUnpackedApp(target);
+                        if (target.isDirectory()) {
+                            autoInfo = readUnpackedApp(target);
+                        } else {
+                            // Расширение в -launch писать необязательно, но подставляем только .ipa.
+                            if (!targetApp.toLowerCase(Locale.US).endsWith(".ipa")) target = new File(APPS_DIR, targetApp + ".ipa");
+                            if (target.isFile()) autoInfo = readIpaApp(target);
+                        }
                         if (autoInfo != null) {
                             final AppInfo finalInfo = autoInfo;
                             runOnUiThread(() -> launchApp(finalInfo, true));
@@ -1259,18 +1253,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
             icon.setLayoutParams(new FrameLayout.LayoutParams(160, 160));
             iconContainer.addView(icon);
 
-            TextView versionText = new TextView(MainActivity.this) {
-                @Override
-                protected void onDraw(android.graphics.Canvas canvas) {
-                    getPaint().setStyle(android.graphics.Paint.Style.STROKE);
-                    getPaint().setStrokeWidth(4f);
-                    setTextColor(Color.BLACK);
-                    super.onDraw(canvas);
-                    getPaint().setStyle(android.graphics.Paint.Style.FILL);
-                    setTextColor(Color.WHITE);
-                    super.onDraw(canvas);
-                }
-            };
+            TextView versionText = new OutlineTextView(MainActivity.this);
             versionText.setText(app.version);
             versionText.setTextSize(10f);
             versionText.setSingleLine(true);
@@ -2043,12 +2026,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 android.graphics.ImageDecoder.Source source = android.graphics.ImageDecoder.createSource(file);
-                android.graphics.drawable.Drawable drawable = android.graphics.ImageDecoder.decodeDrawable(source, new android.graphics.ImageDecoder.OnHeaderDecodedListener() {
-                    @Override
-                    public void onHeaderDecoded(android.graphics.ImageDecoder decoder, android.graphics.ImageDecoder.ImageInfo info, android.graphics.ImageDecoder.Source src) {
-                        decoder.setAllocator(android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE);
-                    }
-                });
+                // Аллокатор оставляем на усмотрение ImageDecoder: статичные обои он положит
+                // в hardware-битмап. Принудительный ALLOCATOR_SOFTWARE заставлял HWUI заливать
+                // многомегабайтную картинку в GPU на каждом кадре перерисовки.
+                android.graphics.drawable.Drawable drawable = android.graphics.ImageDecoder.decodeDrawable(source);
                 ImageView iv = new ImageView(context);
                 iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 iv.setImageDrawable(drawable);
@@ -2062,6 +2043,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         FallbackWallpaperView fwv = new FallbackWallpaperView(context, file);
         if (fwv.isValid()) return fwv;
         return null;
+    }
+
+    // Текст с чёрной обводкой. setTextColor дёргает invalidate, поэтому на время
+    // отрисовки его надо глушить: иначе View просит перерисовку из собственного
+    // onDraw и UI-поток крутит кадры без остановки.
+    private static class OutlineTextView extends TextView {
+        private boolean drawing;
+
+        OutlineTextView(Context context) { super(context); }
+
+        @Override
+        public void invalidate() { if (!drawing) super.invalidate(); }
+
+        @Override
+        protected void onDraw(android.graphics.Canvas canvas) {
+            drawing = true;
+            getPaint().setStyle(android.graphics.Paint.Style.STROKE);
+            getPaint().setStrokeWidth(4f);
+            setTextColor(Color.BLACK);
+            super.onDraw(canvas);
+            getPaint().setStyle(android.graphics.Paint.Style.FILL);
+            setTextColor(Color.WHITE);
+            super.onDraw(canvas);
+            drawing = false;
+        }
     }
 
     private class FallbackWallpaperView extends View {
