@@ -1,20 +1,36 @@
-DamnWrapper32 (ARMv7) [by XaView]
+# DamnWrapper32 (ARMv7) — by XaView
 
--IOS emulator (wrapper) that currently support these games:
+An iOS emulator (wrapper) for Android that runs 32-bit ARMv7 iOS games.
 
-Action Buggy (All versions)
-Compatability: Fully working but saves not tested, idk.
-Perfomance: 48-52 fps on Snapdragon 7 Gen 2+
----
-Traps N Gems (All versions)
-Compatability: Fully working but saves not tested, idk.
-Perfomance: 44-48 fps on Snapdragon 7 Gen 2+
----
--Super Monkey Ball 2 (2.0.0, Lite 1.2.0, 3.1.0 (but only with native root mmap), other versions untested. 
-Compatability: ~~Fully~~ working but saves not works (Tested only on 2.0.0, other versions may have working saves, dm me if you test it and want to help by showing working saves or not) (touches no correcty works, crash if u die)
-Perfomance: 19-20 FPS on Snapdragon 7 Gen 2+
+Theoretical target is iOS 3.0–5.1.1. If you find a game outside the list below that
+works, DM me :)
 
-*Theoretically support is IOS 3.0-5.1.1, if you will find some games except in list upper that works then dm me :)
+## Supported games
 
---- Compiling:
-NDK r17 (build 4754217), that released in middle of 2018 year (android-ndk-aide).
+| Game | Versions | Status | Notes |
+|---|---|---|---|
+| Action Buggy | 1.11 – 1111 | Playable | Saves not tested |
+| Traps N Gems | 1.00 – 1.01 | Playable | Saves not tested |
+| Minecraft PE | 0.1.2.0 – 0.10.4 | Playable | Runs on both the software and the GPU renderer |
+| Wolfenstein 3D | 2.1 | Playable | Menu graphics are drawn with visible stair-stepping |
+| Super Monkey Ball 2 | 2.0.0 – 3.1.0 + 1.2.0 Lite | Rough | Saves do not work, touch input is inaccurate, crashes on death. Other versions untested |
+| Asphalt 6 | 1.0.2 Free | Rough | Long freezes during drifting |
+
+## Settings worth knowing
+
+- **Native ROOT mmap** — loads the game at its original addresses. Needed by some games,
+  requires root.
+- **GPU Offload** — moves parts of rendering to the GPU. Experimental; if a game shows
+  black areas or crashes, turn it off.
+- **OpenGL ES Mode** — picks ES 1.1 or ES 2.0. If the game image only supports one of
+  them, the wrapper switches to it automatically.
+
+## Command line
+
+- `-launch packagename_version` — skip the wrapper menus and start the game directly.
+  Example: `-launch com.sega.smb2_2.0.0`
+- `-novideo` — skip video cutscenes in all games.
+
+## Compiling
+
+NDK r17 (build 4754217), released mid-2018 (android-ndk-aide).
